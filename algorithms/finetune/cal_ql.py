@@ -22,6 +22,17 @@ TensorBatch = List[torch.Tensor]
 
 ENVS_WITH_GOAL = ("antmaze", "pen", "door", "hammer", "relocate")
 
+ENV_CONFIG = {
+    "antmaze": {
+        "reward_pos": 1.0,
+        "reward_neg": 0.0,
+    },
+    "adroit-binary": {
+        "reward_pos": 0.0,
+        "reward_neg": -1.0,
+    },
+}
+
 
 @dataclass
 class TrainConfig:
@@ -62,6 +73,7 @@ class TrainConfig:
     normalize: bool = True  # Normalize states
     normalize_reward: bool = False  # Normalize reward
     q_n_hidden_layers: int = 2  # Number of hidden layers in Q networks
+    q_n_hidden_units: int = 256  # Number of hidden units in Q networks
     reward_scale: float = 1.0  # Reward scale for normalization
     reward_bias: float = 0.0  # Reward bias for normalization
     # Cal-QL
@@ -71,6 +83,7 @@ class TrainConfig:
     project: str = "CORL"  # wandb project name
     group: str = "Cal-QL-D4RL"  # wandb group name
     name: str = "Cal-QL"  # wandb run name
+    sweep: bool = False  # If True, the run will be logged in a sweep
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -133,7 +146,9 @@ class ReplayBuffer:
         self._actions = torch.zeros(
             (buffer_size, action_dim), dtype=torch.float32, device=device
         )
-        self._rewards = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
+        self._rewards = torch.zeros(
+            (buffer_size, 1), dtype=torch.float32, device=device
+        )
         self._next_states = torch.zeros(
             (buffer_size, state_dim), dtype=torch.float32, device=device
         )
@@ -161,7 +176,9 @@ class ReplayBuffer:
         self._rewards[:n_transitions] = self._to_tensor(data["rewards"][..., None])
         self._next_states[:n_transitions] = self._to_tensor(data["next_observations"])
         self._dones[:n_transitions] = self._to_tensor(data["terminals"][..., None])
-        self._mc_returns[:n_transitions] = self._to_tensor(data["mc_returns"][..., None])
+        self._mc_returns[:n_transitions] = self._to_tensor(
+            data["mc_returns"][..., None]
+        )
         self._size += n_transitions
         self._pointer = min(self._size, n_transitions)
 
@@ -299,8 +316,7 @@ def get_return_to_go(dataset: Dict, env: gym.Env, config: TrainConfig) -> np.nda
             prev_return = 0
             if (
                 config.is_sparse_reward
-                and r
-                == env.ref_min_score * config.reward_scale + config.reward_bias
+                and r == env.ref_min_score * config.reward_scale + config.reward_bias
             ):
                 discounted_returns = [r / (1 - config.discount)] * ep_len
             else:
@@ -364,6 +380,212 @@ def init_module_weights(module: torch.nn.Module, orthogonal_init: bool = False):
             nn.init.xavier_uniform_(module.weight, gain=1e-2)
 
 
+def calc_return_to_go(
+    env_name, rewards, terminals, gamma, reward_scale, reward_bias, is_sparse_reward
+):
+    """
+    A config dict for getting the default high/low rewrd values for each envs
+    This is used in calc_return_to_go func in sampler.py and replay_buffer.py
+    """
+    if len(rewards) == 0:
+        return np.array([])
+
+    if "antmaze" in env_name:
+        reward_neg = ENV_CONFIG["antmaze"]["reward_neg"] * reward_scale + reward_bias
+    elif env_name in [
+        "pen-binary-v0",
+        "door-binary-v0",
+        "relocate-binary-v0",
+        "pen-binary",
+        "door-binary",
+        "relocate-binary",
+    ]:
+        reward_neg = (
+            ENV_CONFIG["adroit-binary"]["reward_neg"] * reward_scale + reward_bias
+        )
+    else:
+        assert (
+            not is_sparse_reward
+        ), "If you want to try on a sparse reward env, please add the reward_neg value in the ENV_CONFIG dict."
+
+    if is_sparse_reward and np.all(np.array(rewards) == reward_neg):
+        """
+        If the env has sparse reward and the trajectory is all negative rewards,
+        we use r / (1-gamma) as return to go.
+        For exapmle, if gamma = 0.99 and the rewards = [-1, -1, -1],
+        then return_to_go = [-100, -100, -100]
+        """
+        # assuming failure reward is negative
+        # use r / (1-gamma) for negative trajctory
+        return_to_go = [float(reward_neg / (1 - gamma))] * len(rewards)
+    else:
+        return_to_go = [0] * len(rewards)
+        prev_return = 0
+        for i in range(len(rewards)):
+            return_to_go[-i - 1] = rewards[-i - 1] + gamma * prev_return * (
+                1 - terminals[-i - 1]
+            )
+            prev_return = return_to_go[-i - 1]
+
+    return np.array(return_to_go, dtype=np.float32)
+
+
+def get_hand_dataset_with_mc_calculation(
+    env_name,
+    gamma,
+    add_expert_demos=True,
+    add_bc_demos=True,
+    reward_scale=1.0,
+    reward_bias=0.0,
+    pos_ind=-1,
+    clip_action=None,
+):
+
+    expert_demo_paths = {
+        "pen-binary-v0": "demonstrations/offpolicy_hand_data/pen2_sparse.npy",
+        "door-binary-v0": "demonstrations/offpolicy_hand_data/door2_sparse.npy",
+        "relocate-binary-v0": "demonstrations/offpolicy_hand_data/relocate2_sparse.npy",
+    }
+
+    bc_demo_paths = {
+        "pen-binary-v0": "demonstrations/offpolicy_hand_data/pen_bc_sparse4.npy",
+        "door-binary-v0": "demonstrations/offpolicy_hand_data/door_bc_sparse4.npy",
+        "relocate-binary-v0": "demonstrations/offpolicy_hand_data/relocate_bc_sparse4.npy",
+    }
+
+    def truncate_traj(
+        env_name,
+        dataset,
+        i,
+        reward_scale,
+        reward_bias,
+        gamma,
+        start_index=None,
+        end_index=None,
+    ):
+        """
+        This function truncates the i'th trajectory in dataset from start_index to end_index.
+        Since in Adroit-binary datasets, we have trajectories like [-1, -1, -1, -1, 0, 0, 0, -1, -1] which transit from neg -> pos -> neg,
+        we truncate the trajcotry from the beginning to the last positive reward, i.e., [-1, -1, -1, -1, 0, 0, 0]
+        """
+
+        reward_pos = ENV_CONFIG["adroit-binary"]["reward_pos"]
+
+        observations = np.array(dataset[i]["observations"])[start_index:end_index]
+        next_observations = np.array(dataset[i]["next_observations"])[
+            start_index:end_index
+        ]
+        rewards = dataset[i]["rewards"][start_index:end_index]
+        terminals = rewards == reward_pos
+        rewards = rewards * reward_scale + reward_bias
+        actions = np.array(dataset[i]["actions"])[start_index:end_index]
+        mc_returns = calc_return_to_go(
+            env_name,
+            rewards,
+            terminals,
+            gamma,
+            reward_scale,
+            reward_bias,
+            is_sparse_reward=True,
+        )
+
+        return dict(
+            observations=observations,
+            next_observations=next_observations,
+            actions=actions,
+            rewards=rewards,
+            terminals=terminals,
+            mc_returns=mc_returns,
+        )
+
+    dataset_list = []
+    dataset_bc_list = []
+    if add_expert_demos:
+        print("loading expert demos from:", expert_demo_paths[env_name])
+        dataset = np.load(expert_demo_paths[env_name], allow_pickle=True)
+
+        for i in range(len(dataset)):
+            N = len(dataset[i]["observations"])
+            for j in range(len(dataset[i]["observations"])):
+                dataset[i]["observations"][j] = dataset[i]["observations"][j][
+                    "state_observation"
+                ]
+                dataset[i]["next_observations"][j] = dataset[i]["next_observations"][j][
+                    "state_observation"
+                ]
+            if (
+                np.array(dataset[i]["rewards"]).shape
+                != np.array(dataset[i]["terminals"]).shape
+            ):
+                dataset[i]["rewards"] = dataset[i]["rewards"][:N]
+
+            if clip_action:
+                dataset[i]["actions"] = np.clip(
+                    dataset[i]["actions"], -clip_action, clip_action
+                )
+
+            assert (
+                np.array(dataset[i]["rewards"]).shape
+                == np.array(dataset[i]["terminals"]).shape
+            )
+            dataset[i].pop("terminals", None)
+
+            if not (0 in dataset[i]["rewards"]):
+                continue
+
+            trunc_ind = np.where(dataset[i]["rewards"] == 0)[0][pos_ind] + 1
+            d_pos = truncate_traj(
+                env_name,
+                dataset,
+                i,
+                reward_scale,
+                reward_bias,
+                gamma,
+                start_index=None,
+                end_index=trunc_ind,
+            )
+            dataset_list.append(d_pos)
+
+    if add_bc_demos:
+        print("loading BC demos from:", bc_demo_paths[env_name])
+        dataset_bc = np.load(bc_demo_paths[env_name], allow_pickle=True)
+        for i in range(len(dataset_bc)):
+            dataset_bc[i]["rewards"] = dataset_bc[i]["rewards"].squeeze()
+            dataset_bc[i]["terminals"] = dataset_bc[i]["terminals"].squeeze()
+            dataset_bc[i].pop("terminals", None)
+            if clip_action:
+                dataset_bc[i]["actions"] = np.clip(
+                    dataset_bc[i]["actions"], -clip_action, clip_action
+                )
+
+            if not (0 in dataset_bc[i]["rewards"]):
+                continue
+            trunc_ind = np.where(dataset_bc[i]["rewards"] == 0)[0][pos_ind] + 1
+            d_pos = truncate_traj(
+                env_name,
+                dataset_bc,
+                i,
+                reward_scale,
+                reward_bias,
+                gamma,
+                start_index=None,
+                end_index=trunc_ind,
+            )
+            dataset_bc_list.append(d_pos)
+
+    dataset = np.concatenate([dataset_list, dataset_bc_list])
+
+    print("num offline trajs:", len(dataset))
+    concatenated = {}
+    for key in dataset[0].keys():
+        if key in ["agent_infos", "env_infos"]:
+            continue
+        concatenated[key] = np.concatenate(
+            [batch[key] for batch in dataset], axis=0
+        ).astype(np.float32)
+    return concatenated
+
+
 class ReparameterizedTanhGaussian(nn.Module):
     def __init__(
         self,
@@ -425,6 +647,7 @@ class TanhGaussianPolicy(nn.Module):
         log_std_offset: float = -1.0,
         orthogonal_init: bool = False,
         no_tanh: bool = False,
+        q_n_hidden_units: int = 256,
     ):
         super().__init__()
         self.observation_dim = state_dim
@@ -434,13 +657,13 @@ class TanhGaussianPolicy(nn.Module):
         self.no_tanh = no_tanh
 
         self.base_network = nn.Sequential(
-            nn.Linear(state_dim, 256),
+            nn.Linear(state_dim, q_n_hidden_units),
             nn.ReLU(),
-            nn.Linear(256, 256),
+            nn.Linear(q_n_hidden_units, q_n_hidden_units),
             nn.ReLU(),
-            nn.Linear(256, 256),
+            nn.Linear(q_n_hidden_units, q_n_hidden_units),
             nn.ReLU(),
-            nn.Linear(256, 2 * action_dim),
+            nn.Linear(q_n_hidden_units, 2 * action_dim),
         )
 
         if orthogonal_init:
@@ -492,6 +715,7 @@ class FullyConnectedQFunction(nn.Module):
         action_dim: int,
         orthogonal_init: bool = False,
         n_hidden_layers: int = 2,
+        q_n_hidden_units: int = 256,
     ):
         super().__init__()
         self.observation_dim = observation_dim
@@ -499,13 +723,13 @@ class FullyConnectedQFunction(nn.Module):
         self.orthogonal_init = orthogonal_init
 
         layers = [
-            nn.Linear(observation_dim + action_dim, 256),
+            nn.Linear(observation_dim + action_dim, q_n_hidden_units),
             nn.ReLU(),
         ]
         for _ in range(n_hidden_layers - 1):
-            layers.append(nn.Linear(256, 256))
+            layers.append(nn.Linear(q_n_hidden_units, q_n_hidden_units))
             layers.append(nn.ReLU())
-        layers.append(nn.Linear(256, 1))
+        layers.append(nn.Linear(q_n_hidden_units, 1))
 
         self.network = nn.Sequential(*layers)
         if orthogonal_init:
@@ -513,7 +737,9 @@ class FullyConnectedQFunction(nn.Module):
         else:
             init_module_weights(self.network[-1], False)
 
-    def forward(self, observations: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, observations: torch.Tensor, actions: torch.Tensor
+    ) -> torch.Tensor:
         multiple_actions = False
         batch_size = observations.shape[0]
         if actions.ndim == 3 and observations.ndim == 2:
@@ -980,8 +1206,36 @@ class CalQL:
         self.total_it = state_dict["total_it"]
 
 
-@pyrallis.wrap()
 def train(config: TrainConfig):
+    calql_demo = {
+        "pen-binary-v0": "pen-cloned-v1",
+        "door-binary-v0": "door-cloned-v1",
+        "relocate-binary-v0": "relocate-cloned-v1",
+    }
+    if config.env in calql_demo:
+        dataset = get_hand_dataset_with_mc_calculation(
+            config.env,
+            gamma=config.discount,
+            reward_scale=config.reward_scale,
+            reward_bias=config.reward_bias,
+            clip_action=0.99999,
+        )
+        config.env = calql_demo[config.env]
+
+    else:
+        dataset = d4rl.qlearning_dataset(env)
+        reward_mod_dict = {}
+        if config.normalize_reward:
+            reward_mod_dict = modify_reward(
+                dataset,
+                config.env,
+                reward_scale=config.reward_scale,
+                reward_bias=config.reward_bias,
+            )
+        mc_returns = get_return_to_go(dataset, env, config)
+        dataset["mc_returns"] = np.array(mc_returns)
+        assert len(dataset["mc_returns"]) == len(dataset["rewards"])
+
     env = gym.make(config.env)
     eval_env = gym.make(config.env)
 
@@ -993,20 +1247,6 @@ def train(config: TrainConfig):
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
-
-    dataset = d4rl.qlearning_dataset(env)
-
-    reward_mod_dict = {}
-    if config.normalize_reward:
-        reward_mod_dict = modify_reward(
-            dataset,
-            config.env,
-            reward_scale=config.reward_scale,
-            reward_bias=config.reward_bias,
-        )
-    mc_returns = get_return_to_go(dataset, env, config)
-    dataset["mc_returns"] = np.array(mc_returns)
-    assert len(dataset["mc_returns"]) == len(dataset["rewards"])
 
     if config.normalize:
         state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
@@ -1053,12 +1293,14 @@ def train(config: TrainConfig):
         action_dim,
         config.orthogonal_init,
         config.q_n_hidden_layers,
+        config.q_n_hidden_units,
     ).to(config.device)
     critic_2 = FullyConnectedQFunction(
         state_dim,
         action_dim,
         config.orthogonal_init,
         config.q_n_hidden_layers,
+        config.q_n_hidden_units,
     ).to(config.device)
     critic_1_optimizer = torch.optim.Adam(list(critic_1.parameters()), config.qf_lr)
     critic_2_optimizer = torch.optim.Adam(list(critic_2.parameters()), config.qf_lr)
@@ -1068,6 +1310,7 @@ def train(config: TrainConfig):
         action_dim,
         max_action,
         orthogonal_init=config.orthogonal_init,
+        q_n_hidden_units=config.q_n_hidden_units,
     ).to(config.device)
     actor_optimizer = torch.optim.Adam(actor.parameters(), config.policy_lr)
 
@@ -1231,4 +1474,39 @@ def train(config: TrainConfig):
 
 
 if __name__ == "__main__":
-    train()
+    config = pyrallis.parse(config_class=TrainConfig)
+
+    # Add sweep configuration
+    sweep_configuration = {
+        "method": "random",  # or 'grid', 'bayes'
+        "metric": {"name": "eval/d4rl_normalized_score", "goal": "maximize"},
+        "parameters": {
+            "cql_alpha": {"values": [0.5, 1.0, 5.0, 10.0]},
+            "cql_alpha_online": {"values": [0.5, 1.0, 5.0, 10.0]},
+        },
+    }
+
+    # Initialize the sweep
+    if config.sweep:
+        sweep_id = wandb.sweep(sweep=sweep_configuration, project="CORL")
+
+        def sweep_train():
+            print("---------------------------------------")
+            print("Training with sweep")
+            print("---------------------------------------")
+            # Initialize wandb first
+            wandb_init(asdict(config))
+            # Then access wandb.config
+            config.cql_alpha = wandb.config.cql_alpha
+            config.cql_alpha_online = wandb.config.cql_alpha_online
+            # Run the training
+            train(config)
+
+        # Start the sweep
+        wandb.agent(sweep_id, function=sweep_train)
+    else:
+        print("---------------------------------------")
+        print("Training without sweep")
+        print("---------------------------------------")
+        # wandb_init(asdict(config))
+        train(config)
