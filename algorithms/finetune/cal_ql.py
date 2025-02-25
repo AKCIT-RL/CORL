@@ -1214,7 +1214,7 @@ def train(config: TrainConfig):
     }
     if config.env in calql_demo:
         dataset = get_hand_dataset_with_mc_calculation(
-            config.env,
+            calql_demo[config.env],
             gamma=config.discount,
             reward_scale=config.reward_scale,
             reward_bias=config.reward_bias,
