@@ -18,13 +18,13 @@ device: cuda
 discount: 0.99
 env: antmaze-large-play-v2
 eval_freq: 50000
-group: cql-antmaze-large-play-v2-multiseed-v0
+group: calql-antmaze-large-play-v2-multiseed-v0
 load_model: ''
 offline_iterations: 1000000
 online_iterations: 1000000
 mixing_ratio: 0.5
 n_episodes: 100
-name: CQL
+name: CalQL
 normalize: false
 normalize_reward: true
 orthogonal_init: true
@@ -35,6 +35,7 @@ seed: 0
 soft_target_update_rate: 0.005
 target_update_period: 1
 q_n_hidden_layers: 5
+q_n_hidden_units: 256
 reward_scale: 10.0
 reward_bias: -5.0
 use_automatic_entropy_tuning: true
