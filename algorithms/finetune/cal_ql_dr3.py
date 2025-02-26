@@ -727,9 +727,10 @@ class FullyConnectedQFunction(nn.Module):
             nn.Linear(observation_dim + action_dim, q_n_hidden_units),
             nn.ReLU(),
         ]
-        for _ in range(n_hidden_layers - 1):
+        for _ in range(n_hidden_layers - 2):
             layers.append(nn.Linear(q_n_hidden_units, q_n_hidden_units))
             layers.append(nn.ReLU())
+        layers.append(nn.Linear(q_n_hidden_units, q_n_hidden_units))
         # layers.append(nn.Linear(q_n_hidden_units, 1))
 
         self.network = nn.Sequential(*layers)
@@ -884,10 +885,9 @@ class CalQL:
             log_probs = self.actor.log_prob(observations, actions)
             policy_loss = (alpha * log_pi - log_probs).mean()
         else:
-            q_new_actions = torch.min(
-                self.critic_1(observations, new_actions),
-                self.critic_2(observations, new_actions),
-            )
+            _, q1_new_actions = self.critic_1(observations, new_actions)
+            _, q2_new_actions = self.critic_2(observations, new_actions)
+            q_new_actions = torch.min(q1_new_actions, q2_new_actions)
             policy_loss = (alpha * log_pi - q_new_actions).mean()
         return policy_loss
 
@@ -909,10 +909,10 @@ class CalQL:
             new_next_actions, next_log_pi = self.actor(
                 next_observations, repeat=self.cql_n_actions
             )
-            q1_features_next, target_q1_predicted = self.target_critic_1(
+            _, target_q1_predicted = self.target_critic_1(
                 next_observations, new_next_actions
             )
-            q2_features_next, target_q2_predicted = self.target_critic_2(
+            _, target_q2_predicted = self.target_critic_2(
                 next_observations, new_next_actions
             )
             target_q_values, max_target_indices = torch.max(
@@ -927,10 +927,10 @@ class CalQL:
             ).squeeze(-1)
         else:
             new_next_actions, next_log_pi = self.actor(next_observations)
-            q1_features_next, target_q1_predicted = self.target_critic_1(
+            _, target_q1_predicted = self.target_critic_1(
                 next_observations, new_next_actions
             )
-            q2_features_next, target_q2_predicted = self.target_critic_2(
+            _, target_q2_predicted = self.target_critic_2(
                 next_observations, new_next_actions
             )
             target_q_values = torch.min(
@@ -968,12 +968,12 @@ class CalQL:
             cql_next_log_pis.detach(),
         )
 
-        cql_q1_rand = self.critic_1(observations, cql_random_actions)
-        cql_q2_rand = self.critic_2(observations, cql_random_actions)
-        cql_q1_current_actions = self.critic_1(observations, cql_current_actions)
-        cql_q2_current_actions = self.critic_2(observations, cql_current_actions)
-        cql_q1_next_actions = self.critic_1(observations, cql_next_actions)
-        cql_q2_next_actions = self.critic_2(observations, cql_next_actions)
+        _, cql_q1_rand = self.critic_1(observations, cql_random_actions)
+        _, cql_q2_rand = self.critic_2(observations, cql_random_actions)
+        _, cql_q1_current_actions = self.critic_1(observations, cql_current_actions)
+        _, cql_q2_current_actions = self.critic_2(observations, cql_current_actions)
+        _, cql_q1_next_actions = self.critic_1(observations, cql_next_actions)
+        _, cql_q2_next_actions = self.critic_2(observations, cql_next_actions)
 
         # Calibration
         lower_bounds = mc_returns.reshape(-1, 1).repeat(
@@ -996,10 +996,10 @@ class CalQL:
 
         """ Cal-QL: bound Q-values with MC return-to-go """
         if self._calibration_enabled:
-            cql_q1_current_actions = torch.maximum(cql_q1_current_actions, lower_bounds)
-            cql_q2_current_actions = torch.maximum(cql_q2_current_actions, lower_bounds)
-            cql_q1_next_actions = torch.maximum(cql_q1_next_actions, lower_bounds)
-            cql_q2_next_actions = torch.maximum(cql_q2_next_actions, lower_bounds)
+            cql_q1_current_actions = torch.max(cql_q1_current_actions, lower_bounds)
+            cql_q2_current_actions = torch.max(cql_q2_current_actions, lower_bounds)
+            cql_q1_next_actions = torch.max(cql_q1_next_actions, lower_bounds)
+            cql_q2_next_actions = torch.max(cql_q2_next_actions, lower_bounds)
 
         cql_cat_q1 = torch.cat(
             [
@@ -1082,6 +1082,10 @@ class CalQL:
             alpha_prime = observations.new_tensor(0.0)
 
         # Compute DR3 loss
+        with torch.no_grad():
+            new_next_actions, next_log_pi = self.actor(next_observations)
+            q1_features_next, _ = self.critic_1(next_observations, new_next_actions)
+            q2_features_next, _ = self.critic_2(next_observations, new_next_actions)
         dr3_loss_q1 = self.dr3_regularizer(q1_features, q1_features_next)
         dr3_loss_q2 = self.dr3_regularizer(q2_features, q2_features_next)
 
@@ -1235,13 +1239,10 @@ class CalQL:
         self.total_it = state_dict["total_it"]
 
     # DR3 Regularizer
-    def dr3_regularizer(features_1, features_2):
+    def dr3_regularizer(self, features_1, features_2):
         """
         Compute the DR3 regularizer as the dot product of features.
-
-        DR3 Regularizer:
-        L = (f(s, a) - f(s', a'))^2
-        encourage the learned Q-function to yield representations that are as orthogonal as possible
+        Encourage the learned Q-function to yield representations that are as orthogonal as possible
         between data from dataset and policy. In this manner, the representations of (s, a) and (s', a')
         can be distinctly discerned.
 
