@@ -84,6 +84,7 @@ class TrainConfig:
     group: str = "Cal-QL-D4RL"  # wandb group name
     name: str = "Cal-QL"  # wandb run name
     sweep: bool = False  # If True, the run will be logged in a sweep
+    dr3_lambda: float = 0.1  # DR3 regularization coefficient
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -729,13 +730,15 @@ class FullyConnectedQFunction(nn.Module):
         for _ in range(n_hidden_layers - 1):
             layers.append(nn.Linear(q_n_hidden_units, q_n_hidden_units))
             layers.append(nn.ReLU())
-        layers.append(nn.Linear(q_n_hidden_units, 1))
+        # layers.append(nn.Linear(q_n_hidden_units, 1))
 
         self.network = nn.Sequential(*layers)
+        self.q_value_head = nn.Linear(q_n_hidden_units, 1)
         if orthogonal_init:
             self.network.apply(lambda m: init_module_weights(m, True))
         else:
             init_module_weights(self.network[-1], False)
+            init_module_weights(self.q_value_head, False)
 
     def forward(
         self, observations: torch.Tensor, actions: torch.Tensor
@@ -749,10 +752,11 @@ class FullyConnectedQFunction(nn.Module):
             )
             actions = actions.reshape(-1, actions.shape[-1])
         input_tensor = torch.cat([observations, actions], dim=-1)
-        q_values = torch.squeeze(self.network(input_tensor), dim=-1)
+        features = torch.squeeze(self.network(input_tensor), dim=-1)
+        q_values = self.q_value_head(features).squeeze(-1)
         if multiple_actions:
             q_values = q_values.reshape(batch_size, -1)
-        return q_values
+        return features, q_values
 
 
 class Scalar(nn.Module):
@@ -793,6 +797,7 @@ class CalQL:
         cql_clip_diff_min: float = -np.inf,
         cql_clip_diff_max: float = np.inf,
         device: str = "cpu",
+        dr3_lambda: float = 0.0,
     ):
         super().__init__()
 
@@ -816,7 +821,7 @@ class CalQL:
         self.cql_clip_diff_min = cql_clip_diff_min
         self.cql_clip_diff_max = cql_clip_diff_max
         self._device = device
-
+        self.dr3_lambda = dr3_lambda
         self.total_it = 0
 
         self.critic_1 = critic_1
@@ -897,17 +902,23 @@ class CalQL:
         alpha: torch.Tensor,
         log_dict: Dict,
     ) -> torch.Tensor:
-        q1_predicted = self.critic_1(observations, actions)
-        q2_predicted = self.critic_2(observations, actions)
+        q1_features, q1_predicted = self.critic_1(observations, actions)
+        q2_features, q2_predicted = self.critic_2(observations, actions)
 
         if self.cql_max_target_backup:
             new_next_actions, next_log_pi = self.actor(
                 next_observations, repeat=self.cql_n_actions
             )
+            q1_features_next, target_q1_predicted = self.target_critic_1(
+                next_observations, new_next_actions
+            )
+            q2_features_next, target_q2_predicted = self.target_critic_2(
+                next_observations, new_next_actions
+            )
             target_q_values, max_target_indices = torch.max(
                 torch.min(
-                    self.target_critic_1(next_observations, new_next_actions),
-                    self.target_critic_2(next_observations, new_next_actions),
+                    target_q1_predicted,
+                    target_q2_predicted,
                 ),
                 dim=-1,
             )
@@ -916,9 +927,15 @@ class CalQL:
             ).squeeze(-1)
         else:
             new_next_actions, next_log_pi = self.actor(next_observations)
+            q1_features_next, target_q1_predicted = self.target_critic_1(
+                next_observations, new_next_actions
+            )
+            q2_features_next, target_q2_predicted = self.target_critic_2(
+                next_observations, new_next_actions
+            )
             target_q_values = torch.min(
-                self.target_critic_1(next_observations, new_next_actions),
-                self.target_critic_2(next_observations, new_next_actions),
+                target_q1_predicted,
+                target_q2_predicted,
             )
 
         if self.backup_entropy:
@@ -1064,12 +1081,24 @@ class CalQL:
             alpha_prime_loss = observations.new_tensor(0.0)
             alpha_prime = observations.new_tensor(0.0)
 
-        qf_loss = qf1_loss + qf2_loss + cql_min_qf1_loss + cql_min_qf2_loss
+        # Compute DR3 loss
+        dr3_loss_q1 = self.dr3_regularizer(q1_features, q1_features_next)
+        dr3_loss_q2 = self.dr3_regularizer(q2_features, q2_features_next)
+
+        qf_loss = (
+            qf1_loss
+            + qf2_loss
+            + cql_min_qf1_loss
+            + cql_min_qf2_loss
+            + self.dr3_lambda * (dr3_loss_q1 + dr3_loss_q2)
+        )
 
         log_dict.update(
             dict(
                 qf1_loss=qf1_loss.item(),
                 qf2_loss=qf2_loss.item(),
+                dr3_loss_q1=dr3_loss_q1.item(),
+                dr3_loss_q2=dr3_loss_q2.item(),
                 alpha=alpha.item(),
                 average_qf1=q1_predicted.mean().item(),
                 average_qf2=q2_predicted.mean().item(),
@@ -1205,6 +1234,34 @@ class CalQL:
         )
         self.total_it = state_dict["total_it"]
 
+    # DR3 Regularizer
+    def dr3_regularizer(features_1, features_2):
+        """
+        Compute the DR3 regularizer as the dot product of features.
+
+        DR3 Regularizer:
+        L = (f(s, a) - f(s', a'))^2
+        encourage the learned Q-function to yield representations that are as orthogonal as possible
+        between data from dataset and policy. In this manner, the representations of (s, a) and (s', a')
+        can be distinctly discerned.
+
+        - Kumar, A., Agarwal, R., Ma, T., Courville, A., Tucker, G., & Levine, S. (2021). Dr3: Value-based
+        deep reinforcement learning requires explicit regularization. arXiv preprint arXiv:2112.04716.
+        - Ma, Y., Tang, H., Li, D., & Meng, Z. (2023). Reining generalization in offline reinforcement
+        learning via representation distinction. Advances in Neural Information Processing Systems, 36,
+        40773-40785.
+
+        Args:
+            features_1: Features from state-action pairs (batch_size, feature_dim)
+            features_2: Features from next state-action pairs (batch_size, feature_dim)
+        Returns:
+            Regularization loss (scalar)
+        """
+        dot_products = (features_1 * features_2).sum(
+            dim=-1
+        )  # Compute dot product per sample
+        return dot_products.mean()  # Average over the batch
+
 
 def train(config: TrainConfig):
     calql_demo = {
@@ -1221,7 +1278,6 @@ def train(config: TrainConfig):
             clip_action=0.99999,
         )
         config.env = calql_demo[config.env]
-
         env = gym.make(config.env)
         eval_env = gym.make(config.env)
 
@@ -1344,6 +1400,7 @@ def train(config: TrainConfig):
         "cql_max_target_backup": config.cql_max_target_backup,
         "cql_clip_diff_min": config.cql_clip_diff_min,
         "cql_clip_diff_max": config.cql_clip_diff_max,
+        "dr3_lambda": config.dr3_lambda,
     }
 
     print("---------------------------------------")
