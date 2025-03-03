@@ -18,6 +18,8 @@ import torch.nn.functional as F
 import wandb
 from torch.distributions import Normal, TanhTransform, TransformedDistribution
 
+torch.autograd.set_detect_anomaly(True)
+
 TensorBatch = List[torch.Tensor]
 
 ENVS_WITH_GOAL = ("antmaze", "pen", "door", "hammer", "relocate")
@@ -805,6 +807,7 @@ class CalQL:
         cql_clip_diff_max: float = np.inf,
         device: str = "cpu",
         dr3_lambda: float = 0.0,
+        **kwargs,
     ):
         super().__init__()
 
@@ -1269,19 +1272,20 @@ class RD(CalQL):
 
     def _policy_ood_loss(self, observations, actions, log_dict):
         # Compute OOD action loss
-        ood_actions = self.actor_ood(observations)
-        phi_pi_1 = self.critic_1.network(
+        ood_actions, _ = self.actor_ood(observations)
+
+        _, phi_pi_1 = self.critic_1(
             observations, actions
         )  # Representation of policy actions
-        phi_pi_2 = self.critic_2.network(
+        _, phi_pi_2 = self.critic_2(
             observations, actions
         )  # Representation of policy actions
         phi_pi = torch.min(phi_pi_1, phi_pi_2)
 
-        phi_ood_1 = self.critic_1.network(
+        _, phi_ood_1 = self.critic_1(
             observations, ood_actions
         )  # Representation of OOD actions
-        phi_ood_2 = self.critic_2.network(
+        _, phi_ood_2 = self.critic_2(
             observations, ood_actions
         )  # Representation of OOD actions
         phi_ood = torch.min(phi_ood_1, phi_ood_2)
@@ -1318,7 +1322,8 @@ class RD(CalQL):
         q_features = torch.min(q1_features, q2_features)
 
         # DR3 loss (L1)
-        new_next_actions, _ = self.actor(next_observations)
+        with torch.no_grad():
+            new_next_actions, _ = self.actor(next_observations)
         q1_features_next, _ = self.critic_1(next_observations, new_next_actions)
         q2_features_next, _ = self.critic_2(next_observations, new_next_actions)
         q_features_next = torch.min(q1_features_next, q2_features_next)
@@ -1326,30 +1331,31 @@ class RD(CalQL):
         l1 = self.dr3_regularizer(q_features, q_features_next)
 
         # L2 loss
-        ood_actions = self.actor_ood(observations)
+        with torch.no_grad():
+            ood_actions, _ = self.actor_ood(observations)
         q1_features_ood, _ = self.critic_1(observations, ood_actions)
         q2_features_ood, _ = self.critic_2(observations, ood_actions)
         q_features_ood = torch.min(q1_features_ood, q2_features_ood)
         l2 = self.dr3_regularizer(q_features, q_features_ood)
 
         # Weighting function
-        w = torch.tanh(self.total_it / self.M_rd)  # Hyperparameter can be tuned
+        w = np.tanh(self.total_it / self.M_rd)
 
         # Compute L_RD
         l_rd = (1 - w) * l1 + w * l2
 
-        qf_loss = self.lambda_rd * l_rd
+        rd_loss = self.lambda_rd * l_rd
 
         log_dict.update(
             dict(
                 l1_loss=l1.item(),
                 l2_loss=l2.item(),
                 l_rd=l_rd.item(),
-                w=w.item(),
+                w=w,
             )
         )
 
-        return qf_loss
+        return rd_loss
 
     def train(self, batch: TensorBatch) -> Dict[str, float]:
         (
@@ -1360,64 +1366,71 @@ class RD(CalQL):
             dones,
             mc_returns,
         ) = batch
-        self.total_it += 1
-        log_dict = dict()
-        if self.total_it % self.interval_rd == 0:
-            ood_loss = self._policy_ood_loss(observations, actions, log_dict)
-            rd_loss = self._rd_loss(observations, actions, next_observations, log_dict)
+        with torch.autograd.set_detect_anomaly(True):
 
-            self.actor_ood_optimizer.zero_grad()
-            ood_loss.backward()
-            self.actor_ood_optimizer.step()
+            self.total_it += 1
+            log_dict = dict()
+            rd_loss = torch.tensor(0.0, device=self._device)
 
-        new_actions, log_pi = self.actor(observations)
+            if self.total_it % self.interval_rd == 0:
+                ood_loss = self._policy_ood_loss(observations, actions, log_dict)
 
-        alpha, alpha_loss = self._alpha_and_alpha_loss(observations, log_pi)
+                self.actor_ood_optimizer.zero_grad()
+                ood_loss.backward()
+                self.actor_ood_optimizer.step()
 
-        """ Policy loss """
-        policy_loss = self._policy_loss(
-            observations, actions, new_actions, alpha, log_pi
-        )
+                rd_loss = self._rd_loss(
+                    observations, actions, next_observations, log_dict
+                )
 
-        log_dict.update(
-            dict(
-                log_pi=log_pi.mean().item(),
-                policy_loss=policy_loss.item(),
-                alpha_loss=alpha_loss.item(),
-                alpha=alpha.item(),
+            new_actions, log_pi = self.actor(observations)
+
+            alpha, alpha_loss = self._alpha_and_alpha_loss(observations, log_pi)
+
+            """ Policy loss """
+            policy_loss = self._policy_loss(
+                observations, actions, new_actions, alpha, log_pi
             )
-        )
 
-        """ Q function loss """
-        qf_loss = self._q_loss(
-            observations,
-            actions,
-            next_observations,
-            rewards,
-            dones,
-            mc_returns,
-            alpha,
-            log_dict,
-        )
-        qf_loss = self.lambda_rd * rd_loss + qf_loss
+            log_dict.update(
+                dict(
+                    log_pi=log_pi.mean().item(),
+                    policy_loss=policy_loss.item(),
+                    alpha_loss=alpha_loss.item(),
+                    alpha=alpha.item(),
+                )
+            )
 
-        if self.use_automatic_entropy_tuning:
-            self.alpha_optimizer.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optimizer.step()
+            """ Q function loss """
+            qf_loss = self._q_loss(
+                observations,
+                actions,
+                next_observations,
+                rewards,
+                dones,
+                mc_returns,
+                alpha,
+                log_dict,
+            )
+            qf_loss = qf_loss + self.lambda_rd * rd_loss
 
-        self.actor_optimizer.zero_grad()
-        policy_loss.backward()
-        self.actor_optimizer.step()
+            if self.use_automatic_entropy_tuning:
+                self.alpha_optimizer.zero_grad()
+                alpha_loss.backward()
+                self.alpha_optimizer.step()
 
-        self.critic_1_optimizer.zero_grad()
-        self.critic_2_optimizer.zero_grad()
-        qf_loss.backward(retain_graph=True)
-        self.critic_1_optimizer.step()
-        self.critic_2_optimizer.step()
+            self.actor_optimizer.zero_grad()
+            policy_loss.backward()
+            self.actor_optimizer.step()
 
-        if self.total_it % self.target_update_period == 0:
-            self.update_target_network(self.soft_target_update_rate)
+            self.critic_1_optimizer.zero_grad()
+            self.critic_2_optimizer.zero_grad()
+            qf_loss.backward(retain_graph=True)
+            self.critic_1_optimizer.step()
+            self.critic_2_optimizer.step()
+
+            if self.total_it % self.target_update_period == 0:
+                self.update_target_network(self.soft_target_update_rate)
 
         return log_dict
 

@@ -18,6 +18,8 @@ import torch.nn.functional as F
 import wandb
 from torch.distributions import Normal, TanhTransform, TransformedDistribution
 
+torch.autograd.set_detect_anomaly(True)
+
 TensorBatch = List[torch.Tensor]
 
 ENVS_WITH_GOAL = ("antmaze", "pen", "door", "hammer", "relocate")
@@ -84,7 +86,10 @@ class TrainConfig:
     group: str = "Cal-QL-D4RL"  # wandb group name
     name: str = "Cal-QL"  # wandb run name
     sweep: bool = False  # If True, the run will be logged in a sweep
-    dr3_lambda: float = 0.1  # DR3 regularization coefficient
+    # RD
+    is_rd: bool = True  # If True, use RD
+    lambda_rd: float = 0.1  # DR3 regularization coefficient
+    interval_rd: int = 10
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -799,6 +804,7 @@ class CalQL:
         cql_clip_diff_max: float = np.inf,
         device: str = "cpu",
         dr3_lambda: float = 0.0,
+        **kwargs,
     ):
         super().__init__()
 
@@ -902,8 +908,8 @@ class CalQL:
         alpha: torch.Tensor,
         log_dict: Dict,
     ) -> torch.Tensor:
-        q1_features, q1_predicted = self.critic_1(observations, actions)
-        q2_features, q2_predicted = self.critic_2(observations, actions)
+        _, q1_predicted = self.critic_1(observations, actions)
+        _, q2_predicted = self.critic_2(observations, actions)
 
         if self.cql_max_target_backup:
             new_next_actions, next_log_pi = self.actor(
@@ -1081,28 +1087,12 @@ class CalQL:
             alpha_prime_loss = observations.new_tensor(0.0)
             alpha_prime = observations.new_tensor(0.0)
 
-        # Compute DR3 loss
-        with torch.no_grad():
-            new_next_actions, next_log_pi = self.actor(next_observations)
-            q1_features_next, _ = self.critic_1(next_observations, new_next_actions)
-            q2_features_next, _ = self.critic_2(next_observations, new_next_actions)
-        dr3_loss_q1 = self.dr3_regularizer(q1_features, q1_features_next)
-        dr3_loss_q2 = self.dr3_regularizer(q2_features, q2_features_next)
-
-        qf_loss = (
-            qf1_loss
-            + qf2_loss
-            + cql_min_qf1_loss
-            + cql_min_qf2_loss
-            + self.dr3_lambda * (dr3_loss_q1 + dr3_loss_q2)
-        )
+        qf_loss = qf1_loss + qf2_loss + cql_min_qf1_loss + cql_min_qf2_loss
 
         log_dict.update(
             dict(
                 qf1_loss=qf1_loss.item(),
                 qf2_loss=qf2_loss.item(),
-                dr3_loss_q1=dr3_loss_q1.item(),
-                dr3_loss_q2=dr3_loss_q2.item(),
                 alpha=alpha.item(),
                 average_qf1=q1_predicted.mean().item(),
                 average_qf2=q2_predicted.mean().item(),
@@ -1238,6 +1228,20 @@ class CalQL:
         )
         self.total_it = state_dict["total_it"]
 
+
+class RD(CalQL):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.actor_ood = deepcopy(self.actor).to(self._device)
+        self.actor_ood_optimizer = torch.optim.Adam(
+            self.actor_ood.parameters(), lr=self.policy_lr
+        )
+        self.lambda_rd = 0.1
+        self.M_rd = 2e6
+        self.alpha_rd = 0.6
+        self.beta_rd = 0.7
+        self.interval_rd = 10
+
     # DR3 Regularizer
     def dr3_regularizer(self, features_1, features_2):
         """
@@ -1262,6 +1266,111 @@ class CalQL:
             dim=-1
         )  # Compute dot product per sample
         return dot_products.mean()  # Average over the batch
+
+    def _rd_loss(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        next_observations: torch.Tensor,
+        log_dict: Dict,
+    ) -> torch.Tensor:
+        q1_features, _ = self.critic_1(observations, actions)
+        q2_features, _ = self.critic_2(observations, actions)
+        q_features = torch.min(q1_features, q2_features)
+
+        # DR3 loss (L1)
+        with torch.no_grad():
+            new_next_actions, _ = self.actor(next_observations)
+        q1_features_next, _ = self.critic_1(next_observations, new_next_actions)
+        q2_features_next, _ = self.critic_2(next_observations, new_next_actions)
+        q_features_next = torch.min(q1_features_next, q2_features_next)
+
+        l1 = self.dr3_regularizer(q_features, q_features_next)
+
+        rd_loss = self.lambda_rd * l1
+
+        log_dict.update(
+            dict(
+                l1_loss=l1.item(),
+            )
+        )
+
+        return rd_loss
+
+    def train(self, batch: TensorBatch) -> Dict[str, float]:
+        (
+            observations,
+            actions,
+            rewards,
+            next_observations,
+            dones,
+            mc_returns,
+        ) = batch
+        with torch.autograd.set_detect_anomaly(True):
+
+            self.total_it += 1
+            log_dict = dict()
+            rd_loss = torch.tensor(0.0, device=self._device)
+
+            if self.total_it % self.interval_rd == 0:
+                rd_loss = self._rd_loss(
+                    observations, actions, next_observations, log_dict
+                )
+
+            new_actions, log_pi = self.actor(observations)
+
+            alpha, alpha_loss = self._alpha_and_alpha_loss(observations, log_pi)
+
+            """ Policy loss """
+            policy_loss = self._policy_loss(
+                observations, actions, new_actions, alpha, log_pi
+            )
+
+            log_dict.update(
+                dict(
+                    log_pi=log_pi.mean().item(),
+                    policy_loss=policy_loss.item(),
+                    alpha_loss=alpha_loss.item(),
+                    alpha=alpha.item(),
+                )
+            )
+
+            """ Q function loss """
+            qf_loss = self._q_loss(
+                observations,
+                actions,
+                next_observations,
+                rewards,
+                dones,
+                mc_returns,
+                alpha,
+                log_dict,
+            )
+            qf_loss = qf_loss + self.lambda_rd * rd_loss
+
+            if self.use_automatic_entropy_tuning:
+                self.alpha_optimizer.zero_grad()
+                alpha_loss.backward()
+                self.alpha_optimizer.step()
+
+            self.actor_optimizer.zero_grad()
+            policy_loss.backward()
+            self.actor_optimizer.step()
+
+            self.critic_1_optimizer.zero_grad()
+            self.critic_2_optimizer.zero_grad()
+            qf_loss.backward(retain_graph=True)
+            self.critic_1_optimizer.step()
+            self.critic_2_optimizer.step()
+
+            if self.total_it % self.target_update_period == 0:
+                self.update_target_network(self.soft_target_update_rate)
+
+        return log_dict
+
+    def switch_calibration(self):
+        self._calibration_enabled = not self._calibration_enabled
+        self.dr3_lambda = 0.0
 
 
 def train(config: TrainConfig):
@@ -1401,7 +1510,12 @@ def train(config: TrainConfig):
         "cql_max_target_backup": config.cql_max_target_backup,
         "cql_clip_diff_min": config.cql_clip_diff_min,
         "cql_clip_diff_max": config.cql_clip_diff_max,
-        "dr3_lambda": config.dr3_lambda,
+        # RD
+        "lambda_rd": config.lambda_rd,
+        "M_rd": config.M_rd,
+        "alpha_rd": config.alpha_rd,
+        "beta_rd": config.beta_rd,
+        "interval_rd": config.interval_rd,
     }
 
     print("---------------------------------------")
@@ -1409,7 +1523,10 @@ def train(config: TrainConfig):
     print("---------------------------------------")
 
     # Initialize actor
-    trainer = CalQL(**kwargs)
+    if config.is_rd:
+        trainer = RD(**kwargs)
+    else:
+        trainer = CalQL(**kwargs)
 
     if config.load_model != "":
         policy_file = Path(config.load_model)
