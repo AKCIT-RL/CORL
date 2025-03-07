@@ -1235,15 +1235,264 @@ class CalQL:
 class RD(CalQL):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.actor_ood = deepcopy(self.actor).to(self._device)
-        self.actor_ood_optimizer = torch.optim.Adam(
-            self.actor_ood.parameters(), lr=self.policy_lr
-        )
+        self.actor_ood = kwargs["actor_ood"]
+        self.actor_ood_optimizer = kwargs["actor_ood_optimizer"]
         self.lambda_rd = 0.1
         self.M_rd = 2e6
         self.alpha_rd = 0.6
         self.beta_rd = 0.7
         self.interval_rd = 10
+
+    def _q_loss(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        next_observations: torch.Tensor,
+        rewards: torch.Tensor,
+        dones: torch.Tensor,
+        mc_returns: torch.Tensor,
+        alpha: torch.Tensor,
+        log_dict: Dict,
+    ) -> torch.Tensor:
+        q1_features, q1_predicted = self.critic_1(observations, actions)
+        q2_features, q2_predicted = self.critic_2(observations, actions)
+
+        if self.cql_max_target_backup:
+            new_next_actions, next_log_pi = self.actor(
+                next_observations, repeat=self.cql_n_actions
+            )
+            _, target_q1_predicted = self.target_critic_1(
+                next_observations, new_next_actions
+            )
+            _, target_q2_predicted = self.target_critic_2(
+                next_observations, new_next_actions
+            )
+            target_q_values, max_target_indices = torch.max(
+                torch.min(
+                    target_q1_predicted,
+                    target_q2_predicted,
+                ),
+                dim=-1,
+            )
+            next_log_pi = torch.gather(
+                next_log_pi, -1, max_target_indices.unsqueeze(-1)
+            ).squeeze(-1)
+        else:
+            new_next_actions, next_log_pi = self.actor(next_observations)
+            _, target_q1_predicted = self.target_critic_1(
+                next_observations, new_next_actions
+            )
+            _, target_q2_predicted = self.target_critic_2(
+                next_observations, new_next_actions
+            )
+            target_q_values = torch.min(
+                target_q1_predicted,
+                target_q2_predicted,
+            )
+
+        if self.backup_entropy:
+            target_q_values = target_q_values - alpha * next_log_pi
+
+        target_q_values = target_q_values.unsqueeze(-1)
+        td_target = rewards + (1.0 - dones) * self.discount * target_q_values.detach()
+        td_target = td_target.squeeze(-1)
+        qf1_loss = F.mse_loss(q1_predicted, td_target.detach())
+        qf2_loss = F.mse_loss(q2_predicted, td_target.detach())
+
+        # CQL
+        batch_size = actions.shape[0]
+        action_dim = actions.shape[-1]
+        cql_random_actions = actions.new_empty(
+            (batch_size, self.cql_n_actions, action_dim), requires_grad=False
+        ).uniform_(-1, 1)
+        cql_current_actions, cql_current_log_pis = self.actor(
+            observations, repeat=self.cql_n_actions
+        )
+        cql_next_actions, cql_next_log_pis = self.actor(
+            next_observations, repeat=self.cql_n_actions
+        )
+        cql_current_actions, cql_current_log_pis = (
+            cql_current_actions.detach(),
+            cql_current_log_pis.detach(),
+        )
+        cql_next_actions, cql_next_log_pis = (
+            cql_next_actions.detach(),
+            cql_next_log_pis.detach(),
+        )
+
+        _, cql_q1_rand = self.critic_1(observations, cql_random_actions)
+        _, cql_q2_rand = self.critic_2(observations, cql_random_actions)
+        q1_features_next, cql_q1_current_actions = self.critic_1(
+            observations, cql_current_actions
+        )
+        q2_features_next, cql_q2_current_actions = self.critic_2(
+            observations, cql_current_actions
+        )
+        _, cql_q1_next_actions = self.critic_1(observations, cql_next_actions)
+        _, cql_q2_next_actions = self.critic_2(observations, cql_next_actions)
+
+        # Calibration
+        lower_bounds = mc_returns.reshape(-1, 1).repeat(
+            1, cql_q1_current_actions.shape[1]
+        )
+
+        num_vals = torch.sum(lower_bounds == lower_bounds)
+        bound_rate_cql_q1_current_actions = (
+            torch.sum(cql_q1_current_actions < lower_bounds) / num_vals
+        )
+        bound_rate_cql_q2_current_actions = (
+            torch.sum(cql_q2_current_actions < lower_bounds) / num_vals
+        )
+        bound_rate_cql_q1_next_actions = (
+            torch.sum(cql_q1_next_actions < lower_bounds) / num_vals
+        )
+        bound_rate_cql_q2_next_actions = (
+            torch.sum(cql_q2_next_actions < lower_bounds) / num_vals
+        )
+
+        """ Cal-QL: bound Q-values with MC return-to-go """
+        if self._calibration_enabled:
+            cql_q1_current_actions = torch.max(cql_q1_current_actions, lower_bounds)
+            cql_q2_current_actions = torch.max(cql_q2_current_actions, lower_bounds)
+            cql_q1_next_actions = torch.max(cql_q1_next_actions, lower_bounds)
+            cql_q2_next_actions = torch.max(cql_q2_next_actions, lower_bounds)
+
+        cql_cat_q1 = torch.cat(
+            [
+                cql_q1_rand,
+                torch.unsqueeze(q1_predicted, 1),
+                cql_q1_next_actions,
+                cql_q1_current_actions,
+            ],
+            dim=1,
+        )
+        cql_cat_q2 = torch.cat(
+            [
+                cql_q2_rand,
+                torch.unsqueeze(q2_predicted, 1),
+                cql_q2_next_actions,
+                cql_q2_current_actions,
+            ],
+            dim=1,
+        )
+        cql_std_q1 = torch.std(cql_cat_q1, dim=1)
+        cql_std_q2 = torch.std(cql_cat_q2, dim=1)
+
+        if self.cql_importance_sample:
+            random_density = np.log(0.5**action_dim)
+            cql_cat_q1 = torch.cat(
+                [
+                    cql_q1_rand - random_density,
+                    cql_q1_next_actions - cql_next_log_pis.detach(),
+                    cql_q1_current_actions - cql_current_log_pis.detach(),
+                ],
+                dim=1,
+            )
+            cql_cat_q2 = torch.cat(
+                [
+                    cql_q2_rand - random_density,
+                    cql_q2_next_actions - cql_next_log_pis.detach(),
+                    cql_q2_current_actions - cql_current_log_pis.detach(),
+                ],
+                dim=1,
+            )
+
+        cql_qf1_ood = torch.logsumexp(cql_cat_q1 / self.cql_temp, dim=1) * self.cql_temp
+        cql_qf2_ood = torch.logsumexp(cql_cat_q2 / self.cql_temp, dim=1) * self.cql_temp
+
+        """Subtract the log likelihood of data"""
+        cql_qf1_diff = torch.clamp(
+            cql_qf1_ood - q1_predicted,
+            self.cql_clip_diff_min,
+            self.cql_clip_diff_max,
+        ).mean()
+        cql_qf2_diff = torch.clamp(
+            cql_qf2_ood - q2_predicted,
+            self.cql_clip_diff_min,
+            self.cql_clip_diff_max,
+        ).mean()
+
+        if self.cql_lagrange:
+            alpha_prime = torch.clamp(
+                torch.exp(self.log_alpha_prime()), min=0.0, max=1000000.0
+            )
+            cql_min_qf1_loss = (
+                alpha_prime
+                * self.cql_alpha
+                * (cql_qf1_diff - self.cql_target_action_gap)
+            )
+            cql_min_qf2_loss = (
+                alpha_prime
+                * self.cql_alpha
+                * (cql_qf2_diff - self.cql_target_action_gap)
+            )
+
+            self.alpha_prime_optimizer.zero_grad()
+            alpha_prime_loss = (-cql_min_qf1_loss - cql_min_qf2_loss) * 0.5
+            alpha_prime_loss.backward(retain_graph=True)
+            self.alpha_prime_optimizer.step()
+        else:
+            cql_min_qf1_loss = cql_qf1_diff * self.cql_alpha
+            cql_min_qf2_loss = cql_qf2_diff * self.cql_alpha
+            alpha_prime_loss = observations.new_tensor(0.0)
+            alpha_prime = observations.new_tensor(0.0)
+
+        qf_loss = qf1_loss + qf2_loss + cql_min_qf1_loss + cql_min_qf2_loss
+
+        q_features = torch.min(q1_features, q2_features)
+        q_features_next = torch.min(q1_features_next[0], q2_features_next[0])
+        l1 = self.dr3_regularizer(q_features, q_features_next)
+
+        ood_actions, _ = self.actor_ood(observations)
+        q1_features_ood, _ = self.critic_1(observations, ood_actions.detach())
+        q2_features_ood, _ = self.critic_2(observations, ood_actions.detach())
+        q_features_ood = torch.min(q1_features_ood, q2_features_ood)
+        l2 = self.dr3_regularizer(q_features, q_features_ood)
+
+        w = np.tanh(self.total_it / self.M_rd)
+        rd_loss = (1 - w) * l1 + w * l2
+
+        qf_loss = qf_loss + (self.lambda_rd * rd_loss)
+
+        log_dict.update(
+            dict(l1_loss=l1.item(), l2_loss=l2.item(), rd_loss=rd_loss.item())
+        )
+
+        log_dict.update(
+            dict(
+                qf1_loss=qf1_loss.item(),
+                qf2_loss=qf2_loss.item(),
+                alpha=alpha.item(),
+                average_qf1=q1_predicted.mean().item(),
+                average_qf2=q2_predicted.mean().item(),
+                average_target_q=target_q_values.mean().item(),
+            )
+        )
+
+        log_dict.update(
+            dict(
+                cql_std_q1=cql_std_q1.mean().item(),
+                cql_std_q2=cql_std_q2.mean().item(),
+                cql_q1_rand=cql_q1_rand.mean().item(),
+                cql_q2_rand=cql_q2_rand.mean().item(),
+                cql_min_qf1_loss=cql_min_qf1_loss.mean().item(),
+                cql_min_qf2_loss=cql_min_qf2_loss.mean().item(),
+                cql_qf1_diff=cql_qf1_diff.mean().item(),
+                cql_qf2_diff=cql_qf2_diff.mean().item(),
+                cql_q1_current_actions=cql_q1_current_actions.mean().item(),
+                cql_q2_current_actions=cql_q2_current_actions.mean().item(),
+                cql_q1_next_actions=cql_q1_next_actions.mean().item(),
+                cql_q2_next_actions=cql_q2_next_actions.mean().item(),
+                alpha_prime_loss=alpha_prime_loss.item(),
+                alpha_prime=alpha_prime.item(),
+                bound_rate_cql_q1_current_actions=bound_rate_cql_q1_current_actions.item(),  # noqa
+                bound_rate_cql_q2_current_actions=bound_rate_cql_q2_current_actions.item(),  # noqa
+                bound_rate_cql_q1_next_actions=bound_rate_cql_q1_next_actions.item(),
+                bound_rate_cql_q2_next_actions=bound_rate_cql_q2_next_actions.item(),
+            )
+        )
+
+        return qf_loss
 
     # DR3 Regularizer
     def dr3_regularizer(self, features_1, features_2):
@@ -1302,13 +1551,15 @@ class RD(CalQL):
             )  # Max(0, α * Q(s, a) - Q(s, π_ood))
         ).mean()
 
+        self.actor_ood_optimizer.zero_grad()
+        l_ood.backward()
+        self.actor_ood_optimizer.step()
+
         log_dict.update(
             dict(
                 l_ood=l_ood.item(),
             )
         )
-
-        return l_ood
 
     def _rd_loss(
         self,
@@ -1370,18 +1621,9 @@ class RD(CalQL):
 
             self.total_it += 1
             log_dict = dict()
-            rd_loss = torch.tensor(0.0, device=self._device)
 
             if self.total_it % self.interval_rd == 0:
-                ood_loss = self._policy_ood_loss(observations, actions, log_dict)
-
-                self.actor_ood_optimizer.zero_grad()
-                ood_loss.backward()
-                self.actor_ood_optimizer.step()
-
-                rd_loss = self._rd_loss(
-                    observations, actions, next_observations, log_dict
-                )
+                self._policy_ood_loss(observations, actions, log_dict)
 
             new_actions, log_pi = self.actor(observations)
 
@@ -1412,7 +1654,6 @@ class RD(CalQL):
                 alpha,
                 log_dict,
             )
-            qf_loss = qf_loss + self.lambda_rd * rd_loss
 
             if self.use_automatic_entropy_tuning:
                 self.alpha_optimizer.zero_grad()
@@ -1436,7 +1677,7 @@ class RD(CalQL):
 
     def switch_calibration(self):
         self._calibration_enabled = not self._calibration_enabled
-        self.dr3_lambda = 0.0
+        self.lambda_rd = 0.0
 
 
 def train(config: TrainConfig):
@@ -1548,6 +1789,15 @@ def train(config: TrainConfig):
     ).to(config.device)
     actor_optimizer = torch.optim.Adam(actor.parameters(), config.policy_lr)
 
+    actor_ood = TanhGaussianPolicy(
+        state_dim,
+        action_dim,
+        max_action,
+        orthogonal_init=config.orthogonal_init,
+        q_n_hidden_units=config.q_n_hidden_units,
+    ).to(config.device)
+    actor_ood_optimizer = torch.optim.Adam(actor_ood.parameters(), config.policy_lr)
+
     kwargs = {
         "critic_1": critic_1,
         "critic_2": critic_2,
@@ -1555,6 +1805,8 @@ def train(config: TrainConfig):
         "critic_2_optimizer": critic_2_optimizer,
         "actor": actor,
         "actor_optimizer": actor_optimizer,
+        "actor_ood": actor_ood,
+        "actor_ood_optimizer": actor_ood_optimizer,
         "discount": config.discount,
         "soft_target_update_rate": config.soft_target_update_rate,
         "device": config.device,
