@@ -1318,12 +1318,8 @@ class RD(CalQL):
 
         _, cql_q1_rand = self.critic_1(observations, cql_random_actions)
         _, cql_q2_rand = self.critic_2(observations, cql_random_actions)
-        q1_features_next, cql_q1_current_actions = self.critic_1(
-            observations, cql_current_actions
-        )
-        q2_features_next, cql_q2_current_actions = self.critic_2(
-            observations, cql_current_actions
-        )
+        _, cql_q1_current_actions = self.critic_1(observations, cql_current_actions)
+        _, cql_q2_current_actions = self.critic_2(observations, cql_current_actions)
         _, cql_q1_next_actions = self.critic_1(observations, cql_next_actions)
         _, cql_q2_next_actions = self.critic_2(observations, cql_next_actions)
 
@@ -1435,8 +1431,12 @@ class RD(CalQL):
 
         qf_loss = qf1_loss + qf2_loss + cql_min_qf1_loss + cql_min_qf2_loss
 
+        new_next_actions, next_log_pi = self.actor(observations)
+        q1_features_next, _ = self.critic_1(observations, new_next_actions.detach())
+        q2_features_next, _ = self.critic_2(observations, new_next_actions.detach())
+
         q_features = torch.min(q1_features, q2_features)
-        q_features_next = torch.min(q1_features_next[0], q2_features_next[0])
+        q_features_next = torch.min(q1_features_next, q2_features_next)
         l1 = self.dr3_regularizer(q_features, q_features_next)
         rd_loss = self.lambda_rd * l1
         qf_loss = qf_loss + rd_loss

@@ -1322,12 +1322,8 @@ class RD(CalQL):
 
         _, cql_q1_rand = self.critic_1(observations, cql_random_actions)
         _, cql_q2_rand = self.critic_2(observations, cql_random_actions)
-        q1_features_next, cql_q1_current_actions = self.critic_1(
-            observations, cql_current_actions
-        )
-        q2_features_next, cql_q2_current_actions = self.critic_2(
-            observations, cql_current_actions
-        )
+        _, cql_q1_current_actions = self.critic_1(observations, cql_current_actions)
+        _, cql_q2_current_actions = self.critic_2(observations, cql_current_actions)
         _, cql_q1_next_actions = self.critic_1(observations, cql_next_actions)
         _, cql_q2_next_actions = self.critic_2(observations, cql_next_actions)
 
@@ -1439,8 +1435,12 @@ class RD(CalQL):
 
         qf_loss = qf1_loss + qf2_loss + cql_min_qf1_loss + cql_min_qf2_loss
 
+        new_next_actions, next_log_pi = self.actor(observations)
+        q1_features_next, _ = self.critic_1(observations, new_next_actions.detach())
+        q2_features_next, _ = self.critic_2(observations, new_next_actions.detach())
+
         q_features = torch.min(q1_features, q2_features)
-        q_features_next = torch.min(q1_features_next[0], q2_features_next[0])
+        q_features_next = torch.min(q1_features_next, q2_features_next)
         l1 = self.dr3_regularizer(q_features, q_features_next)
 
         ood_actions, _ = self.actor_ood(observations)
@@ -1521,7 +1521,7 @@ class RD(CalQL):
 
     def _policy_ood_loss(self, observations, actions, log_dict):
         # Compute OOD action loss
-        ood_actions, _ = self.actor_ood(observations)
+        ood_actions, log_pi = self.actor_ood(observations)
 
         _, phi_pi_1 = self.critic_1(
             observations, actions
@@ -1541,14 +1541,17 @@ class RD(CalQL):
 
         # Compute L_ood using Equation (5)
         l_ood = (
-            torch.max(
-                phi_ood - self.beta_rd * phi_pi,
-                torch.zeros_like(phi_ood - self.beta_rd * phi_pi),
-            )  # Max(0, Q(s, π_ood) - β * Q(s, a))
-            + torch.max(
-                phi_pi - self.alpha_rd * phi_ood,
-                torch.zeros_like(phi_pi - self.alpha_rd * phi_ood),
-            )  # Max(0, α * Q(s, a) - Q(s, π_ood))
+            log_pi
+            - (
+                torch.max(
+                    phi_ood - self.beta_rd * phi_pi,
+                    torch.zeros_like(phi_ood - self.beta_rd * phi_pi),
+                )  # Max(0, Q(s, π_ood) - β * Q(s, a))
+                + torch.max(
+                    self.alpha_rd * phi_pi - phi_ood,
+                    torch.zeros_like(self.alpha_rd * phi_pi - phi_ood),
+                )  # Max(0, α * Q(s, a) - Q(s, π_ood))
+            )
         ).mean()
 
         self.actor_ood_optimizer.zero_grad()
@@ -1560,53 +1563,6 @@ class RD(CalQL):
                 l_ood=l_ood.item(),
             )
         )
-
-    def _rd_loss(
-        self,
-        observations: torch.Tensor,
-        actions: torch.Tensor,
-        next_observations: torch.Tensor,
-        log_dict: Dict,
-    ) -> torch.Tensor:
-        q1_features, _ = self.critic_1(observations, actions)
-        q2_features, _ = self.critic_2(observations, actions)
-        q_features = torch.min(q1_features, q2_features)
-
-        # DR3 loss (L1)
-        with torch.no_grad():
-            new_next_actions, _ = self.actor(next_observations)
-        q1_features_next, _ = self.critic_1(next_observations, new_next_actions)
-        q2_features_next, _ = self.critic_2(next_observations, new_next_actions)
-        q_features_next = torch.min(q1_features_next, q2_features_next)
-
-        l1 = self.dr3_regularizer(q_features, q_features_next)
-
-        # L2 loss
-        with torch.no_grad():
-            ood_actions, _ = self.actor_ood(observations)
-        q1_features_ood, _ = self.critic_1(observations, ood_actions)
-        q2_features_ood, _ = self.critic_2(observations, ood_actions)
-        q_features_ood = torch.min(q1_features_ood, q2_features_ood)
-        l2 = self.dr3_regularizer(q_features, q_features_ood)
-
-        # Weighting function
-        w = np.tanh(self.total_it / self.M_rd)
-
-        # Compute L_RD
-        l_rd = (1 - w) * l1 + w * l2
-
-        rd_loss = self.lambda_rd * l_rd
-
-        log_dict.update(
-            dict(
-                l1_loss=l1.item(),
-                l2_loss=l2.item(),
-                l_rd=l_rd.item(),
-                w=w,
-            )
-        )
-
-        return rd_loss
 
     def train(self, batch: TensorBatch) -> Dict[str, float]:
         (
