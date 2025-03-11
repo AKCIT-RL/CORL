@@ -1431,9 +1431,13 @@ class RD(CalQL):
 
         qf_loss = qf1_loss + qf2_loss + cql_min_qf1_loss + cql_min_qf2_loss
 
-        new_next_actions, next_log_pi = self.actor(observations)
-        q1_features_next, _ = self.critic_1(observations, new_next_actions.detach())
-        q2_features_next, _ = self.critic_2(observations, new_next_actions.detach())
+        new_next_actions, next_log_pi = self.actor(next_observations)
+        q1_features_next, _ = self.critic_1(
+            next_observations, new_next_actions.detach()
+        )
+        q2_features_next, _ = self.critic_2(
+            next_observations, new_next_actions.detach()
+        )
 
         q_features = torch.min(q1_features, q2_features)
         q_features_next = torch.min(q1_features_next, q2_features_next)
