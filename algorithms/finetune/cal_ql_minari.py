@@ -8,8 +8,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import d4rl
-import gym
+import minari
+import gymnasium as gym
 import numpy as np
 import pyrallis
 import torch
@@ -18,22 +18,9 @@ import torch.nn.functional as F
 import wandb
 from torch.distributions import Normal, TanhTransform, TransformedDistribution
 
-torch.autograd.set_detect_anomaly(True)
-
 TensorBatch = List[torch.Tensor]
 
 ENVS_WITH_GOAL = ("antmaze", "pen", "door", "hammer", "relocate")
-
-ENV_CONFIG = {
-    "antmaze": {
-        "reward_pos": 1.0,
-        "reward_neg": 0.0,
-    },
-    "adroit-binary": {
-        "reward_pos": 0.0,
-        "reward_neg": -1.0,
-    },
-}
 
 
 @dataclass
@@ -41,6 +28,7 @@ class TrainConfig:
     # Experiment
     device: str = "cuda"
     env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
+    dataset_id: str = "halfcheetah-medium-expert-v2"  # Minari dataset id
     seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
     eval_seed: int = 0  # Eval environment seed
     eval_freq: int = int(5e3)  # How often (time steps) we evaluate
@@ -75,7 +63,6 @@ class TrainConfig:
     normalize: bool = True  # Normalize states
     normalize_reward: bool = False  # Normalize reward
     q_n_hidden_layers: int = 2  # Number of hidden layers in Q networks
-    q_n_hidden_units: int = 256  # Number of hidden units in Q networks
     reward_scale: float = 1.0  # Reward scale for normalization
     reward_bias: float = 0.0  # Reward bias for normalization
     # Cal-QL
@@ -85,14 +72,6 @@ class TrainConfig:
     project: str = "CORL"  # wandb project name
     group: str = "Cal-QL-D4RL"  # wandb group name
     name: str = "Cal-QL"  # wandb run name
-    sweep: bool = False  # If True, the run will be logged in a sweep
-    # RD
-    is_rd: bool = True  # If True, use RD
-    lambda_rd: float = 0.1  # DR3 regularization coefficient
-    M_rd: int = 1000  # Number of iterations to update the OOD action
-    alpha_rd: float = 0.6
-    beta_rd: float = 0.7
-    interval_rd: int = 10
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -120,6 +99,7 @@ def wrap_env(
     state_mean: Union[np.ndarray, float] = 0.0,
     state_std: Union[np.ndarray, float] = 1.0,
     reward_scale: float = 1.0,
+    observation_space: gym.Space = None,
 ) -> gym.Env:
     # PEP 8: E731 do not assign a lambda expression, use a def
     def normalize_state(state):
@@ -131,7 +111,7 @@ def wrap_env(
         # Please be careful, here reward is multiplied by scale!
         return reward_scale * reward
 
-    env = gym.wrappers.TransformObservation(env, normalize_state)
+    env = gym.wrappers.TransformObservation(env, normalize_state, observation_space)
     if reward_scale != 1.0:
         env = gym.wrappers.TransformReward(env, scale_reward)
     return env
@@ -172,7 +152,7 @@ class ReplayBuffer:
         return torch.tensor(data, dtype=torch.float32, device=self._device)
 
     # Loads data in d4rl format, i.e. from Dict[str, np.array].
-    def load_d4rl_dataset(self, data: Dict[str, np.ndarray]):
+    def load_dataset(self, data: Dict[str, np.ndarray]):
         if self._size != 0:
             raise ValueError("Trying to load data into non-empty replay buffer")
         n_transitions = data["observations"].shape[0]
@@ -223,16 +203,7 @@ class ReplayBuffer:
         self._size = min(self._size + 1, self._buffer_size)
 
 
-def set_env_seed(env: Optional[gym.Env], seed: int):
-    env.seed(seed)
-    env.action_space.seed(seed)
-
-
-def set_seed(
-    seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
-):
-    if env is not None:
-        set_env_seed(env, seed)
+def set_seed(seed: int, deterministic_torch: bool = False):
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -261,17 +232,18 @@ def is_goal_reached(reward: float, info: Dict) -> bool:
 def eval_actor(
     env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
 ) -> Tuple[np.ndarray, np.ndarray]:
-    env.seed(seed)
     actor.eval()
     episode_rewards = []
     successes = []
     for _ in range(n_episodes):
-        state, done = env.reset(), False
+        state, _ = env.reset(seed=seed)
+        done = False
+        truncated = False
         episode_reward = 0.0
         goal_achieved = False
-        while not done:
+        while not done and not truncated:
             action = actor.act(state, device)
-            state, reward, done, env_infos = env.step(action)
+            state, reward, done, truncated, env_infos = env.step(action)
             episode_reward += reward
             if not goal_achieved:
                 goal_achieved = is_goal_reached(reward, env_infos)
@@ -376,6 +348,25 @@ def modify_reward_online(
     return reward
 
 
+def qlearning_dataset(dataset: minari.MinariDataset) -> Dict[str, np.ndarray]:
+    obs, next_obs, actions, rewards, dones = [], [], [], [], []
+
+    for episode in dataset.iterate_episodes():
+        obs.append(episode.observations[:-1].astype(np.float32))
+        next_obs.append(episode.observations[1:].astype(np.float32))
+        actions.append(episode.actions.astype(np.float32))
+        rewards.append(episode.rewards)
+        dones.append(episode.terminations | episode.truncations)
+
+    return {
+        "observations": np.concatenate(obs),
+        "actions": np.concatenate(actions),
+        "next_observations": np.concatenate(next_obs),
+        "rewards": np.concatenate(rewards),
+        "terminals": np.concatenate(dones),
+    }
+
+
 def extend_and_repeat(tensor: torch.Tensor, dim: int, repeat: int) -> torch.Tensor:
     return tensor.unsqueeze(dim).repeat_interleave(repeat, dim=dim)
 
@@ -387,212 +378,6 @@ def init_module_weights(module: torch.nn.Module, orthogonal_init: bool = False):
             nn.init.constant_(module.bias, 0.0)
         else:
             nn.init.xavier_uniform_(module.weight, gain=1e-2)
-
-
-def calc_return_to_go(
-    env_name, rewards, terminals, gamma, reward_scale, reward_bias, is_sparse_reward
-):
-    """
-    A config dict for getting the default high/low rewrd values for each envs
-    This is used in calc_return_to_go func in sampler.py and replay_buffer.py
-    """
-    if len(rewards) == 0:
-        return np.array([])
-
-    if "antmaze" in env_name:
-        reward_neg = ENV_CONFIG["antmaze"]["reward_neg"] * reward_scale + reward_bias
-    elif env_name in [
-        "pen-binary-v0",
-        "door-binary-v0",
-        "relocate-binary-v0",
-        "pen-binary",
-        "door-binary",
-        "relocate-binary",
-    ]:
-        reward_neg = (
-            ENV_CONFIG["adroit-binary"]["reward_neg"] * reward_scale + reward_bias
-        )
-    else:
-        assert (
-            not is_sparse_reward
-        ), "If you want to try on a sparse reward env, please add the reward_neg value in the ENV_CONFIG dict."
-
-    if is_sparse_reward and np.all(np.array(rewards) == reward_neg):
-        """
-        If the env has sparse reward and the trajectory is all negative rewards,
-        we use r / (1-gamma) as return to go.
-        For exapmle, if gamma = 0.99 and the rewards = [-1, -1, -1],
-        then return_to_go = [-100, -100, -100]
-        """
-        # assuming failure reward is negative
-        # use r / (1-gamma) for negative trajctory
-        return_to_go = [float(reward_neg / (1 - gamma))] * len(rewards)
-    else:
-        return_to_go = [0] * len(rewards)
-        prev_return = 0
-        for i in range(len(rewards)):
-            return_to_go[-i - 1] = rewards[-i - 1] + gamma * prev_return * (
-                1 - terminals[-i - 1]
-            )
-            prev_return = return_to_go[-i - 1]
-
-    return np.array(return_to_go, dtype=np.float32)
-
-
-def get_hand_dataset_with_mc_calculation(
-    env_name,
-    gamma,
-    add_expert_demos=True,
-    add_bc_demos=True,
-    reward_scale=1.0,
-    reward_bias=0.0,
-    pos_ind=-1,
-    clip_action=None,
-):
-
-    expert_demo_paths = {
-        "pen-binary-v0": "demonstrations/offpolicy_hand_data/pen2_sparse.npy",
-        "door-binary-v0": "demonstrations/offpolicy_hand_data/door2_sparse.npy",
-        "relocate-binary-v0": "demonstrations/offpolicy_hand_data/relocate2_sparse.npy",
-    }
-
-    bc_demo_paths = {
-        "pen-binary-v0": "demonstrations/offpolicy_hand_data/pen_bc_sparse4.npy",
-        "door-binary-v0": "demonstrations/offpolicy_hand_data/door_bc_sparse4.npy",
-        "relocate-binary-v0": "demonstrations/offpolicy_hand_data/relocate_bc_sparse4.npy",
-    }
-
-    def truncate_traj(
-        env_name,
-        dataset,
-        i,
-        reward_scale,
-        reward_bias,
-        gamma,
-        start_index=None,
-        end_index=None,
-    ):
-        """
-        This function truncates the i'th trajectory in dataset from start_index to end_index.
-        Since in Adroit-binary datasets, we have trajectories like [-1, -1, -1, -1, 0, 0, 0, -1, -1] which transit from neg -> pos -> neg,
-        we truncate the trajcotry from the beginning to the last positive reward, i.e., [-1, -1, -1, -1, 0, 0, 0]
-        """
-
-        reward_pos = ENV_CONFIG["adroit-binary"]["reward_pos"]
-
-        observations = np.array(dataset[i]["observations"])[start_index:end_index]
-        next_observations = np.array(dataset[i]["next_observations"])[
-            start_index:end_index
-        ]
-        rewards = dataset[i]["rewards"][start_index:end_index]
-        terminals = rewards == reward_pos
-        rewards = rewards * reward_scale + reward_bias
-        actions = np.array(dataset[i]["actions"])[start_index:end_index]
-        mc_returns = calc_return_to_go(
-            env_name,
-            rewards,
-            terminals,
-            gamma,
-            reward_scale,
-            reward_bias,
-            is_sparse_reward=True,
-        )
-
-        return dict(
-            observations=observations,
-            next_observations=next_observations,
-            actions=actions,
-            rewards=rewards,
-            terminals=terminals,
-            mc_returns=mc_returns,
-        )
-
-    dataset_list = []
-    dataset_bc_list = []
-    if add_expert_demos:
-        print("loading expert demos from:", expert_demo_paths[env_name])
-        dataset = np.load(expert_demo_paths[env_name], allow_pickle=True)
-
-        for i in range(len(dataset)):
-            N = len(dataset[i]["observations"])
-            for j in range(len(dataset[i]["observations"])):
-                dataset[i]["observations"][j] = dataset[i]["observations"][j][
-                    "state_observation"
-                ]
-                dataset[i]["next_observations"][j] = dataset[i]["next_observations"][j][
-                    "state_observation"
-                ]
-            if (
-                np.array(dataset[i]["rewards"]).shape
-                != np.array(dataset[i]["terminals"]).shape
-            ):
-                dataset[i]["rewards"] = dataset[i]["rewards"][:N]
-
-            if clip_action:
-                dataset[i]["actions"] = np.clip(
-                    dataset[i]["actions"], -clip_action, clip_action
-                )
-
-            assert (
-                np.array(dataset[i]["rewards"]).shape
-                == np.array(dataset[i]["terminals"]).shape
-            )
-            dataset[i].pop("terminals", None)
-
-            if not (0 in dataset[i]["rewards"]):
-                continue
-
-            trunc_ind = np.where(dataset[i]["rewards"] == 0)[0][pos_ind] + 1
-            d_pos = truncate_traj(
-                env_name,
-                dataset,
-                i,
-                reward_scale,
-                reward_bias,
-                gamma,
-                start_index=None,
-                end_index=trunc_ind,
-            )
-            dataset_list.append(d_pos)
-
-    if add_bc_demos:
-        print("loading BC demos from:", bc_demo_paths[env_name])
-        dataset_bc = np.load(bc_demo_paths[env_name], allow_pickle=True)
-        for i in range(len(dataset_bc)):
-            dataset_bc[i]["rewards"] = dataset_bc[i]["rewards"].squeeze()
-            dataset_bc[i]["terminals"] = dataset_bc[i]["terminals"].squeeze()
-            dataset_bc[i].pop("terminals", None)
-            if clip_action:
-                dataset_bc[i]["actions"] = np.clip(
-                    dataset_bc[i]["actions"], -clip_action, clip_action
-                )
-
-            if not (0 in dataset_bc[i]["rewards"]):
-                continue
-            trunc_ind = np.where(dataset_bc[i]["rewards"] == 0)[0][pos_ind] + 1
-            d_pos = truncate_traj(
-                env_name,
-                dataset_bc,
-                i,
-                reward_scale,
-                reward_bias,
-                gamma,
-                start_index=None,
-                end_index=trunc_ind,
-            )
-            dataset_bc_list.append(d_pos)
-
-    dataset = np.concatenate([dataset_list, dataset_bc_list])
-
-    print("num offline trajs:", len(dataset))
-    concatenated = {}
-    for key in dataset[0].keys():
-        if key in ["agent_infos", "env_infos"]:
-            continue
-        concatenated[key] = np.concatenate(
-            [batch[key] for batch in dataset], axis=0
-        ).astype(np.float32)
-    return concatenated
 
 
 class ReparameterizedTanhGaussian(nn.Module):
@@ -656,7 +441,6 @@ class TanhGaussianPolicy(nn.Module):
         log_std_offset: float = -1.0,
         orthogonal_init: bool = False,
         no_tanh: bool = False,
-        q_n_hidden_units: int = 256,
     ):
         super().__init__()
         self.observation_dim = state_dim
@@ -666,13 +450,13 @@ class TanhGaussianPolicy(nn.Module):
         self.no_tanh = no_tanh
 
         self.base_network = nn.Sequential(
-            nn.Linear(state_dim, q_n_hidden_units),
+            nn.Linear(state_dim, 256),
             nn.ReLU(),
-            nn.Linear(q_n_hidden_units, q_n_hidden_units),
+            nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(q_n_hidden_units, q_n_hidden_units),
+            nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(q_n_hidden_units, 2 * action_dim),
+            nn.Linear(256, 2 * action_dim),
         )
 
         if orthogonal_init:
@@ -724,7 +508,6 @@ class FullyConnectedQFunction(nn.Module):
         action_dim: int,
         orthogonal_init: bool = False,
         n_hidden_layers: int = 2,
-        q_n_hidden_units: int = 256,
     ):
         super().__init__()
         self.observation_dim = observation_dim
@@ -732,22 +515,19 @@ class FullyConnectedQFunction(nn.Module):
         self.orthogonal_init = orthogonal_init
 
         layers = [
-            nn.Linear(observation_dim + action_dim, q_n_hidden_units),
+            nn.Linear(observation_dim + action_dim, 256),
             nn.ReLU(),
         ]
-        for _ in range(n_hidden_layers - 2):
-            layers.append(nn.Linear(q_n_hidden_units, q_n_hidden_units))
+        for _ in range(n_hidden_layers - 1):
+            layers.append(nn.Linear(256, 256))
             layers.append(nn.ReLU())
-        layers.append(nn.Linear(q_n_hidden_units, q_n_hidden_units))
-        # layers.append(nn.Linear(q_n_hidden_units, 1))
+        layers.append(nn.Linear(256, 1))
 
         self.network = nn.Sequential(*layers)
-        self.q_value_head = nn.Linear(q_n_hidden_units, 1)
         if orthogonal_init:
             self.network.apply(lambda m: init_module_weights(m, True))
         else:
             init_module_weights(self.network[-1], False)
-            init_module_weights(self.q_value_head, False)
 
     def forward(
         self, observations: torch.Tensor, actions: torch.Tensor
@@ -761,11 +541,10 @@ class FullyConnectedQFunction(nn.Module):
             )
             actions = actions.reshape(-1, actions.shape[-1])
         input_tensor = torch.cat([observations, actions], dim=-1)
-        features = torch.squeeze(self.network(input_tensor), dim=-1)
-        q_values = self.q_value_head(features).squeeze(-1)
+        q_values = torch.squeeze(self.network(input_tensor), dim=-1)
         if multiple_actions:
             q_values = q_values.reshape(batch_size, -1)
-        return features, q_values
+        return q_values
 
 
 class Scalar(nn.Module):
@@ -806,8 +585,6 @@ class CalQL:
         cql_clip_diff_min: float = -np.inf,
         cql_clip_diff_max: float = np.inf,
         device: str = "cpu",
-        dr3_lambda: float = 0.0,
-        **kwargs,
     ):
         super().__init__()
 
@@ -831,7 +608,7 @@ class CalQL:
         self.cql_clip_diff_min = cql_clip_diff_min
         self.cql_clip_diff_max = cql_clip_diff_max
         self._device = device
-        self.dr3_lambda = dr3_lambda
+
         self.total_it = 0
 
         self.critic_1 = critic_1
@@ -894,9 +671,10 @@ class CalQL:
             log_probs = self.actor.log_prob(observations, actions)
             policy_loss = (alpha * log_pi - log_probs).mean()
         else:
-            _, q1_new_actions = self.critic_1(observations, new_actions)
-            _, q2_new_actions = self.critic_2(observations, new_actions)
-            q_new_actions = torch.min(q1_new_actions, q2_new_actions)
+            q_new_actions = torch.min(
+                self.critic_1(observations, new_actions),
+                self.critic_2(observations, new_actions),
+            )
             policy_loss = (alpha * log_pi - q_new_actions).mean()
         return policy_loss
 
@@ -911,23 +689,17 @@ class CalQL:
         alpha: torch.Tensor,
         log_dict: Dict,
     ) -> torch.Tensor:
-        _, q1_predicted = self.critic_1(observations, actions)
-        _, q2_predicted = self.critic_2(observations, actions)
+        q1_predicted = self.critic_1(observations, actions)
+        q2_predicted = self.critic_2(observations, actions)
 
         if self.cql_max_target_backup:
             new_next_actions, next_log_pi = self.actor(
                 next_observations, repeat=self.cql_n_actions
             )
-            _, target_q1_predicted = self.target_critic_1(
-                next_observations, new_next_actions
-            )
-            _, target_q2_predicted = self.target_critic_2(
-                next_observations, new_next_actions
-            )
             target_q_values, max_target_indices = torch.max(
                 torch.min(
-                    target_q1_predicted,
-                    target_q2_predicted,
+                    self.target_critic_1(next_observations, new_next_actions),
+                    self.target_critic_2(next_observations, new_next_actions),
                 ),
                 dim=-1,
             )
@@ -936,15 +708,9 @@ class CalQL:
             ).squeeze(-1)
         else:
             new_next_actions, next_log_pi = self.actor(next_observations)
-            _, target_q1_predicted = self.target_critic_1(
-                next_observations, new_next_actions
-            )
-            _, target_q2_predicted = self.target_critic_2(
-                next_observations, new_next_actions
-            )
             target_q_values = torch.min(
-                target_q1_predicted,
-                target_q2_predicted,
+                self.target_critic_1(next_observations, new_next_actions),
+                self.target_critic_2(next_observations, new_next_actions),
             )
 
         if self.backup_entropy:
@@ -977,12 +743,12 @@ class CalQL:
             cql_next_log_pis.detach(),
         )
 
-        _, cql_q1_rand = self.critic_1(observations, cql_random_actions)
-        _, cql_q2_rand = self.critic_2(observations, cql_random_actions)
-        _, cql_q1_current_actions = self.critic_1(observations, cql_current_actions)
-        _, cql_q2_current_actions = self.critic_2(observations, cql_current_actions)
-        _, cql_q1_next_actions = self.critic_1(observations, cql_next_actions)
-        _, cql_q2_next_actions = self.critic_2(observations, cql_next_actions)
+        cql_q1_rand = self.critic_1(observations, cql_random_actions)
+        cql_q2_rand = self.critic_2(observations, cql_random_actions)
+        cql_q1_current_actions = self.critic_1(observations, cql_current_actions)
+        cql_q2_current_actions = self.critic_2(observations, cql_current_actions)
+        cql_q1_next_actions = self.critic_1(observations, cql_next_actions)
+        cql_q2_next_actions = self.critic_2(observations, cql_next_actions)
 
         # Calibration
         lower_bounds = mc_returns.reshape(-1, 1).repeat(
@@ -1005,10 +771,10 @@ class CalQL:
 
         """ Cal-QL: bound Q-values with MC return-to-go """
         if self._calibration_enabled:
-            cql_q1_current_actions = torch.max(cql_q1_current_actions, lower_bounds)
-            cql_q2_current_actions = torch.max(cql_q2_current_actions, lower_bounds)
-            cql_q1_next_actions = torch.max(cql_q1_next_actions, lower_bounds)
-            cql_q2_next_actions = torch.max(cql_q2_next_actions, lower_bounds)
+            cql_q1_current_actions = torch.maximum(cql_q1_current_actions, lower_bounds)
+            cql_q2_current_actions = torch.maximum(cql_q2_current_actions, lower_bounds)
+            cql_q1_next_actions = torch.maximum(cql_q1_next_actions, lower_bounds)
+            cql_q2_next_actions = torch.maximum(cql_q2_next_actions, lower_bounds)
 
         cql_cat_q1 = torch.cat(
             [
@@ -1232,471 +998,56 @@ class CalQL:
         self.total_it = state_dict["total_it"]
 
 
-class RD(CalQL):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.actor_ood = kwargs["actor_ood"]
-        self.actor_ood_optimizer = kwargs["actor_ood_optimizer"]
-        self.lambda_rd = 0.1
-        self.M_rd = 2e6
-        self.alpha_rd = 0.6
-        self.beta_rd = 0.7
-        self.interval_rd = 10
-
-    def _q_loss(
-        self,
-        observations: torch.Tensor,
-        actions: torch.Tensor,
-        next_observations: torch.Tensor,
-        rewards: torch.Tensor,
-        dones: torch.Tensor,
-        mc_returns: torch.Tensor,
-        alpha: torch.Tensor,
-        log_dict: Dict,
-    ) -> torch.Tensor:
-        q1_features, q1_predicted = self.critic_1(observations, actions)
-        q2_features, q2_predicted = self.critic_2(observations, actions)
-
-        if self.cql_max_target_backup:
-            new_next_actions, next_log_pi = self.actor(
-                next_observations, repeat=self.cql_n_actions
-            )
-            _, target_q1_predicted = self.target_critic_1(
-                next_observations, new_next_actions
-            )
-            _, target_q2_predicted = self.target_critic_2(
-                next_observations, new_next_actions
-            )
-            target_q_values, max_target_indices = torch.max(
-                torch.min(
-                    target_q1_predicted,
-                    target_q2_predicted,
-                ),
-                dim=-1,
-            )
-            next_log_pi = torch.gather(
-                next_log_pi, -1, max_target_indices.unsqueeze(-1)
-            ).squeeze(-1)
-        else:
-            new_next_actions, next_log_pi = self.actor(next_observations)
-            _, target_q1_predicted = self.target_critic_1(
-                next_observations, new_next_actions
-            )
-            _, target_q2_predicted = self.target_critic_2(
-                next_observations, new_next_actions
-            )
-            target_q_values = torch.min(
-                target_q1_predicted,
-                target_q2_predicted,
-            )
-
-        if self.backup_entropy:
-            target_q_values = target_q_values - alpha * next_log_pi
-
-        target_q_values = target_q_values.unsqueeze(-1)
-        td_target = rewards + (1.0 - dones) * self.discount * target_q_values.detach()
-        td_target = td_target.squeeze(-1)
-        qf1_loss = F.mse_loss(q1_predicted, td_target.detach())
-        qf2_loss = F.mse_loss(q2_predicted, td_target.detach())
-
-        # CQL
-        batch_size = actions.shape[0]
-        action_dim = actions.shape[-1]
-        cql_random_actions = actions.new_empty(
-            (batch_size, self.cql_n_actions, action_dim), requires_grad=False
-        ).uniform_(-1, 1)
-        cql_current_actions, cql_current_log_pis = self.actor(
-            observations, repeat=self.cql_n_actions
-        )
-        cql_next_actions, cql_next_log_pis = self.actor(
-            next_observations, repeat=self.cql_n_actions
-        )
-        cql_current_actions, cql_current_log_pis = (
-            cql_current_actions.detach(),
-            cql_current_log_pis.detach(),
-        )
-        cql_next_actions, cql_next_log_pis = (
-            cql_next_actions.detach(),
-            cql_next_log_pis.detach(),
-        )
-
-        _, cql_q1_rand = self.critic_1(observations, cql_random_actions)
-        _, cql_q2_rand = self.critic_2(observations, cql_random_actions)
-        _, cql_q1_current_actions = self.critic_1(observations, cql_current_actions)
-        _, cql_q2_current_actions = self.critic_2(observations, cql_current_actions)
-        _, cql_q1_next_actions = self.critic_1(observations, cql_next_actions)
-        _, cql_q2_next_actions = self.critic_2(observations, cql_next_actions)
-
-        # Calibration
-        lower_bounds = mc_returns.reshape(-1, 1).repeat(
-            1, cql_q1_current_actions.shape[1]
-        )
-
-        num_vals = torch.sum(lower_bounds == lower_bounds)
-        bound_rate_cql_q1_current_actions = (
-            torch.sum(cql_q1_current_actions < lower_bounds) / num_vals
-        )
-        bound_rate_cql_q2_current_actions = (
-            torch.sum(cql_q2_current_actions < lower_bounds) / num_vals
-        )
-        bound_rate_cql_q1_next_actions = (
-            torch.sum(cql_q1_next_actions < lower_bounds) / num_vals
-        )
-        bound_rate_cql_q2_next_actions = (
-            torch.sum(cql_q2_next_actions < lower_bounds) / num_vals
-        )
-
-        """ Cal-QL: bound Q-values with MC return-to-go """
-        if self._calibration_enabled:
-            cql_q1_current_actions = torch.max(cql_q1_current_actions, lower_bounds)
-            cql_q2_current_actions = torch.max(cql_q2_current_actions, lower_bounds)
-            cql_q1_next_actions = torch.max(cql_q1_next_actions, lower_bounds)
-            cql_q2_next_actions = torch.max(cql_q2_next_actions, lower_bounds)
-
-        cql_cat_q1 = torch.cat(
-            [
-                cql_q1_rand,
-                torch.unsqueeze(q1_predicted, 1),
-                cql_q1_next_actions,
-                cql_q1_current_actions,
-            ],
-            dim=1,
-        )
-        cql_cat_q2 = torch.cat(
-            [
-                cql_q2_rand,
-                torch.unsqueeze(q2_predicted, 1),
-                cql_q2_next_actions,
-                cql_q2_current_actions,
-            ],
-            dim=1,
-        )
-        cql_std_q1 = torch.std(cql_cat_q1, dim=1)
-        cql_std_q2 = torch.std(cql_cat_q2, dim=1)
-
-        if self.cql_importance_sample:
-            random_density = np.log(0.5**action_dim)
-            cql_cat_q1 = torch.cat(
-                [
-                    cql_q1_rand - random_density,
-                    cql_q1_next_actions - cql_next_log_pis.detach(),
-                    cql_q1_current_actions - cql_current_log_pis.detach(),
-                ],
-                dim=1,
-            )
-            cql_cat_q2 = torch.cat(
-                [
-                    cql_q2_rand - random_density,
-                    cql_q2_next_actions - cql_next_log_pis.detach(),
-                    cql_q2_current_actions - cql_current_log_pis.detach(),
-                ],
-                dim=1,
-            )
-
-        cql_qf1_ood = torch.logsumexp(cql_cat_q1 / self.cql_temp, dim=1) * self.cql_temp
-        cql_qf2_ood = torch.logsumexp(cql_cat_q2 / self.cql_temp, dim=1) * self.cql_temp
-
-        """Subtract the log likelihood of data"""
-        cql_qf1_diff = torch.clamp(
-            cql_qf1_ood - q1_predicted,
-            self.cql_clip_diff_min,
-            self.cql_clip_diff_max,
-        ).mean()
-        cql_qf2_diff = torch.clamp(
-            cql_qf2_ood - q2_predicted,
-            self.cql_clip_diff_min,
-            self.cql_clip_diff_max,
-        ).mean()
-
-        if self.cql_lagrange:
-            alpha_prime = torch.clamp(
-                torch.exp(self.log_alpha_prime()), min=0.0, max=1000000.0
-            )
-            cql_min_qf1_loss = (
-                alpha_prime
-                * self.cql_alpha
-                * (cql_qf1_diff - self.cql_target_action_gap)
-            )
-            cql_min_qf2_loss = (
-                alpha_prime
-                * self.cql_alpha
-                * (cql_qf2_diff - self.cql_target_action_gap)
-            )
-
-            self.alpha_prime_optimizer.zero_grad()
-            alpha_prime_loss = (-cql_min_qf1_loss - cql_min_qf2_loss) * 0.5
-            alpha_prime_loss.backward(retain_graph=True)
-            self.alpha_prime_optimizer.step()
-        else:
-            cql_min_qf1_loss = cql_qf1_diff * self.cql_alpha
-            cql_min_qf2_loss = cql_qf2_diff * self.cql_alpha
-            alpha_prime_loss = observations.new_tensor(0.0)
-            alpha_prime = observations.new_tensor(0.0)
-
-        qf_loss = qf1_loss + qf2_loss + cql_min_qf1_loss + cql_min_qf2_loss
-
-        new_next_actions, next_log_pi = self.actor(next_observations)
-        q1_features_next, _ = self.critic_1(
-            next_observations, new_next_actions.detach()
-        )
-        q2_features_next, _ = self.critic_2(
-            next_observations, new_next_actions.detach()
-        )
-
-        l1_q1 = self.dr3_regularizer(q1_features, q1_features_next)
-        l1_q2 = self.dr3_regularizer(q2_features, q2_features_next)
-        l1 = l1_q1 + l1_q2
-
-        ood_actions, _ = self.actor_ood(next_observations)
-        q1_features_ood, _ = self.critic_1(next_observations, ood_actions.detach())
-        q2_features_ood, _ = self.critic_2(next_observations, ood_actions.detach())
-        l2_q1 = self.dr3_regularizer(q1_features, q1_features_ood)
-        l2_q2 = self.dr3_regularizer(q2_features, q2_features_ood)
-        l2 = l2_q1 + l2_q2
-
-        w = np.tanh(self.total_it / self.M_rd)
-        rd_loss = (1 - w) * l1 + w * l2
-
-        qf_loss = qf_loss + (self.lambda_rd * rd_loss)
-
-        log_dict.update(
-            dict(l1_loss=l1.item(), l2_loss=l2.item(), rd_loss=rd_loss.item())
-        )
-
-        log_dict.update(
-            dict(
-                qf1_loss=qf1_loss.item(),
-                qf2_loss=qf2_loss.item(),
-                alpha=alpha.item(),
-                average_qf1=q1_predicted.mean().item(),
-                average_qf2=q2_predicted.mean().item(),
-                average_target_q=target_q_values.mean().item(),
-            )
-        )
-
-        log_dict.update(
-            dict(
-                cql_std_q1=cql_std_q1.mean().item(),
-                cql_std_q2=cql_std_q2.mean().item(),
-                cql_q1_rand=cql_q1_rand.mean().item(),
-                cql_q2_rand=cql_q2_rand.mean().item(),
-                cql_min_qf1_loss=cql_min_qf1_loss.mean().item(),
-                cql_min_qf2_loss=cql_min_qf2_loss.mean().item(),
-                cql_qf1_diff=cql_qf1_diff.mean().item(),
-                cql_qf2_diff=cql_qf2_diff.mean().item(),
-                cql_q1_current_actions=cql_q1_current_actions.mean().item(),
-                cql_q2_current_actions=cql_q2_current_actions.mean().item(),
-                cql_q1_next_actions=cql_q1_next_actions.mean().item(),
-                cql_q2_next_actions=cql_q2_next_actions.mean().item(),
-                alpha_prime_loss=alpha_prime_loss.item(),
-                alpha_prime=alpha_prime.item(),
-                bound_rate_cql_q1_current_actions=bound_rate_cql_q1_current_actions.item(),  # noqa
-                bound_rate_cql_q2_current_actions=bound_rate_cql_q2_current_actions.item(),  # noqa
-                bound_rate_cql_q1_next_actions=bound_rate_cql_q1_next_actions.item(),
-                bound_rate_cql_q2_next_actions=bound_rate_cql_q2_next_actions.item(),
-            )
-        )
-
-        return qf_loss
-
-    # DR3 Regularizer
-    def dr3_regularizer(self, features_1, features_2):
-        """
-        Compute the DR3 regularizer as the dot product of features.
-        Encourage the learned Q-function to yield representations that are as orthogonal as possible
-        between data from dataset and policy. In this manner, the representations of (s, a) and (s', a')
-        can be distinctly discerned.
-
-        - Kumar, A., Agarwal, R., Ma, T., Courville, A., Tucker, G., & Levine, S. (2021). Dr3: Value-based
-        deep reinforcement learning requires explicit regularization. arXiv preprint arXiv:2112.04716.
-        - Ma, Y., Tang, H., Li, D., & Meng, Z. (2023). Reining generalization in offline reinforcement
-        learning via representation distinction. Advances in Neural Information Processing Systems, 36,
-        40773-40785.
-
-        Args:
-            features_1: Features from state-action pairs (batch_size, feature_dim)
-            features_2: Features from next state-action pairs (batch_size, feature_dim)
-        Returns:
-            Regularization loss (scalar)
-        """
-        dot_products = (features_1 * features_2).sum(
-            dim=-1
-        )  # Compute dot product per sample
-        return dot_products.mean()  # Average over the batch
-
-    def _policy_ood_loss(self, observations, actions, log_dict):
-        # Compute OOD action loss
-        ood_actions, log_pi = self.actor_ood(observations)
-
-        _, phi_pi_1 = self.critic_1(
-            observations, actions
-        )  # Representation of policy actions
-        _, phi_pi_2 = self.critic_2(
-            observations, actions
-        )  # Representation of policy actions
-        phi_pi = torch.min(phi_pi_1, phi_pi_2)
-
-        _, phi_ood_1 = self.critic_1(
-            observations, ood_actions
-        )  # Representation of OOD actions
-        _, phi_ood_2 = self.critic_2(
-            observations, ood_actions
-        )  # Representation of OOD actions
-        phi_ood = torch.min(phi_ood_1, phi_ood_2)
-
-        # Compute L_ood using Equation (5)
-        l_ood = (
-            log_pi
-            - (
-                torch.max(
-                    phi_ood - self.beta_rd * phi_pi,
-                    torch.zeros_like(phi_ood - self.beta_rd * phi_pi),
-                )  # Max(0, Q(s, π_ood) - β * Q(s, a))
-                + torch.max(
-                    self.alpha_rd * phi_pi - phi_ood,
-                    torch.zeros_like(self.alpha_rd * phi_pi - phi_ood),
-                )  # Max(0, α * Q(s, a) - Q(s, π_ood))
-            )
-        ).mean()
-
-        self.actor_ood_optimizer.zero_grad()
-        l_ood.backward()
-        self.actor_ood_optimizer.step()
-
-        log_dict.update(
-            dict(
-                l_ood=l_ood.item(),
-            )
-        )
-
-    def train(self, batch: TensorBatch) -> Dict[str, float]:
-        (
-            observations,
-            actions,
-            rewards,
-            next_observations,
-            dones,
-            mc_returns,
-        ) = batch
-        with torch.autograd.set_detect_anomaly(True):
-
-            self.total_it += 1
-            log_dict = dict()
-
-            if self.total_it % self.interval_rd == 0:
-                self._policy_ood_loss(observations, actions, log_dict)
-
-            new_actions, log_pi = self.actor(observations)
-
-            alpha, alpha_loss = self._alpha_and_alpha_loss(observations, log_pi)
-
-            """ Policy loss """
-            policy_loss = self._policy_loss(
-                observations, actions, new_actions, alpha, log_pi
-            )
-
-            log_dict.update(
-                dict(
-                    log_pi=log_pi.mean().item(),
-                    policy_loss=policy_loss.item(),
-                    alpha_loss=alpha_loss.item(),
-                    alpha=alpha.item(),
-                )
-            )
-
-            """ Q function loss """
-            qf_loss = self._q_loss(
-                observations,
-                actions,
-                next_observations,
-                rewards,
-                dones,
-                mc_returns,
-                alpha,
-                log_dict,
-            )
-
-            if self.use_automatic_entropy_tuning:
-                self.alpha_optimizer.zero_grad()
-                alpha_loss.backward()
-                self.alpha_optimizer.step()
-
-            self.actor_optimizer.zero_grad()
-            policy_loss.backward()
-            self.actor_optimizer.step()
-
-            self.critic_1_optimizer.zero_grad()
-            self.critic_2_optimizer.zero_grad()
-            qf_loss.backward(retain_graph=True)
-            self.critic_1_optimizer.step()
-            self.critic_2_optimizer.step()
-
-            if self.total_it % self.target_update_period == 0:
-                self.update_target_network(self.soft_target_update_rate)
-
-        return log_dict
-
-    def switch_calibration(self):
-        self._calibration_enabled = not self._calibration_enabled
-        self.lambda_rd = 0.0
-
-
+@pyrallis.wrap()
 def train(config: TrainConfig):
-    calql_demo = {
-        "pen-binary-v0": "pen-cloned-v1",
-        "door-binary-v0": "door-cloned-v1",
-        "relocate-binary-v0": "relocate-cloned-v1",
-    }
-    if config.env in calql_demo:
-        dataset = get_hand_dataset_with_mc_calculation(
-            calql_demo[config.env],
-            gamma=config.discount,
-            reward_scale=config.reward_scale,
-            reward_bias=config.reward_bias,
-            clip_action=0.99999,
-        )
-        config.env = calql_demo[config.env]
-        env = gym.make(config.env)
-        eval_env = gym.make(config.env)
+    minari.download_dataset(config.dataset_id)
+    dataset = minari.load_dataset(config.dataset_id)
+    env = dataset.recover_environment()
+    eval_env = dataset.recover_environment(eval_env=True)
+    state_dim = eval_env.observation_space.shape[0]
+    action_dim = eval_env.action_space.shape[0]
+    max_action = float(eval_env.action_space.high[0])
+    max_steps = env._max_episode_steps
 
-    else:
-        env = gym.make(config.env)
-        eval_env = gym.make(config.env)
-        dataset = d4rl.qlearning_dataset(env)
-        reward_mod_dict = {}
-        if config.normalize_reward:
-            reward_mod_dict = modify_reward(
-                dataset,
-                config.env,
-                reward_scale=config.reward_scale,
-                reward_bias=config.reward_bias,
-            )
-        mc_returns = get_return_to_go(dataset, env, config)
-        dataset["mc_returns"] = np.array(mc_returns)
-        assert len(dataset["mc_returns"]) == len(dataset["rewards"])
-
-    is_env_with_goal = config.env.startswith(ENVS_WITH_GOAL)
     batch_size_offline = int(config.batch_size * config.mixing_ratio)
     batch_size_online = config.batch_size - batch_size_offline
 
-    max_steps = env._max_episode_steps
+    is_env_with_goal = config.dataset_id.split("/")[1].startswith(ENVS_WITH_GOAL)
 
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    qdataset = qlearning_dataset(dataset)
+
+    reward_mod_dict = {}
+    if config.normalize_reward:
+        reward_mod_dict = modify_reward(
+            qdataset,
+            config.env,
+            reward_scale=config.reward_scale,
+            reward_bias=config.reward_bias,
+        )
+    mc_returns = get_return_to_go(qdataset, env, config)
+    qdataset["mc_returns"] = np.array(mc_returns)
+    assert len(qdataset["mc_returns"]) == len(qdataset["rewards"])
 
     if config.normalize:
-        state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
+        state_mean, state_std = compute_mean_std(qdataset["observations"], eps=1e-3)
     else:
         state_mean, state_std = 0, 1
 
-    dataset["observations"] = normalize_states(
-        dataset["observations"], state_mean, state_std
+    qdataset["observations"] = normalize_states(
+        qdataset["observations"], state_mean, state_std
     )
-    dataset["next_observations"] = normalize_states(
-        dataset["next_observations"], state_mean, state_std
+    qdataset["next_observations"] = normalize_states(
+        qdataset["next_observations"], state_mean, state_std
     )
-    env = wrap_env(env, state_mean=state_mean, state_std=state_std)
-    eval_env = wrap_env(eval_env, state_mean=state_mean, state_std=state_std)
+    env = wrap_env(
+        env, state_mean=state_mean, state_std=state_std, observation_space=state_dim
+    )
+    eval_env = wrap_env(
+        eval_env,
+        state_mean=state_mean,
+        state_std=state_std,
+        observation_space=state_dim,
+    )
     offline_buffer = ReplayBuffer(
         state_dim,
         action_dim,
@@ -1709,7 +1060,7 @@ def train(config: TrainConfig):
         config.buffer_size,
         config.device,
     )
-    offline_buffer.load_d4rl_dataset(dataset)
+    offline_buffer.load_dataset(qdataset)
 
     max_action = float(env.action_space.high[0])
 
@@ -1721,22 +1072,19 @@ def train(config: TrainConfig):
 
     # Set seeds
     seed = config.seed
-    set_seed(seed, env)
-    set_env_seed(eval_env, config.eval_seed)
+    set_seed(seed)
 
     critic_1 = FullyConnectedQFunction(
         state_dim,
         action_dim,
         config.orthogonal_init,
         config.q_n_hidden_layers,
-        config.q_n_hidden_units,
     ).to(config.device)
     critic_2 = FullyConnectedQFunction(
         state_dim,
         action_dim,
         config.orthogonal_init,
         config.q_n_hidden_layers,
-        config.q_n_hidden_units,
     ).to(config.device)
     critic_1_optimizer = torch.optim.Adam(list(critic_1.parameters()), config.qf_lr)
     critic_2_optimizer = torch.optim.Adam(list(critic_2.parameters()), config.qf_lr)
@@ -1746,18 +1094,8 @@ def train(config: TrainConfig):
         action_dim,
         max_action,
         orthogonal_init=config.orthogonal_init,
-        q_n_hidden_units=config.q_n_hidden_units,
     ).to(config.device)
     actor_optimizer = torch.optim.Adam(actor.parameters(), config.policy_lr)
-
-    actor_ood = TanhGaussianPolicy(
-        state_dim,
-        action_dim,
-        max_action,
-        orthogonal_init=config.orthogonal_init,
-        q_n_hidden_units=config.q_n_hidden_units,
-    ).to(config.device)
-    actor_ood_optimizer = torch.optim.Adam(actor_ood.parameters(), config.policy_lr)
 
     kwargs = {
         "critic_1": critic_1,
@@ -1766,8 +1104,6 @@ def train(config: TrainConfig):
         "critic_2_optimizer": critic_2_optimizer,
         "actor": actor,
         "actor_optimizer": actor_optimizer,
-        "actor_ood": actor_ood,
-        "actor_ood_optimizer": actor_ood_optimizer,
         "discount": config.discount,
         "soft_target_update_rate": config.soft_target_update_rate,
         "device": config.device,
@@ -1789,12 +1125,6 @@ def train(config: TrainConfig):
         "cql_max_target_backup": config.cql_max_target_backup,
         "cql_clip_diff_min": config.cql_clip_diff_min,
         "cql_clip_diff_max": config.cql_clip_diff_max,
-        # RD
-        "lambda_rd": config.lambda_rd,
-        "M_rd": config.M_rd,
-        "alpha_rd": config.alpha_rd,
-        "beta_rd": config.beta_rd,
-        "interval_rd": config.interval_rd,
     }
 
     print("---------------------------------------")
@@ -1802,10 +1132,7 @@ def train(config: TrainConfig):
     print("---------------------------------------")
 
     # Initialize actor
-    if config.is_rd:
-        trainer = RD(**kwargs)
-    else:
-        trainer = CalQL(**kwargs)
+    trainer = CalQL(**kwargs)
 
     if config.load_model != "":
         policy_file = Path(config.load_model)
@@ -1815,7 +1142,9 @@ def train(config: TrainConfig):
     wandb_init(asdict(config))
 
     evaluations = []
-    state, done = env.reset(), False
+    state, _ = env.reset(seed=config.seed)
+    done = False
+    truncated = False
     episode_return = 0
     episode_step = 0
     goal_achieved = False
@@ -1832,21 +1161,14 @@ def train(config: TrainConfig):
         online_log = {}
         if t >= config.offline_iterations:
             episode_step += 1
-            action, _ = actor(
-                torch.tensor(
-                    state.reshape(1, -1),
-                    device=config.device,
-                    dtype=torch.float32,
-                )
-            )
-            action = action.cpu().data.numpy().flatten()
-            next_state, reward, done, env_infos = env.step(action)
+            action = actor.act(state, config.device)
+            next_state, reward, done, truncated, env_infos = env.step(action)
 
             if not goal_achieved:
                 goal_achieved = is_goal_reached(reward, env_infos)
             episode_return += reward
             real_done = False  # Episode can timeout which is different from done
-            if done and episode_step < max_steps:
+            if (done or truncated) and episode_step < max_steps:
                 real_done = True
 
             if config.normalize_reward:
@@ -1860,15 +1182,17 @@ def train(config: TrainConfig):
             online_buffer.add_transition(state, action, reward, next_state, real_done)
             state = next_state
 
-            if done:
-                state, done = env.reset(), False
+            if done or truncated:
+                state, _ = env.reset(seed=config.seed)
+                done = False
+                truncated = False
                 # Valid only for envs with goal, e.g. AntMaze, Adroit
                 if is_env_with_goal:
                     train_successes.append(goal_achieved)
                     online_log["train/regret"] = np.mean(1 - np.array(train_successes))
                     online_log["train/is_success"] = float(goal_achieved)
                 online_log["train/episode_return"] = episode_return
-                normalized_return = eval_env.get_normalized_score(episode_return)
+                normalized_return = minari.get_normalized_score(dataset, episode_return)
                 online_log["train/d4rl_normalized_episode_return"] = (
                     normalized_return * 100.0
                 )
@@ -1906,7 +1230,7 @@ def train(config: TrainConfig):
             )
             eval_score = eval_scores.mean()
             eval_log = {}
-            normalized = eval_env.get_normalized_score(np.mean(eval_scores))
+            normalized = minari.get_normalized_score(dataset, np.mean(eval_scores))
             # Valid only for envs with goal, e.g. AntMaze, Adroit
             if t >= config.offline_iterations and is_env_with_goal:
                 eval_successes.append(success_rate)
@@ -1914,11 +1238,11 @@ def train(config: TrainConfig):
                 eval_log["eval/success_rate"] = success_rate
             normalized_eval_score = normalized * 100.0
             eval_log["eval/d4rl_normalized_score"] = normalized_eval_score
+            eval_log["eval/episode_return"] = eval_scores
             evaluations.append(normalized_eval_score)
             print("---------------------------------------")
             print(
-                f"Evaluation over {config.n_episodes} episodes: "
-                f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}"
+                f"Evaluation over {config.n_episodes} episodes: {eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}"
             )
             print("---------------------------------------")
             if config.checkpoints_path:
@@ -1930,39 +1254,4 @@ def train(config: TrainConfig):
 
 
 if __name__ == "__main__":
-    config = pyrallis.parse(config_class=TrainConfig)
-
-    # Add sweep configuration
-    sweep_configuration = {
-        "method": "random",  # or 'grid', 'bayes'
-        "metric": {"name": "eval/d4rl_normalized_score", "goal": "maximize"},
-        "parameters": {
-            "cql_alpha": {"values": [0.5, 1.0, 5.0, 10.0]},
-            "cql_alpha_online": {"values": [0.5, 1.0, 5.0, 10.0]},
-        },
-    }
-
-    # Initialize the sweep
-    if config.sweep:
-        sweep_id = wandb.sweep(sweep=sweep_configuration, project="CORL")
-
-        def sweep_train():
-            print("---------------------------------------")
-            print("Training with sweep")
-            print("---------------------------------------")
-            # Initialize wandb first
-            wandb_init(asdict(config))
-            # Then access wandb.config
-            config.cql_alpha = wandb.config.cql_alpha
-            config.cql_alpha_online = wandb.config.cql_alpha_online
-            # Run the training
-            train(config)
-
-        # Start the sweep
-        wandb.agent(sweep_id, function=sweep_train)
-    else:
-        print("---------------------------------------")
-        print("Training without sweep")
-        print("---------------------------------------")
-        # wandb_init(asdict(config))
-        train(config)
+    train()
