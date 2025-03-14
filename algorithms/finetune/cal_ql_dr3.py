@@ -1439,9 +1439,11 @@ class RD(CalQL):
             next_observations, new_next_actions.detach()
         )
 
-        q_features = torch.min(q1_features, q2_features)
-        q_features_next = torch.min(q1_features_next, q2_features_next)
-        l1 = self.dr3_regularizer(q_features, q_features_next)
+        # q_features = torch.min(q1_features, q2_features)
+        # q_features_next = torch.min(q1_features_next, q2_features_next)
+        dr3_loss_q1 = self.dr3_regularizer(q1_features, q1_features_next)
+        dr3_loss_q2 = self.dr3_regularizer(q2_features, q2_features_next)
+        l1 = dr3_loss_q1 + dr3_loss_q2
         rd_loss = self.lambda_rd * l1
         qf_loss = qf_loss + rd_loss
 

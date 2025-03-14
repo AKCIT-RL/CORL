@@ -1444,14 +1444,16 @@ class RD(CalQL):
         )
 
         q_features = torch.min(q1_features, q2_features)
-        q_features_next = torch.min(q1_features_next, q2_features_next)
-        l1 = self.dr3_regularizer(q_features, q_features_next)
+        l1_q1 = self.dr3_regularizer(q1_features, q1_features_next)
+        l1_q2 = self.dr3_regularizer(q2_features, q2_features_next)
+        l1 = l1_q1 + l1_q2
 
         ood_actions, _ = self.actor_ood(next_observations)
         q1_features_ood, _ = self.critic_1(next_observations, ood_actions.detach())
         q2_features_ood, _ = self.critic_2(next_observations, ood_actions.detach())
-        q_features_ood = torch.min(q1_features_ood, q2_features_ood)
-        l2 = self.dr3_regularizer(q_features, q_features_ood)
+        l2_q1 = self.dr3_regularizer(q1_features, q1_features_ood)
+        l2_q2 = self.dr3_regularizer(q2_features, q2_features_ood)
+        l2 = l2_q1 + l2_q2
 
         w = np.tanh(self.total_it / self.M_rd)
         rd_loss = (1 - w) * l1 + w * l2
