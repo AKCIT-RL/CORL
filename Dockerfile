@@ -34,6 +34,9 @@ ENV LD_LIBRARY_PATH /root/.mujoco/mujoco210/bin:${LD_LIBRARY_PATH}
 COPY requirements/requirements.txt requirements.txt
 RUN pip install -r requirements.txt
 
+ARG WANDB_KEY
+ENV WANDB_API_KEY=$WANDB_KEY
+
 RUN mkdir -p /CORL
 COPY . /CORL
 RUN chown -R 1000:root /CORL && chmod -R 775 /CORL
