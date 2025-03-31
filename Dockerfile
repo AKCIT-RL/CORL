@@ -39,6 +39,5 @@ ENV WANDB_API_KEY=$WANDB_KEY
 
 RUN mkdir -p /CORL
 COPY . /CORL
-RUN chown -R 1000:root /CORL && chmod -R 775 /CORL
 
 WORKDIR /CORL
