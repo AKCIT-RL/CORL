@@ -24,11 +24,11 @@ RUN apt-get update -q \
 
 RUN ln -s /usr/bin/python3 /usr/bin/python
 # installing mujoco distr
-RUN mkdir -p /raid/aluno_luanamartins/.mujoco \
+RUN mkdir -p /root/.mujoco \
     && wget https://mujoco.org/download/mujoco210-linux-x86_64.tar.gz -O mujoco.tar.gz \
-    && tar -xf mujoco.tar.gz -C /raid/aluno_luanamartins/.mujoco \
+    && tar -xf mujoco.tar.gz -C /root/.mujoco \
     && rm mujoco.tar.gz
-ENV LD_LIBRARY_PATH /raid/aluno_luanamartins/.mujoco/mujoco210/bin:${LD_LIBRARY_PATH}
+ENV LD_LIBRARY_PATH /root/.mujoco/mujoco210/bin:${LD_LIBRARY_PATH}
 
 # installing poetry & env setup, mujoco_py compilation
 COPY requirements/requirements.txt requirements.txt
