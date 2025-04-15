@@ -18,6 +18,11 @@ import torch.nn.functional as F
 import wandb
 from torch.distributions import Normal, TanhTransform, TransformedDistribution
 
+import minari
+
+from algorithms.utils.wrapper_gym import get_env
+from algorithms.utils.dataset import qlearning_dataset
+
 TensorBatch = List[torch.Tensor]
 
 
@@ -25,6 +30,7 @@ TensorBatch = List[torch.Tensor]
 class TrainConfig:
     device: str = "cuda"
     env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
+    dataset_id: str = "halfcheetah-medium-expert-v2"
     seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
     eval_freq: int = int(5e3)  # How often (time steps) we evaluate
     n_episodes: int = 10  # How many episodes run during evaluation
@@ -123,7 +129,9 @@ class ReplayBuffer:
         self._actions = torch.zeros(
             (buffer_size, action_dim), dtype=torch.float32, device=device
         )
-        self._rewards = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
+        self._rewards = torch.zeros(
+            (buffer_size, 1), dtype=torch.float32, device=device
+        )
         self._next_states = torch.zeros(
             (buffer_size, state_dim), dtype=torch.float32, device=device
         )
@@ -134,10 +142,11 @@ class ReplayBuffer:
         return torch.tensor(data, dtype=torch.float32, device=self._device)
 
     # Loads data in d4rl format, i.e. from Dict[str, np.array].
-    def load_d4rl_dataset(self, data: Dict[str, np.ndarray]):
+    def load_dataset(self, data: Dict[str, np.ndarray]):
         if self._size != 0:
             raise ValueError("Trying to load data into non-empty replay buffer")
         n_transitions = data["observations"].shape[0]
+        print(f"Dataset size: {n_transitions}")
         if n_transitions > self._buffer_size:
             raise ValueError(
                 "Replay buffer is smaller than the dataset you are trying to load!"
@@ -264,7 +273,10 @@ def init_module_weights(module: torch.nn.Sequential, orthogonal_init: bool = Fal
 
 class ReparameterizedTanhGaussian(nn.Module):
     def __init__(
-        self, log_std_min: float = -20.0, log_std_max: float = 2.0, no_tanh: bool = False
+        self,
+        log_std_min: float = -20.0,
+        log_std_max: float = 2.0,
+        no_tanh: bool = False,
     ):
         super().__init__()
         self.log_std_min = log_std_min
@@ -400,7 +412,9 @@ class FullyConnectedQFunction(nn.Module):
 
         init_module_weights(self.network, orthogonal_init)
 
-    def forward(self, observations: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, observations: torch.Tensor, actions: torch.Tensor
+    ) -> torch.Tensor:
         multiple_actions = False
         batch_size = observations.shape[0]
         if actions.ndim == 3 and observations.ndim == 2:
@@ -826,12 +840,13 @@ class ContinuousCQL:
 
 @pyrallis.wrap()
 def train(config: TrainConfig):
-    env = gym.make(config.env)
+    dataset = minari.load_dataset(config.dataset_id)
+    qdataset = qlearning_dataset(dataset)
 
+    env = get_env(config.env, config.device)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
-
-    dataset = d4rl.qlearning_dataset(env)
+    max_action = 1.0
 
     if config.normalize_reward:
         modify_reward(
@@ -842,15 +857,15 @@ def train(config: TrainConfig):
         )
 
     if config.normalize:
-        state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
+        state_mean, state_std = compute_mean_std(qdataset["observations"], eps=1e-3)
     else:
         state_mean, state_std = 0, 1
 
-    dataset["observations"] = normalize_states(
-        dataset["observations"], state_mean, state_std
+    qdataset["observations"] = normalize_states(
+        qdataset["observations"], state_mean, state_std
     )
-    dataset["next_observations"] = normalize_states(
-        dataset["next_observations"], state_mean, state_std
+    qdataset["next_observations"] = normalize_states(
+        qdataset["next_observations"], state_mean, state_std
     )
     env = wrap_env(env, state_mean=state_mean, state_std=state_std)
     replay_buffer = ReplayBuffer(
@@ -859,9 +874,7 @@ def train(config: TrainConfig):
         config.buffer_size,
         config.device,
     )
-    replay_buffer.load_d4rl_dataset(dataset)
-
-    max_action = float(env.action_space.high[0])
+    replay_buffer.load_dataset(qdataset)
 
     if config.checkpoints_path is not None:
         print(f"Checkpoints path: {config.checkpoints_path}")
@@ -879,9 +892,9 @@ def train(config: TrainConfig):
         config.orthogonal_init,
         config.q_n_hidden_layers,
     ).to(config.device)
-    critic_2 = FullyConnectedQFunction(state_dim, action_dim, config.orthogonal_init).to(
-        config.device
-    )
+    critic_2 = FullyConnectedQFunction(
+        state_dim, action_dim, config.orthogonal_init
+    ).to(config.device)
     critic_1_optimizer = torch.optim.Adam(list(critic_1.parameters()), config.qf_lr)
     critic_2_optimizer = torch.optim.Adam(list(critic_2.parameters()), config.qf_lr)
 
