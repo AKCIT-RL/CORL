@@ -22,7 +22,13 @@ RUN apt-get update -q \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-RUN ln -s /usr/bin/python3 /usr/bin/python
+RUN ln -s /usr/bin/python3 /usr/bin/python3
+
+RUN git clone https://github.com/AKCIT-RL/mujoco_playground.git \
+    && cd mujoco_playground \
+    && git checkout rough_terrain \
+    && pip install -U -e ".[all]"  
+
 # installing mujoco distr
 RUN mkdir -p /root/.mujoco \
     && wget https://mujoco.org/download/mujoco210-linux-x86_64.tar.gz -O mujoco.tar.gz \
