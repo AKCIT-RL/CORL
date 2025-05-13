@@ -1,0 +1,1 @@
+python -m algorithms.offline.cql --config_path="configs/offline/cql/go1/joystick_flat_expert.yaml" --device "cuda:0" --normalize "false" --normalize_reward "true" --reward_scale "1.0" --checkpoints_path "checkpoints/cql"
