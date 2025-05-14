@@ -16,7 +16,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
-
+import yaml
+import etils.epath as epath
 from torch.utils.data import DataLoader
 
 import minari
@@ -26,6 +27,51 @@ from algorithms.utils.dataset import qlearning_dataset
 from algorithms.utils.save_video import save_video
 TensorBatch = List[torch.Tensor]
 
+def get_actor_from_checkpoint(checkpoint_path: str, state_dim: int, action_dim: int, max_action: float, checkpoint_id: int = -1):
+    ckpt_path = str(epath.Path(checkpoint_path).resolve())
+    FINETUNE_PATH = epath.Path(ckpt_path)
+    latest_ckpts = list(FINETUNE_PATH.glob("*"))
+    latest_ckpts = [ckpt for ckpt in latest_ckpts if not ckpt.is_dir() and ckpt.name.endswith(".pt")]
+    latest_ckpts.sort(key=lambda x: int(x.name.split("/")[-1].split("_")[-1].split(".")[0]))
+    latest_ckpts = latest_ckpts[checkpoint_id]
+
+    with open(os.path.join(checkpoint_path, "config.yaml")) as f:
+        config = yaml.safe_load(f)
+
+    actor = Actor(state_dim, action_dim, max_action).to(config["device"])
+    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=3e-4)
+
+    critic_1 = Critic(state_dim, action_dim).to(config["device"])
+    critic_1_optimizer = torch.optim.Adam(critic_1.parameters(), lr=3e-4)
+    critic_2 = Critic(state_dim, action_dim).to(config["device"])
+    critic_2_optimizer = torch.optim.Adam(critic_2.parameters(), lr=3e-4)
+
+    kwargs = {
+        "max_action": max_action,
+        "actor": actor,
+        "actor_optimizer": actor_optimizer,
+        "critic_1": critic_1,
+        "critic_1_optimizer": critic_1_optimizer,
+        "critic_2": critic_2,
+        "critic_2_optimizer": critic_2_optimizer,
+        "discount": config["discount"],
+        "tau": config["tau"],
+        "device": config["device"],
+        # TD3
+        "policy_noise": config["policy_noise"] * max_action,
+        "noise_clip": config["noise_clip"] * max_action,
+        "policy_freq": config["policy_freq"],
+        # TD3 + BC
+        "alpha": config["alpha"],
+    }
+
+    # Initialize actor
+    trainer = TD3_BC(**kwargs)
+    policy_file = Path(latest_ckpts)
+    trainer.load_state_dict(torch.load(policy_file))
+    actor = trainer.actor
+    actor.eval()
+    return actor
 
 @dataclass
 class TrainConfig:
