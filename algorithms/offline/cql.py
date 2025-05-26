@@ -129,9 +129,9 @@ class ReplayBuffer(torch.utils.data.Dataset):
         return [
             torch.from_numpy(self.observations[idx]),
             torch.from_numpy(self.actions[idx]),
-            torch.tensor(self.rewards[idx], dtype=torch.float32),
+            torch.tensor([self.rewards[idx]], dtype=torch.float32),
             torch.from_numpy(self.next_observations[idx]),
-            torch.tensor(self.terminals[idx], dtype=torch.float32),
+            torch.tensor([self.terminals[idx]], dtype=torch.float32),
         ]      
 
 

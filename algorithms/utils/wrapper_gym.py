@@ -15,8 +15,6 @@ def get_env(env_name: str, device: str):
     env_cfg = registry.get_default_config(env_name)
     randomizer = registry.get_domain_randomizer(env_name)
 
-    device_rank = int(device.split(":")[-1]) if "cuda" in device else 0
-
     render_trajectory = []
 
     def render_callback(_, state):
@@ -30,7 +28,6 @@ def get_env(env_name: str, device: str):
         action_repeat=1,
         render_callback=render_callback,
         randomization_fn=randomizer,
-        device_rank=device_rank,
         device=device,
     )
 

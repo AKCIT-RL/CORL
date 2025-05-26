@@ -154,9 +154,9 @@ class ReplayBuffer(torch.utils.data.Dataset):
         return [
             torch.from_numpy(self.observations[idx]),
             torch.from_numpy(self.actions[idx]),
-            torch.tensor(self.rewards[idx], dtype=torch.float32),
+            torch.tensor([self.rewards[idx]], dtype=torch.float32),
             torch.from_numpy(self.next_observations[idx]),
-            torch.tensor(self.terminals[idx], dtype=torch.float32),
+            torch.tensor([self.terminals[idx]], dtype=torch.float32),
         ]
 
 # SAC Actor & Critic implementation
@@ -355,11 +355,6 @@ class SACN:
             )
             q_next = self.target_critic(next_state, next_action).min(0).values
             q_next = q_next - self.alpha * next_action_log_prob
-
-            print("Critic Loss shapes assertion:")
-            print(q_next.shape, q_next.unsqueeze(-1).shape)
-            print(done.shape)
-            print(reward.shape)
 
             assert q_next.unsqueeze(-1).shape == done.shape == reward.shape
             q_target = reward + self.gamma * (1 - done) * q_next.unsqueeze(-1)

@@ -16,9 +16,9 @@ cql_temp: 1.0
 device: cuda
 discount: 0.99
 env: Go1JoystickFlatTerrain
-dataset_id: playground/Go1JoystickFlatTerrain-expert-v0
+dataset_id: playground/Go1JoystickFlatTerrain-random-v0
 eval_freq: 5000
-group: cql-go1-expert-v0
+group: cql-go1-random-v0
 load_model: ''
 max_timesteps: 1000000
 n_episodes: 10

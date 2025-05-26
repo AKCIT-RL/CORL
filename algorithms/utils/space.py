@@ -63,7 +63,7 @@ def serialize_space(space: NumpySpace, to_string=True):
 
 
 @deserialize_space.register("NumpySpace")
-def deserialize_space(*, space_dict) -> NumpySpace:
+def deserialize_space(space_dict) -> NumpySpace:
     assert space_dict["type"] == "NumpySpace"
     shape = tuple(space_dict["shape"])
     dtype = np.dtype(space_dict["dtype"])
