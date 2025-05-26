@@ -62,7 +62,10 @@ class GymWrapper(wrapper_torch.RSLRLBraxWrapper):
         )
 
         self.device = device
-        self.observation_space = NumpySpace(shape=self.num_obs, dtype=np.float32)
+        if isinstance(self.num_obs, tuple):
+            self.observation_space = NumpySpace(shape=self.num_obs, dtype=np.float32)
+        else:
+            self.observation_space = NumpySpace(shape=(self.num_obs,), dtype=np.float32)
         self.action_space = NumpySpace(shape=(self.num_actions,), dtype=np.float32)
 
     def step(self, action):
