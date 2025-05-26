@@ -16,11 +16,9 @@ RUN apt-get update -q \
 # Garante link python -> python3
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
-# Clona e instala mujoco_playground em modo editable
+# Clona e instala mujoco_playground em modo editable (branch default)
 RUN git clone https://github.com/AKCIT-RL/mujoco_playground.git /mujoco_playground \
-    && cd /mujoco_playground \
-    && git checkout rough_terrain \
-    && pip install -U -e "[all]"
+    && pip install -U -e /mujoco_playground
 
 # Instala MuJoCo
 RUN mkdir -p /root/.mujoco \
@@ -29,9 +27,10 @@ RUN mkdir -p /root/.mujoco \
     && rm mujoco.tar.gz
 ENV LD_LIBRARY_PATH /root/.mujoco/mujoco210/bin:${LD_LIBRARY_PATH}
 
-# Copia requirements e instala nais
+# Copia requirements e instala dependências Python adicionais
 COPY requirements/requirements.txt requirements.txt
 RUN pip install -r requirements.txt \
+    && pip install minari carla mujoco-py
 
 # Configura WandB
 ARG WANDB_KEY
