@@ -13,14 +13,14 @@ RUN apt-get update -q \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Garante link python -> python3
-RUN ln -sf /usr/bin/python3 /usr/bin/python
+RUN ln -s /usr/bin/python3 /usr/bin/python3
 
-# Clona e instala mujoco_playground em modo editable (branch default)
-RUN git clone https://github.com/AKCIT-RL/mujoco_playground.git /mujoco_playground \
-    && pip install -U -e /mujoco_playground
+RUN git clone https://github.com/AKCIT-RL/mujoco_playground.git \
+    && cd mujoco_playground \
+    && git checkout rough_terrain \
+    && pip install -U -e ".[all]"  
 
-# Instala MuJoCo
+# installing mujoco distr
 RUN mkdir -p /root/.mujoco \
     && wget https://mujoco.org/download/mujoco210-linux-x86_64.tar.gz -O mujoco.tar.gz \
     && tar -xf mujoco.tar.gz -C /root/.mujoco \
