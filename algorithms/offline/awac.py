@@ -5,7 +5,6 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import d4rl
 import gym
 import numpy as np
 import pyrallis
@@ -14,6 +13,13 @@ import torch.nn as nn
 import torch.nn.functional
 import wandb
 from tqdm import trange
+from torch.utils.data import DataLoader
+
+import minari
+
+from algorithms.utils.wrapper_gym import get_env
+from algorithms.utils.dataset import qlearning_dataset, ReplayBuffer
+from algorithms.utils.save_video import save_video
 
 TensorBatch = List[torch.Tensor]
 
@@ -27,7 +33,8 @@ class TrainConfig:
     # wandb run name
     name: str = "AWAC"
     # training dataset and evaluation environment
-    env_name: str = "halfcheetah-medium-expert-v2"
+    env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
+    dataset_id: str = "halfcheetah-medium-expert-v2
     # actor and critic hidden dim
     hidden_dim: int = 256
     # actor and critic learning rate
@@ -68,67 +75,6 @@ class TrainConfig:
         self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
         if self.checkpoints_path is not None:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
-
-
-class ReplayBuffer:
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        buffer_size: int,
-        device: str = "cpu",
-    ):
-        self._buffer_size = buffer_size
-        self._pointer = 0
-        self._size = 0
-
-        self._states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._actions = torch.zeros(
-            (buffer_size, action_dim), dtype=torch.float32, device=device
-        )
-        self._rewards = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._next_states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._dones = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._device = device
-
-    def _to_tensor(self, data: np.ndarray) -> torch.Tensor:
-        return torch.tensor(data, dtype=torch.float32, device=self._device)
-
-    def load_d4rl_dataset(self, data: Dict[str, np.ndarray]):
-        if self._size != 0:
-            raise ValueError("Trying to load data into non-empty replay buffer")
-        n_transitions = data["observations"].shape[0]
-        if n_transitions > self._buffer_size:
-            raise ValueError(
-                "Replay buffer is smaller than the dataset you are trying to load!"
-            )
-        self._states[:n_transitions] = self._to_tensor(data["observations"])
-        self._actions[:n_transitions] = self._to_tensor(data["actions"])
-        self._rewards[:n_transitions] = self._to_tensor(data["rewards"][..., None])
-        self._next_states[:n_transitions] = self._to_tensor(data["next_observations"])
-        self._dones[:n_transitions] = self._to_tensor(data["terminals"][..., None])
-        self._size += n_transitions
-        self._pointer = min(self._size, n_transitions)
-
-        print(f"Dataset size: {n_transitions}")
-
-    def sample(self, batch_size: int) -> TensorBatch:
-        indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
-        states = self._states[indices]
-        actions = self._actions[indices]
-        rewards = self._rewards[indices]
-        next_states = self._next_states[indices]
-        dones = self._dones[indices]
-        return [states, actions, rewards, next_states, dones]
-
-    def add_transition(self):
-        # Use this method to add new data into the replay buffer during fine-tuning.
-        # I left it unimplemented since now we do not do fine-tuning.
-        raise NotImplementedError
 
 
 class Actor(nn.Module):
@@ -325,9 +271,6 @@ class AdvantageWeightedActorCritic:
 def set_seed(
     seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
 ):
-    if env is not None:
-        env.seed(seed)
-        env.action_space.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -359,17 +302,18 @@ def wrap_env(
 
 @torch.no_grad()
 def eval_actor(
-    env: gym.Env, actor: Actor, device: str, n_episodes: int, seed: int
+    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
 ) -> np.ndarray:
-    env.seed(seed)
+    # env.seed(seed)
     actor.eval()
     episode_rewards = []
     for _ in range(n_episodes):
-        state, done = env.reset(), False
+        state, _ = env.reset()
+        done = False
         episode_reward = 0.0
         while not done:
             action = actor.act(state, device)
-            state, reward, done, _ = env.step(action)
+            state, reward, done, _, _ = env.step(action)
             episode_reward += reward
         episode_rewards.append(episode_reward)
 
@@ -414,30 +358,30 @@ def wandb_init(config: dict) -> None:
 
 @pyrallis.wrap()
 def train(config: TrainConfig):
-    env = gym.make(config.env_name)
-    set_seed(config.seed, env, deterministic_torch=config.deterministic_torch)
+    dataset = minari.load_dataset(config.dataset_id)
+    qdataset = qlearning_dataset(dataset)
+
+    env = get_env(config.env, config.device)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
-    dataset = d4rl.qlearning_dataset(env)
+    max_action = 1.0
 
     if config.normalize_reward:
-        modify_reward(dataset, config.env_name)
+        modify_reward(qdataset, config.env_name)
 
-    state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
-    dataset["observations"] = normalize_states(
-        dataset["observations"], state_mean, state_std
+    state_mean, state_std = compute_mean_std(qdataset["observations"], eps=1e-3)
+    qdataset["observations"] = normalize_states(
+        qdataset["observations"], state_mean, state_std
     )
-    dataset["next_observations"] = normalize_states(
-        dataset["next_observations"], state_mean, state_std
+    qdataset["next_observations"] = normalize_states(
+        qdataset["next_observations"], state_mean, state_std
     )
     env = wrap_env(env, state_mean=state_mean, state_std=state_std)
-    replay_buffer = ReplayBuffer(
-        state_dim,
-        action_dim,
-        config.buffer_size,
-        config.device,
+    
+    replay_buffer = ReplayBuffer(qdataset)
+    replay_buffer = DataLoader(
+        replay_buffer, batch_size=config.batch_size, shuffle=True
     )
-    replay_buffer.load_d4rl_dataset(dataset)
 
     actor_critic_kwargs = {
         "state_dim": state_dim,
@@ -475,7 +419,7 @@ def train(config: TrainConfig):
             pyrallis.dump(config, f)
 
     for t in trange(config.num_train_ops, ncols=80):
-        batch = replay_buffer.sample(config.batch_size)
+        batch = next(iter(replay_buffer))
         batch = [b.to(config.device) for b in batch]
         update_result = awac.update(batch)
         wandb.log(update_result, step=t)
