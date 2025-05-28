@@ -13,14 +13,15 @@ RUN apt-get update -q \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-RUN ln -s /usr/bin/python3 /usr/bin/python3
+RUN ln -s /usr/bin/python3 /usr/bin/python
 
 RUN git clone https://github.com/AKCIT-RL/mujoco_playground.git \
     && cd mujoco_playground \
-    && git checkout rough_terrain \
-    && pip install -U -e ".[all]"  
+    && git checkout origin/roughterrain \
+    && pip install -U -e ".[all]" 
 
-# installing mujoco distr
+RUN git clone https://github.com/google-deepmind/mujoco_menagerie.git /mujoco_playground/mujoco_playground/external_deps/mujoco_menagerie
+# Instala MuJoCo
 RUN mkdir -p /root/.mujoco \
     && wget https://mujoco.org/download/mujoco210-linux-x86_64.tar.gz -O mujoco.tar.gz \
     && tar -xf mujoco.tar.gz -C /root/.mujoco \
@@ -29,15 +30,20 @@ ENV LD_LIBRARY_PATH /root/.mujoco/mujoco210/bin:${LD_LIBRARY_PATH}
 
 # Copia requirements e instala dependências Python adicionais
 COPY requirements/requirements.txt requirements.txt
-RUN pip install -r requirements.txt \
-    && pip install minari carla mujoco-py
-
+RUN pip install --default-timeout=1000 --no-cache-dir -r requirements.txt
 # Configura WandB
 ARG WANDB_KEY
 ENV WANDB_API_KEY=${WANDB_KEY}
 
-# Variável padrão para Minari (pode ser sobrescrita dentro do container)
-ENV MINARI_DATASETS_PATH=/mujoco_playground
+RUN curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | bash && \
+    apt-get install -y git-lfs && \
+    git lfs install
+
+
+ARG HF_TOKEN
+ENV HF_TOKEN=${HF_TOKEN}
+RUN mkdir -p datasets && cd datasets && git clone https://user:$HF_TOKEN@huggingface.co/datasets/akcit-rl/playground
+ENV MINARI_DATASETS_PATH=/datasets
 
 # Código da aplicação
 WORKDIR /CORL

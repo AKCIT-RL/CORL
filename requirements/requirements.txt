@@ -16,3 +16,5 @@ optax==0.1.3
 distrax==0.1.2
 chex==0.1.5
 Cython==0.29.36
+minari==0.5.2
+mujoco_py==2.1.2.14
