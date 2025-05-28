@@ -9,7 +9,6 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import d4rl
 import gym
 import numpy as np
 import pyrallis
@@ -24,7 +23,7 @@ from torch.utils.data import DataLoader
 import minari
 
 from algorithms.utils.wrapper_gym import get_env
-from algorithms.utils.dataset import qlearning_dataset
+from algorithms.utils.dataset import qlearning_dataset, ReplayBuffer
 from algorithms.utils.save_video import save_video
 
 @dataclass
@@ -138,26 +137,6 @@ def wrap_env(
         env = gym.wrappers.TransformReward(env, scale_reward)
     return env
 
-class ReplayBuffer(torch.utils.data.Dataset):
-    def __init__(self, dataset_dict):
-        self.observations = dataset_dict["observations"]
-        self.actions = dataset_dict["actions"]
-        self.rewards = dataset_dict["rewards"]
-        self.next_observations = dataset_dict["next_observations"]
-        self.terminals = dataset_dict["terminals"]
-        self.size = len(self.observations)
-
-    def __len__(self):
-        return self.size
-
-    def __getitem__(self, idx):
-        return [
-            torch.from_numpy(self.observations[idx]),
-            torch.from_numpy(self.actions[idx]),
-            torch.tensor([self.rewards[idx]], dtype=torch.float32),
-            torch.from_numpy(self.next_observations[idx]),
-            torch.tensor([self.terminals[idx]], dtype=torch.float32),
-        ]
 
 # SAC Actor & Critic implementation
 class VectorizedLinear(nn.Module):
@@ -436,7 +415,7 @@ class SACN:
 
 @torch.no_grad()
 def eval_actor(
-    env: gym.Env, actor: Actor, device: str, n_episodes: int, seed: int
+    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
 ) -> np.ndarray:
     actor.eval()
     episode_rewards = []
@@ -445,13 +424,13 @@ def eval_actor(
         done = False
         episode_reward = 0.0
         while not done:
-            action = actor.act(state, device)
+            action = actor.act(state, device)[0]
             state, reward, done, _, _ = env.step(action)
             episode_reward += reward
         episode_rewards.append(episode_reward)
 
     actor.train()
-    return np.array(episode_rewards)
+    return np.asarray(episode_rewards)
 
 
 # normalization like in the IQL paper

@@ -66,7 +66,8 @@ class GymWrapper(wrapper_torch.RSLRLBraxWrapper):
         self.action_space = NumpySpace(shape=(self.num_actions,), dtype=np.float32)
 
     def step(self, action):
-        action = torch.tensor([action]).to(self.device)
+        action = np.array([action])  # Convert to numpy array first
+        action = torch.from_numpy(action).to(self.device)
         action = torch.clip(action, -1.0, 1.0)  # pytype: disable=attribute-error
         action = wrapper_torch._torch_to_jax(action)
         self.env_state = self.step_fn(self.env_state, action)
