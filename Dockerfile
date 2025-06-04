@@ -41,14 +41,11 @@ RUN curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.d
     git lfs install
 
 
-ARG HF_TOKEN
-ENV HF_TOKEN=${HF_TOKEN}
-RUN mkdir -p datasets && cd datasets && git clone https://user:$HF_TOKEN@huggingface.co/datasets/akcit-rl/playground
-ENV MINARI_DATASETS_PATH=/datasets
-
 # Código da aplicação
 WORKDIR /CORL
-COPY . /CORL
+COPY . /CORL/
+
+ENV MINARI_DATASETS_PATH=/datasets
 
 # Comando padrão: abre bash para você executar manualmente dentro do container
 CMD ["bash"]

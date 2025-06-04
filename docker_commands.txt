@@ -1,0 +1,6 @@
+sudo docker build --no-cache --build-arg WANDB_KEY=d45da33104f6d756eace42e42696916dc0d6ec01 -f Dockerfile -t luanamartins/corl .
+sudo docker run -it --gpus all -d \
+    -v ~/Documents/CEIA/offline_to_online/CORL/checkpoints/:/CORL/checkpoints \
+    -v ~/Documents/CEIA/offline_to_online/CORL/datasets/:/datasets \
+    luanamartins/corl \
+    python -m algorithms.offline.td3_bc --config_path="configs/offline/td3_bc/go1/joystick_rough_medium.yaml" --device "cuda" --normalize "false" --checkpoints_path "checkpoints/TD3-BC"
