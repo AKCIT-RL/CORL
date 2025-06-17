@@ -8,7 +8,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-import d4rl
 import gym
 import numpy as np
 import pyrallis
@@ -18,6 +17,11 @@ import torch.nn.functional as F
 import wandb
 from torch.distributions import Normal
 from torch.optim.lr_scheduler import CosineAnnealingLR
+
+import minari
+from algorithms.utils.wrapper_gym import get_env
+from algorithms.utils.dataset import qlearning_dataset, ReplayBuffer
+from torch.utils.data import TensorDataset, DataLoader
 
 TensorBatch = List[torch.Tensor]
 
@@ -32,11 +36,13 @@ class TrainConfig:
     # wandb project name
     project: str = "CORL"
     # wandb group name
-    group: str = "IQL-D4RL"
+    group: str = "IQL-Minari"
     # wandb run name
     name: str = "IQL"
-    # training dataset and evaluation environment
+    # environment identifier for get_env
     env: str = "halfcheetah-medium-expert-v2"
+    # dataset id for Minari
+    dataset_id: str = "halfcheetah-medium-expert-v2"
     # discount factor
     discount: float = 0.99
     # coefficient for the target critic Polyak's update
@@ -121,80 +127,70 @@ def wrap_env(
         env = gym.wrappers.TransformReward(env, scale_reward)
     return env
 
+class Squeeze(nn.Module):
+    def __init__(self, dim=-1):
+        super().__init__()
+        self.dim = dim
 
-class ReplayBuffer:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.squeeze(dim=self.dim)
+
+class MLP(nn.Module):
     def __init__(
         self,
-        state_dim: int,
-        action_dim: int,
-        buffer_size: int,
-        device: str = "cpu",
+        dims,
+        activation_fn: Callable[[], nn.Module] = nn.ReLU,
+        output_activation_fn: Callable[[], nn.Module] = None,
+        squeeze_output: bool = False,
+        dropout: Optional[float] = None,
     ):
-        self._buffer_size = buffer_size
-        self._pointer = 0
-        self._size = 0
+        super().__init__()
+        n_dims = len(dims)
+        if n_dims < 2:
+            raise ValueError("MLP requires at least two dims (input and output)")
 
-        self._states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._actions = torch.zeros(
-            (buffer_size, action_dim), dtype=torch.float32, device=device
-        )
-        self._rewards = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._next_states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._dones = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._device = device
+        layers = []
+        for i in range(n_dims - 2):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            layers.append(activation_fn())
+            if dropout is not None:
+                layers.append(nn.Dropout(dropout))
 
-    def _to_tensor(self, data: np.ndarray) -> torch.Tensor:
-        return torch.tensor(data, dtype=torch.float32, device=self._device)
+        layers.append(nn.Linear(dims[-2], dims[-1]))
+        if output_activation_fn is not None:
+            layers.append(output_activation_fn())
+        if squeeze_output:
+            if dims[-1] != 1:
+                raise ValueError("Last dim must be 1 when squeezing")
+            layers.append(Squeeze(-1))
+        self.net = nn.Sequential(*layers)
 
-    # Loads data in d4rl format, i.e. from Dict[str, np.array].
-    def load_d4rl_dataset(self, data: Dict[str, np.ndarray]):
-        if self._size != 0:
-            raise ValueError("Trying to load data into non-empty replay buffer")
-        n_transitions = data["observations"].shape[0]
-        if n_transitions > self._buffer_size:
-            raise ValueError(
-                "Replay buffer is smaller than the dataset you are trying to load!"
-            )
-        self._states[:n_transitions] = self._to_tensor(data["observations"])
-        self._actions[:n_transitions] = self._to_tensor(data["actions"])
-        self._rewards[:n_transitions] = self._to_tensor(data["rewards"][..., None])
-        self._next_states[:n_transitions] = self._to_tensor(data["next_observations"])
-        self._dones[:n_transitions] = self._to_tensor(data["terminals"][..., None])
-        self._size += n_transitions
-        self._pointer = min(self._size, n_transitions)
-
-        print(f"Dataset size: {n_transitions}")
-
-    def sample(self, batch_size: int) -> TensorBatch:
-        indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
-        states = self._states[indices]
-        actions = self._actions[indices]
-        rewards = self._rewards[indices]
-        next_states = self._next_states[indices]
-        dones = self._dones[indices]
-        return [states, actions, rewards, next_states, dones]
-
-    def add_transition(self):
-        # Use this method to add new data into the replay buffer during fine-tuning.
-        # I left it unimplemented since now we do not do fine-tuning.
-        raise NotImplementedError
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
-def set_seed(
-    seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
-):
-    if env is not None:
-        env.seed(seed)
-        env.action_space.seed(seed)
+def set_seed(seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False):
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
     random.seed(seed)
     torch.manual_seed(seed)
     torch.use_deterministic_algorithms(deterministic_torch)
+
+    if env is not None:
+        if hasattr(env, "seed") and callable(env.seed):
+            try:
+                env.seed(seed)
+            except Exception as e:
+                print(f"[set_seed] env.seed({seed}) falhou: {e}")
+        else:
+            print("[set_seed] env.seed() não está disponível. Seed será limitado ao PyTorch/NumPy/random.")
+        
+        if hasattr(env, "action_space") and hasattr(env.action_space, "seed"):
+            try:
+                env.action_space.seed(seed)
+            except Exception as e:
+                print(f"[set_seed] action_space.seed({seed}) falhou: {e}")
+
 
 
 def wandb_init(config: dict) -> None:
@@ -209,23 +205,65 @@ def wandb_init(config: dict) -> None:
 
 
 @torch.no_grad()
-def eval_actor(
-    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
-) -> np.ndarray:
-    env.seed(seed)
+def eval_actor(env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int) -> np.ndarray:
+    # 1) Semear o ambiente (se suportado)
+    try:
+        env.seed(seed)
+    except Exception:
+        pass
+    if hasattr(env, "action_space") and hasattr(env.action_space, "seed"):
+        try:
+            env.action_space.seed(seed)
+        except Exception:
+            pass
+
     actor.eval()
     episode_rewards = []
+
     for _ in range(n_episodes):
-        state, done = env.reset(), False
+        # 2) RESET: pode vir como (obs, info) ou dicionário. Pegamos apenas a parte "obs".
+        raw = env.reset()
+        if isinstance(raw, tuple):
+            state = raw[0]
+        else:
+            state = raw
+
         episode_reward = 0.0
+        done = False
+
         while not done:
-            action = actor.act(state, device)
-            state, reward, done, _ = env.step(action)
-            episode_reward += reward
+            # 3) Obter ação a partir de state (que agora é de fato um array)
+            state_np = state if isinstance(state, np.ndarray) else np.array(state)
+            action = actor.act(state_np, device)
+
+            # 4) STEP: pode retornar 4‐tuple (obs, reward, done, info)
+            #    ou 5‐tuple (obs, reward, terminated, truncated, info).
+            out = env.step(action)
+            if len(out) == 4:
+                next_raw, reward, done_flag, info = out
+                done = bool(done_flag)
+            elif len(out) == 5:
+                next_raw, reward, term_flag, trunc_flag, info = out
+                done = bool(term_flag or trunc_flag)
+            else:
+                raise RuntimeError(
+                    f"env.step() retornou {len(out)} elementos, mas esperava 4 ou 5"
+                )
+
+            # 5) Extrair a parte “obs” de next_raw
+            if isinstance(next_raw, tuple):
+                next_state = next_raw[0]
+            else:
+                next_state = next_raw
+
+            episode_reward += float(reward)
+            state = next_state
+
         episode_rewards.append(episode_reward)
 
     actor.train()
     return np.asarray(episode_rewards)
+
 
 
 def return_reward_range(dataset, max_episode_steps):
@@ -254,51 +292,6 @@ def modify_reward(dataset, env_name, max_episode_steps=1000):
 
 def asymmetric_l2_loss(u: torch.Tensor, tau: float) -> torch.Tensor:
     return torch.mean(torch.abs(tau - (u < 0).float()) * u**2)
-
-
-class Squeeze(nn.Module):
-    def __init__(self, dim=-1):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x.squeeze(dim=self.dim)
-
-
-class MLP(nn.Module):
-    def __init__(
-        self,
-        dims,
-        activation_fn: Callable[[], nn.Module] = nn.ReLU,
-        output_activation_fn: Callable[[], nn.Module] = None,
-        squeeze_output: bool = False,
-        dropout: Optional[float] = None,
-    ):
-        super().__init__()
-        n_dims = len(dims)
-        if n_dims < 2:
-            raise ValueError("MLP requires at least two dims (input and output)")
-
-        layers = []
-        for i in range(n_dims - 2):
-            layers.append(nn.Linear(dims[i], dims[i + 1]))
-            layers.append(activation_fn())
-
-            if dropout is not None:
-                layers.append(nn.Dropout(dropout))
-
-        layers.append(nn.Linear(dims[-2], dims[-1]))
-        if output_activation_fn is not None:
-            layers.append(output_activation_fn())
-        if squeeze_output:
-            if dims[-1] != 1:
-                raise ValueError("Last dim must be 1 when squeezing")
-            layers.append(Squeeze(-1))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
 
 class GaussianPolicy(nn.Module):
     def __init__(
@@ -539,63 +532,68 @@ class ImplicitQLearning:
 
 @pyrallis.wrap()
 def train(config: TrainConfig):
-    env = gym.make(config.env)
+    # 1) Carregar dataset Minari e converter para qdataset
+    dataset_raw = minari.load_dataset(config.dataset_id)
+    qdataset = qlearning_dataset(dataset_raw)
 
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    # 2) Criar o ambiente via get_env e ajustar seed
+    env = get_env(config.env, config.device)
+    set_seed(config.seed, env)
 
-    dataset = d4rl.qlearning_dataset(env)
-
+    # 3) Normalizar recompensa se necessário
     if config.normalize_reward:
-        modify_reward(dataset, config.env)
+        modify_reward(qdataset, config.env)
 
+    # 4) Calcular mean/std e normalizar observações
     if config.normalize:
-        state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
+        state_mean, state_std = compute_mean_std(qdataset["observations"], eps=1e-3)
     else:
         state_mean, state_std = 0, 1
 
-    dataset["observations"] = normalize_states(
-        dataset["observations"], state_mean, state_std
-    )
-    dataset["next_observations"] = normalize_states(
-        dataset["next_observations"], state_mean, state_std
-    )
+    qdataset["observations"] = normalize_states(qdataset["observations"], state_mean, state_std)
+    qdataset["next_observations"] = normalize_states(qdataset["next_observations"], state_mean, state_std)
+
+    # 5) Aplicar wrapper de normalização no ambiente
     env = wrap_env(env, state_mean=state_mean, state_std=state_std)
-    replay_buffer = ReplayBuffer(
-        state_dim,
-        action_dim,
-        config.buffer_size,
-        config.device,
-    )
-    replay_buffer.load_d4rl_dataset(dataset)
 
-    max_action = float(env.action_space.high[0])
+    # 6) Agora que “env” existe, defina state_dim e action_dim
+    #    Note que, em ambientes Minari, pode haver espaços compostos, mas
+    #    aqui assumimos que `.observation_space.shape` e `.action_space.shape` existem:
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
 
-    if config.checkpoints_path is not None:
-        print(f"Checkpoints path: {config.checkpoints_path}")
-        os.makedirs(config.checkpoints_path, exist_ok=True)
-        with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
-            pyrallis.dump(config, f)
+    # 7) Montar DataLoader a partir de qdataset (sem usar replay_buffer.sample)
+    from torch.utils.data import TensorDataset, DataLoader
 
-    # Set seeds
-    seed = config.seed
-    set_seed(seed, env)
+    obs_tensor       = torch.tensor(qdataset["observations"],       dtype=torch.float32)
+    actions_tensor   = torch.tensor(qdataset["actions"],            dtype=torch.float32)
+    rewards_tensor   = torch.tensor(qdataset["rewards"].reshape(-1, 1),    dtype=torch.float32)
+    next_obs_tensor  = torch.tensor(qdataset["next_observations"], dtype=torch.float32)
+    dones_tensor     = torch.tensor(qdataset["terminals"].reshape(-1, 1),   dtype=torch.float32)
 
+    full_dataset = TensorDataset(obs_tensor, actions_tensor, rewards_tensor, next_obs_tensor, dones_tensor)
+    dataloader = DataLoader(full_dataset, batch_size=config.batch_size, shuffle=True, drop_last=True)
+
+    # 8) Determinar max_action (com fallback se action_space.high não existir)
+    try:
+        max_action = float(env.action_space.high[0])
+    except Exception:
+        max_action = 1.0
+
+    # 9) Criar redes e otimizadores (state_dim/action_dim usados aqui)
     q_network = TwinQ(state_dim, action_dim).to(config.device)
     v_network = ValueFunction(state_dim).to(config.device)
     actor = (
-        DeterministicPolicy(
-            state_dim, action_dim, max_action, dropout=config.actor_dropout
-        )
+        DeterministicPolicy(state_dim, action_dim, max_action, dropout=config.actor_dropout)
         if config.iql_deterministic
-        else GaussianPolicy(
-            state_dim, action_dim, max_action, dropout=config.actor_dropout
-        )
+        else GaussianPolicy(state_dim, action_dim, max_action, dropout=config.actor_dropout)
     ).to(config.device)
-    v_optimizer = torch.optim.Adam(v_network.parameters(), lr=config.vf_lr)
-    q_optimizer = torch.optim.Adam(q_network.parameters(), lr=config.qf_lr)
+
+    v_optimizer     = torch.optim.Adam(v_network.parameters(), lr=config.vf_lr)
+    q_optimizer     = torch.optim.Adam(q_network.parameters(), lr=config.qf_lr)
     actor_optimizer = torch.optim.Adam(actor.parameters(), lr=config.actor_lr)
 
+    # 10) Montar kwargs para o construtor ImplicitQLearning
     kwargs = {
         "max_action": max_action,
         "actor": actor,
@@ -607,59 +605,52 @@ def train(config: TrainConfig):
         "discount": config.discount,
         "tau": config.tau,
         "device": config.device,
-        # IQL
         "beta": config.beta,
         "iql_tau": config.iql_tau,
         "max_steps": config.max_timesteps,
     }
 
-    print("---------------------------------------")
-    print(f"Training IQL, Env: {config.env}, Seed: {seed}")
-    print("---------------------------------------")
-
-    # Initialize actor
+    # 11) Instanciar o trainer
     trainer = ImplicitQLearning(**kwargs)
-
-    if config.load_model != "":
-        policy_file = Path(config.load_model)
-        trainer.load_state_dict(torch.load(policy_file))
+    if config.load_model:
+        trainer.load_state_dict(torch.load(config.load_model))
         actor = trainer.actor
 
+    # 12) Inicializar wandb e iniciar o loop de treino
     wandb_init(asdict(config))
 
-    evaluations = []
-    for t in range(int(config.max_timesteps)):
-        batch = replay_buffer.sample(config.batch_size)
-        batch = [b.to(config.device) for b in batch]
-        log_dict = trainer.train(batch)
-        wandb.log(log_dict, step=trainer.total_it)
-        # Evaluate episode
-        if (t + 1) % config.eval_freq == 0:
-            print(f"Time steps: {t + 1}")
-            eval_scores = eval_actor(
-                env,
-                actor,
-                device=config.device,
-                n_episodes=config.n_episodes,
-                seed=config.seed,
-            )
-            eval_score = eval_scores.mean()
-            normalized_eval_score = env.get_normalized_score(eval_score) * 100.0
-            evaluations.append(normalized_eval_score)
-            print("---------------------------------------")
-            print(
-                f"Evaluation over {config.n_episodes} episodes: "
-                f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}"
-            )
-            print("---------------------------------------")
-            if config.checkpoints_path is not None:
-                torch.save(
-                    trainer.state_dict(),
-                    os.path.join(config.checkpoints_path, f"checkpoint_{t}.pt"),
-                )
-            wandb.log(
-                {"d4rl_normalized_score": normalized_eval_score}, step=trainer.total_it
-            )
+    step = 0
+    while step < config.max_timesteps:
+        for batch_tensors in dataloader:
+            obs_batch, actions_batch, rewards_batch, next_obs_batch, dones_batch = [
+                t.to(config.device) for t in batch_tensors
+            ]
+
+            log_dict = trainer.train([obs_batch, actions_batch, rewards_batch, next_obs_batch, dones_batch])
+            wandb.log(log_dict, step=trainer.total_it)
+
+            step += 1
+            if step % config.eval_freq == 0:
+                # Avaliação
+                eval_scores = eval_actor(env, actor, device=config.device, n_episodes=config.n_episodes, seed=config.seed)
+                eval_score = eval_scores.mean()
+                if hasattr(env, "get_normalized_score"):
+                    norm_score = env.get_normalized_score(eval_score) * 100.0
+                    print(f"Evaluation over {config.n_episodes} episodes: {eval_score:.3f} , Normalized: {norm_score:.3f}")
+                    wandb.log({"d4rl_normalized_score": norm_score}, step=trainer.total_it)
+                else:
+                    print(f"Evaluation over {config.n_episodes} episodes: {eval_score:.3f}")
+
+                if config.checkpoints_path is not None:
+                    torch.save(trainer.state_dict(), os.path.join(config.checkpoints_path, f"checkpoint_{step}.pt"))
+
+                if step >= config.max_timesteps:
+                    break
+        if step >= config.max_timesteps:
+            break
+
+    wandb.finish()
+
 
 
 if __name__ == "__main__":
