@@ -21,6 +21,9 @@ import minari
 from algorithms.utils.wrapper_gym import get_env
 from algorithms.utils.dataset import qlearning_dataset, ReplayBuffer
 
+from algorithms.utils.common import soft_update, set_seed, wandb_init, compute_mean_std, normalize_states, wrap_env
+
+
 TensorBatch = List[torch.Tensor]
 
 def get_actor_from_checkpoint(checkpoint_path: str, state_dim: int, action_dim: int, max_action: float, checkpoint_id: int = -1):
@@ -99,20 +102,6 @@ class TrainConfig:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
 
 
-def soft_update(target: nn.Module, source: nn.Module, tau: float):
-    for target_param, source_param in zip(target.parameters(), source.parameters()):
-        target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
-
-
-def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
-    mean = states.mean(0)
-    std = states.std(0) + eps
-    return mean, std
-
-
-def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
-    return (states - mean) / std
-
 
 def wrap_env(
     env: gym.Env,
@@ -144,16 +133,6 @@ def set_seed(
     torch.manual_seed(seed)
     torch.use_deterministic_algorithms(deterministic_torch)
 
-
-def wandb_init(config: dict) -> None:
-    wandb.init(
-        config=config,
-        project=config["project"],
-        group=config["group"],
-        name=config["name"],
-        id=str(uuid.uuid4()),
-    )
-    wandb.run.save()
 
 
 @torch.no_grad()

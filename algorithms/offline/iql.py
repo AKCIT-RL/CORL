@@ -23,6 +23,8 @@ from algorithms.utils.wrapper_gym import get_env
 from algorithms.utils.dataset import qlearning_dataset, ReplayBuffer
 from torch.utils.data import TensorDataset, DataLoader
 
+from algorithms.utils.common import soft_update, set_seed, wandb_init, compute_mean_std, normalize_states, wrap_env
+
 TensorBatch = List[torch.Tensor]
 
 
@@ -91,41 +93,6 @@ class TrainConfig:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
 
 
-def soft_update(target: nn.Module, source: nn.Module, tau: float):
-    for target_param, source_param in zip(target.parameters(), source.parameters()):
-        target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
-
-
-def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
-    mean = states.mean(0)
-    std = states.std(0) + eps
-    return mean, std
-
-
-def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
-    return (states - mean) / std
-
-
-def wrap_env(
-    env: gym.Env,
-    state_mean: Union[np.ndarray, float] = 0.0,
-    state_std: Union[np.ndarray, float] = 1.0,
-    reward_scale: float = 1.0,
-) -> gym.Env:
-    # PEP 8: E731 do not assign a lambda expression, use a def
-    def normalize_state(state):
-        return (
-            state - state_mean
-        ) / state_std  # epsilon should be already added in std.
-
-    def scale_reward(reward):
-        # Please be careful, here reward is multiplied by scale!
-        return reward_scale * reward
-
-    env = gym.wrappers.TransformObservation(env, normalize_state)
-    if reward_scale != 1.0:
-        env = gym.wrappers.TransformReward(env, scale_reward)
-    return env
 
 class Squeeze(nn.Module):
     def __init__(self, dim=-1):
@@ -167,29 +134,6 @@ class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
-
-
-def set_seed(seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False):
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.use_deterministic_algorithms(deterministic_torch)
-
-    if env is not None:
-        if hasattr(env, "seed") and callable(env.seed):
-            try:
-                env.seed(seed)
-            except Exception as e:
-                print(f"[set_seed] env.seed({seed}) falhou: {e}")
-        else:
-            print("[set_seed] env.seed() não está disponível. Seed será limitado ao PyTorch/NumPy/random.")
-        
-        if hasattr(env, "action_space") and hasattr(env.action_space, "seed"):
-            try:
-                env.action_space.seed(seed)
-            except Exception as e:
-                print(f"[set_seed] action_space.seed({seed}) falhou: {e}")
 
 
 
