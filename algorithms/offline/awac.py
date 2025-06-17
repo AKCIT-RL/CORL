@@ -35,7 +35,7 @@ class TrainConfig:
     name: str = "AWAC"
     # training dataset and evaluation environment
     env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
-    dataset_id: str = "halfcheetah-medium-expert-v2
+    dataset_id: str = "halfcheetah-medium-expert-v2"
     # actor and critic hidden dim
     hidden_dim: int = 256
     # actor and critic learning rate
@@ -73,7 +73,7 @@ class TrainConfig:
     device: str = "cuda"
 
     def __post_init__(self):
-        self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
+        self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
         if self.checkpoints_path is not None:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
 
@@ -368,7 +368,7 @@ def train(config: TrainConfig):
     max_action = 1.0
 
     if config.normalize_reward:
-        modify_reward(qdataset, config.env_name)
+        modify_reward(qdataset, config.env)
 
     state_mean, state_std = compute_mean_std(qdataset["observations"], eps=1e-3)
     qdataset["observations"] = normalize_states(
