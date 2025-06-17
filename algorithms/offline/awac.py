@@ -21,6 +21,8 @@ from algorithms.utils.wrapper_gym import get_env
 from algorithms.utils.dataset import qlearning_dataset, ReplayBuffer
 from algorithms.utils.save_video import save_video
 
+from algorithms.utils.common import soft_update, set_seed, wandb_init, compute_mean_std, normalize_states, wrap_env
+
 TensorBatch = List[torch.Tensor]
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -156,10 +158,6 @@ class Critic(nn.Module):
         q_value = self._mlp(torch.cat([state, action], dim=-1))
         return q_value
 
-
-def soft_update(target: nn.Module, source: nn.Module, tau: float):
-    for target_param, source_param in zip(target.parameters(), source.parameters()):
-        target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
 
 
 class AdvantageWeightedActorCritic:
@@ -345,16 +343,6 @@ def modify_reward(dataset, env_name, max_episode_steps=1000):
     elif "antmaze" in env_name:
         dataset["rewards"] -= 1.0
 
-
-def wandb_init(config: dict) -> None:
-    wandb.init(
-        config=config,
-        project=config["project"],
-        group=config["group"],
-        name=config["name"],
-        id=str(uuid.uuid4()),
-    )
-    wandb.run.save()
 
 
 @pyrallis.wrap()

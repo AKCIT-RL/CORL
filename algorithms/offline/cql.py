@@ -24,6 +24,8 @@ from algorithms.utils.wrapper_gym import get_env
 from algorithms.utils.dataset import qlearning_dataset, ReplayBuffer
 from algorithms.utils.save_video import save_video
 
+from algorithms.utils.common import soft_update, set_seed, wandb_init, compute_mean_std, normalize_states, wrap_env
+
 TensorBatch = List[torch.Tensor]
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
