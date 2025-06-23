@@ -26,6 +26,49 @@ from algorithms.utils.wrapper_gym import get_env
 from algorithms.utils.dataset import qlearning_dataset, ReplayBuffer
 from algorithms.utils.save_video import save_video
 
+import yaml
+import etils.epath as epath
+
+def get_actor_from_checkpoint(checkpoint_path: str, state_dim: int, action_dim: int, max_action: float, checkpoint_id: int = -1):
+    ckpt_path = str(epath.Path(checkpoint_path).resolve())
+    FINETUNE_PATH = epath.Path(ckpt_path)
+    latest_ckpts = list(FINETUNE_PATH.glob("*"))
+    latest_ckpts = [ckpt for ckpt in latest_ckpts if not ckpt.is_dir() and ckpt.name.endswith(".pt")]
+    latest_ckpts.sort(key=lambda x: int(x.name.split("/")[-1].split("_")[-1].split(".")[0]))
+    latest_ckpts = latest_ckpts[checkpoint_id]
+
+    with open(os.path.join(checkpoint_path, "config.yaml")) as f:
+        config = yaml.safe_load(f)
+
+    actor = Actor(state_dim, action_dim, config["hidden_dim"], config["max_action"])
+    actor.to(config["device"])
+    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=config["actor_learning_rate"])
+    critic = VectorizedCritic(
+        state_dim, action_dim, config["hidden_dim"], config["num_critics"]
+    )
+    critic.to(config["device"])
+    critic_optimizer = torch.optim.Adam(
+        critic.parameters(), lr=config["critic_learning_rate"]
+    )
+
+    trainer = SACN(
+        actor=actor,
+        actor_optimizer=actor_optimizer,
+        critic=critic,
+        critic_optimizer=critic_optimizer,
+        gamma=config["gamma"],
+        tau=config["tau"],
+        alpha_learning_rate=config["alpha_learning_rate"],
+        device=config["device"],
+    )
+    trainer.load_state_dict(torch.load(latest_ckpts))
+    actor = trainer.actor
+    actor.eval()
+    return actor
+   
+    return actor
+
+
 @dataclass
 class TrainConfig:
     # wandb project name
@@ -542,18 +585,20 @@ def train(config: TrainConfig):
             wandb.log(eval_log)
 
             if config.checkpoints_path is not None:
-                torch.save(
-                    trainer.state_dict(),
-                    os.path.join(config.checkpoints_path, f"{epoch}.pt"),
-                )
+                # Save checkpoint every 10 epochs
+                if epoch % 500 == 0 or epoch == config.num_epochs - 1:
+                    torch.save(
+                        trainer.state_dict(),
+                        os.path.join(config.checkpoints_path, f"checkpoint_{epoch}.pt"),
+                    )
 
-    save_video(
-        env_name=config.env,
-        actor=trainer.actor,
-        device=config.device,
-        command=[1.0, 0.0, 0.0],
-        path_model=config.checkpoints_path,
-    )
+    # save_video(
+    #     env_name=config.env,
+    #     actor=trainer.actor,
+    #     device=config.device,
+    #     command=[1.0, 0.0, 0.0],
+    #     path_model=config.checkpoints_path,
+    # )
     wandb.finish()
 
 
