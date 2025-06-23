@@ -9,7 +9,7 @@ class NumpySpace(gym.spaces.Space[np.ndarray]):
         super().__init__(shape, dtype, seed)
 
     def sample(self, mask=None) -> np.ndarray:
-        return np.zeros(self.shape, dtype=self._dtype)
+        return np.zeros(self.shape, dtype=self.dtype)
 
     def contains(self, x) -> bool:
         # Check type first is slightly safer
