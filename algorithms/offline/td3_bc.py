@@ -514,13 +514,13 @@ def train(config: TrainConfig):
             )
 
 
-    save_video(
-        env_name=config.env,
-        actor=trainer.actor,
-        device=config.device,
-        command=[1.0, 0.0, 0.0],
-        path_model=config.checkpoints_path,
-    )
+    # save_video(
+    #     env_name=config.env,
+    #     actor=trainer.actor,
+    #     device=config.device,
+    #     command=[1.0, 0.0, 0.0],
+    #     path_model=config.checkpoints_path,
+    # )
 
 if __name__ == "__main__":
     train()
