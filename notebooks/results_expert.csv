@@ -1,0 +1,2 @@
+env,model,checkpoint_path,policy_hidden_layer_sizes,episode_rewards_mean,episode_rewards_std
+Go1Getup,PPO,../experts_checkpoints/Go1Getup,"(512, 256, 128)",5.038582,0.0
