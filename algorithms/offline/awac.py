@@ -303,7 +303,6 @@ def wrap_env(
 def eval_actor(
     env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
 ) -> np.ndarray:
-    # env.seed(seed)
     actor.eval()
     episode_rewards = []
     for _ in range(n_episodes):
@@ -312,7 +311,11 @@ def eval_actor(
         episode_reward = 0.0
         while not done:
             action = actor.act(state, device)
-            state, reward, done, _, _ = env.step(action)
+            next_state, reward, done, _, _ = env.step(action)
+
+            done = bool(done) if np.isscalar(done) else bool(done[0])
+
+            state = next_state
             episode_reward += reward
         episode_rewards.append(episode_reward)
 
