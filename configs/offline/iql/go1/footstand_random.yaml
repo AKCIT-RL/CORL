@@ -22,13 +22,3 @@ checkpoints_path: null
 env: G1Footstand
 dataset_id: playground/Go1Footstand-expert-v0
 group: iql-Go1Footstand-expert-v0
-
-actor:
-  net:
-    hidden_dims: [256, 256]
-    input_dim: 45
-
-critic:
-  net:
-    hidden_dims: [256, 256]
-    input_dim: 45
