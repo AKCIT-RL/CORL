@@ -481,7 +481,7 @@ def train(config: TrainConfig):
     qdataset = qlearning_dataset(dataset_raw)
 
     # 2) Criar o ambiente via get_env e ajustar seed
-    env = get_env(config.env, config.device)
+    env = get_env(config.env, config.device, num_actors=config.n_episodes)
     set_seed(config.seed, env)
 
     # 3) Normalizar recompensa se necessário

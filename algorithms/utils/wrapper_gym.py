@@ -10,7 +10,7 @@ import torch
 from .space import NumpySpace
 
 
-def get_env(env_name: str, device: str):
+def get_env(env_name: str, device: str, num_actors: int = 1):
     env = registry.load(env_name)
     env_cfg = registry.get_default_config(env_name)
     randomizer = registry.get_domain_randomizer(env_name)
@@ -22,7 +22,7 @@ def get_env(env_name: str, device: str):
 
     env = GymWrapper(
         env,
-        num_actors=1,
+        num_actors=num_actors,
         seed=1,
         episode_length=env_cfg.episode_length,
         action_repeat=1,
