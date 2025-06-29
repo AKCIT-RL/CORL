@@ -17,6 +17,7 @@ import torch.nn.functional as F
 import wandb
 from torch.distributions import Normal
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from gym.spaces import Dict as SpaceDict
 
 import minari
 from algorithms.utils.wrapper_gym import get_env
@@ -501,9 +502,13 @@ def train(config: TrainConfig):
     env = wrap_env(env, state_mean=state_mean, state_std=state_std)
 
     # 6) Agora que “env” existe, defina state_dim e action_dim
-    #    Note que, em ambientes Minari, pode haver espaços compostos, mas
-    #    aqui assumimos que `.observation_space.shape` e `.action_space.shape` existem:
-    state_dim = env.observation_space.shape[0]
+
+    obs_space = env.observation_space
+    if isinstance(obs_space, SpaceDict):
+        state_dim = sum(space.shape[0] for space in obs_space.spaces.values())
+    else:
+        state_dim = obs_space.shape[0]
+    
     action_dim = env.action_space.shape[0]
 
     # 7) Montar DataLoader a partir de qdataset (sem usar replay_buffer.sample)
