@@ -40,6 +40,7 @@ RUN curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.d
     apt-get install -y git-lfs && \
     git lfs install
 
+RUN pip install -U mujoco==3.3.0
 
 # Código da aplicação
 WORKDIR /CORL

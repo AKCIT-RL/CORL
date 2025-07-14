@@ -8,7 +8,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from typing import Any, DefaultDict, Dict, List, Optional, Tuple, Union
 
-import d4rl  # noqa
+# import d4rl  # noqa
 import gym
 import numpy as np
 import pyrallis
@@ -18,6 +18,15 @@ import wandb
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm.auto import trange
+
+import minari
+
+from algorithms.utils.wrapper_gym import get_env
+from algorithms.utils.dataset import qlearning_dataset, ReplayBuffer
+from algorithms.utils.save_video import save_video
+
+# os.environ["MINARI_DATASETS_PATH"] = "/home/luanagbmartins/Documents/CEIA/offline_to_online/CORL/datasets"
+# os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 @dataclass
 class TrainConfig:
@@ -47,6 +56,7 @@ class TrainConfig:
     max_action: float = 1.0
     # training dataset and evaluation environment
     env_name: str = "halfcheetah-medium-v2"
+    dataset_id: str = "halfcheetah-medium-v2"
     # AdamW optimizer learning rate
     learning_rate: float = 1e-4
     # AdamW optimizer betas
@@ -93,9 +103,6 @@ class TrainConfig:
 def set_seed(
     seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
 ):
-    if env is not None:
-        env.seed(seed)
-        env.action_space.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -153,41 +160,75 @@ def discounted_cumsum(x: np.ndarray, gamma: float) -> np.ndarray:
     return cumsum
 
 
+def custom_collate_fn(batch):
+    """Custom collate function to handle the dataset items properly."""
+    try:
+        states, actions, returns, time_steps, masks = zip(*batch)
+        
+        # Convert to numpy arrays first to ensure consistent shapes
+        states = np.array(states, dtype=np.float32)
+        actions = np.array(actions, dtype=np.float32)
+        returns = np.array(returns, dtype=np.float32)
+        time_steps = np.array(time_steps, dtype=np.int64)
+        masks = np.array(masks, dtype=np.float32)
+        
+        # Convert to tensors
+        states = torch.tensor(states, dtype=torch.float32)
+        actions = torch.tensor(actions, dtype=torch.float32)
+        returns = torch.tensor(returns, dtype=torch.float32)
+        time_steps = torch.tensor(time_steps, dtype=torch.long)
+        masks = torch.tensor(masks, dtype=torch.float32)
+        
+        return states, actions, returns, time_steps, masks
+    except Exception as e:
+        print(f"Error in custom_collate_fn: {e}")
+        print(f"Batch size: {len(batch)}")
+        if len(batch) > 0:
+            print(f"First item shapes: {[x.shape if hasattr(x, 'shape') else type(x) for x in batch[0]]}")
+        raise
+
+
 def load_d4rl_trajectories(
-    env_name: str, gamma: float = 1.0
+    dataset_id: str, gamma: float = 1.0
 ) -> Tuple[List[DefaultDict[str, np.ndarray]], Dict[str, Any]]:
-    dataset = gym.make(env_name).get_dataset()
+    dataset = minari.load_dataset(dataset_id)
+    
     traj, traj_len = [], []
 
-    data_ = defaultdict(list)
-    for i in trange(dataset["rewards"].shape[0], desc="Processing trajectories"):
-        data_["observations"].append(dataset["observations"][i])
-        data_["actions"].append(dataset["actions"][i])
-        data_["rewards"].append(dataset["rewards"][i])
+    obs = []
 
-        if dataset["terminals"][i] or dataset["timeouts"][i]:
-            episode_data = {k: np.array(v, dtype=np.float32) for k, v in data_.items()}
-            # return-to-go if gamma=1.0, just discounted returns else
-            episode_data["returns"] = discounted_cumsum(
-                episode_data["rewards"], gamma=gamma
-            )
-            traj.append(episode_data)
-            traj_len.append(episode_data["actions"].shape[0])
-            # reset trajectory buffer
-            data_ = defaultdict(list)
+    data_ = defaultdict(list)
+    for episode in dataset.iterate_episodes():
+        data_["observations"] = episode.observations
+        data_["actions"] = episode.actions
+        data_["rewards"] = episode.rewards
+        data_["terminals"] = episode.terminations | episode.truncations
+
+        episode_data = {k: np.array(v, dtype=np.float32) for k, v in data_.items()}
+        # return-to-go if gamma=1.0, just discounted returns else
+        episode_data["returns"] = discounted_cumsum(
+            episode_data["rewards"], gamma=gamma
+        )
+        traj.append(episode_data)
+        traj_len.append(episode_data["actions"].shape[0])
+        # reset trajectory buffer
+        data_ = defaultdict(list)
+
+        # Ensure observations are numpy arrays
+        obs.append(np.array(episode.observations, dtype=np.float32))
 
     # needed for normalization, weighted sampling, other stats can be added also
     info = {
-        "obs_mean": dataset["observations"].mean(0, keepdims=True),
-        "obs_std": dataset["observations"].std(0, keepdims=True) + 1e-6,
+        "obs_mean": np.concatenate(obs).mean(0, keepdims=True),
+        "obs_std": np.concatenate(obs).std(0, keepdims=True) + 1e-6,
         "traj_lens": np.array(traj_len),
     }
     return traj, info
 
 
 class SequenceDataset(IterableDataset):
-    def __init__(self, env_name: str, seq_len: int = 10, reward_scale: float = 1.0):
-        self.dataset, info = load_d4rl_trajectories(env_name, gamma=1.0)
+    def __init__(self, dataset_id: str, seq_len: int = 10, reward_scale: float = 1.0):
+        self.dataset, info = load_d4rl_trajectories(dataset_id, gamma=1.0)
         self.reward_scale = reward_scale
         self.seq_len = seq_len
 
@@ -199,21 +240,43 @@ class SequenceDataset(IterableDataset):
     def __prepare_sample(self, traj_idx, start_idx):
         traj = self.dataset[traj_idx]
         # https://github.com/kzl/decision-transformer/blob/e2d82e68f330c00f763507b3b01d774740bee53f/gym/experiment.py#L128 # noqa
-        states = traj["observations"][start_idx : start_idx + self.seq_len]
-        actions = traj["actions"][start_idx : start_idx + self.seq_len]
-        returns = traj["returns"][start_idx : start_idx + self.seq_len]
-        time_steps = np.arange(start_idx, start_idx + self.seq_len)
+        
+        # Get the actual length available from this starting point
+        available_length = traj["observations"].shape[0] - start_idx
+        actual_seq_len = min(self.seq_len, available_length)
+        
+        states = traj["observations"][start_idx : start_idx + actual_seq_len]
+        actions = traj["actions"][start_idx : start_idx + actual_seq_len]
+        returns = traj["returns"][start_idx : start_idx + actual_seq_len]
+        time_steps = np.arange(start_idx, start_idx + actual_seq_len)
 
         states = (states - self.state_mean) / self.state_std
         returns = returns * self.reward_scale
-        # pad up to seq_len if needed, padding is masked during training
+        
+        # Always pad to seq_len, even if we have fewer elements
         mask = np.hstack(
-            [np.ones(states.shape[0]), np.zeros(self.seq_len - states.shape[0])]
+            [np.ones(actual_seq_len), np.zeros(self.seq_len - actual_seq_len)]
         )
-        if states.shape[0] < self.seq_len:
-            states = pad_along_axis(states, pad_to=self.seq_len)
-            actions = pad_along_axis(actions, pad_to=self.seq_len)
-            returns = pad_along_axis(returns, pad_to=self.seq_len)
+        
+        # Pad all arrays to seq_len
+        states = pad_along_axis(states, pad_to=self.seq_len)
+        actions = pad_along_axis(actions, pad_to=self.seq_len)
+        returns = pad_along_axis(returns, pad_to=self.seq_len)
+        time_steps = pad_along_axis(time_steps, pad_to=self.seq_len, fill_value=0)
+
+        # Ensure all arrays have the correct shape and dtype
+        states = np.asarray(states, dtype=np.float32)
+        actions = np.asarray(actions, dtype=np.float32)
+        returns = np.asarray(returns, dtype=np.float32)
+        time_steps = np.asarray(time_steps, dtype=np.int64)
+        mask = np.asarray(mask, dtype=np.float32)
+
+        # Validate shapes
+        assert states.shape == (self.seq_len, states.shape[-1]), f"States shape: {states.shape}, expected: ({self.seq_len}, {states.shape[-1]})"
+        assert actions.shape == (self.seq_len, actions.shape[-1]), f"Actions shape: {actions.shape}, expected: ({self.seq_len}, {actions.shape[-1]})"
+        assert returns.shape == (self.seq_len,), f"Returns shape: {returns.shape}, expected: ({self.seq_len},)"
+        assert time_steps.shape == (self.seq_len,), f"Time steps shape: {time_steps.shape}, expected: ({self.seq_len},)"
+        assert mask.shape == (self.seq_len,), f"Mask shape: {mask.shape}, expected: ({self.seq_len},)"
 
         return states, actions, returns, time_steps, mask
 
@@ -396,27 +459,56 @@ def eval_rollout(
     time_steps = torch.arange(model.episode_len, dtype=torch.long, device=device)
     time_steps = time_steps.view(1, -1)
 
-    states[:, 0] = torch.as_tensor(env.reset(), device=device)
+    obs = env.reset()
+    if isinstance(obs, tuple):
+        obs = obs[0]
+    if isinstance(obs, dict):
+        if 'state' in obs:
+            obs = obs['state']
+        elif 'privileged_state' in obs:
+            obs = obs['privileged_state']
+        elif 'observation' in obs:
+            obs = obs['observation']
+        else:
+            obs = list(obs.values())[0]
+    if not isinstance(obs, np.ndarray):
+        obs = np.array(obs, dtype=np.float32)
+    states[:, 0] = torch.as_tensor(obs, device=device)
     returns[:, 0] = torch.as_tensor(target_return, device=device)
 
-    # cannot step higher than model episode len, as timestep embeddings will crash
     episode_return, episode_len = 0.0, 0.0
     for step in range(model.episode_len):
-        # first select history up to step, then select last seq_len states,
-        # step + 1 as : operator is not inclusive, last action is dummy with zeros
-        # (as model will predict last, actual last values are not important)
-        predicted_actions = model(  # fix this noqa!!!
+        predicted_actions = model(
             states[:, : step + 1][:, -model.seq_len :],
             actions[:, : step + 1][:, -model.seq_len :],
             returns[:, : step + 1][:, -model.seq_len :],
             time_steps[:, : step + 1][:, -model.seq_len :],
         )
         predicted_action = predicted_actions[0, -1].cpu().numpy()
-        next_state, reward, done, info = env.step(predicted_action)
-        # at step t, we predict a_t, get s_{t + 1}, r_{t + 1}
+        step_result = env.step(predicted_action)
+        if isinstance(step_result, tuple) and len(step_result) == 5:
+            next_state, reward, done, truncated, info = step_result
+            done = done or truncated
+        else:
+            next_state, reward, done, info = step_result
+        if isinstance(next_state, tuple):
+            next_state = next_state[0]
+        if isinstance(next_state, dict):
+            if 'state' in next_state:
+                next_state = next_state['state']
+            elif 'privileged_state' in next_state:
+                next_state = next_state['privileged_state']
+            elif 'observation' in next_state:
+                next_state = next_state['observation']
+            else:
+                next_state = list(next_state.values())[0]
+        if not isinstance(next_state, np.ndarray):
+            next_state = np.array(next_state, dtype=np.float32)
         actions[:, step] = torch.as_tensor(predicted_action)
         states[:, step + 1] = torch.as_tensor(next_state)
-        returns[:, step + 1] = torch.as_tensor(returns[:, step] - reward)
+        # Convert reward to tensor on the correct device before subtraction
+        reward_tensor = torch.as_tensor(reward, device=device)
+        returns[:, step + 1] = returns[:, step] - reward_tensor
 
         episode_return += reward
         episode_len += 1
@@ -435,17 +527,30 @@ def train(config: TrainConfig):
 
     # data & dataloader setup
     dataset = SequenceDataset(
-        config.env_name, seq_len=config.seq_len, reward_scale=config.reward_scale
+        config.dataset_id, seq_len=config.seq_len, reward_scale=config.reward_scale
     )
-    trainloader = DataLoader(
-        dataset,
-        batch_size=config.batch_size,
-        pin_memory=True,
-        num_workers=config.num_workers,
-    )
+    
+    # Try with custom collate function first, fallback to single worker if issues persist
+    try:
+        trainloader = DataLoader(
+            dataset,
+            batch_size=config.batch_size,
+            pin_memory=True,
+            num_workers=config.num_workers,
+            collate_fn=custom_collate_fn,
+        )
+    except Exception as e:
+        print(f"Warning: Falling back to single worker due to: {e}")
+        trainloader = DataLoader(
+            dataset,
+            batch_size=config.batch_size,
+            pin_memory=True,
+            num_workers=0,  # Single worker
+            collate_fn=custom_collate_fn,
+        )
     # evaluation environment with state & reward preprocessing (as in dataset above)
     eval_env = wrap_env(
-        env=gym.make(config.env_name),
+        env=get_env(config.env_name, config.device),
         state_mean=dataset.state_mean,
         state_std=dataset.state_std,
         reward_scale=config.reward_scale,
@@ -522,7 +627,12 @@ def train(config: TrainConfig):
         if step % config.eval_every == 0 or step == config.update_steps - 1:
             model.eval()
             for target_return in config.target_returns:
-                eval_env.seed(config.eval_seed)
+                # Try to seed the environment, but handle cases where it might not work
+                try:
+                    eval_env.seed(config.eval_seed)
+                except (AttributeError, TypeError):
+                    # Some environments don't have a seed method or it's not callable
+                    pass
                 eval_returns = []
                 for _ in trange(config.eval_episodes, desc="Evaluation", leave=False):
                     eval_return, eval_len = eval_rollout(
@@ -534,19 +644,19 @@ def train(config: TrainConfig):
                     # unscale for logging & correct normalized score computation
                     eval_returns.append(eval_return / config.reward_scale)
 
-                normalized_scores = (
-                    eval_env.get_normalized_score(np.array(eval_returns)) * 100
-                )
+                # normalized_scores = (
+                #     eval_env.get_normalized_score(np.array(eval_returns)) * 100
+                # )
                 wandb.log(
                     {
                         f"eval/{target_return}_return_mean": np.mean(eval_returns),
                         f"eval/{target_return}_return_std": np.std(eval_returns),
-                        f"eval/{target_return}_normalized_score_mean": np.mean(
-                            normalized_scores
-                        ),
-                        f"eval/{target_return}_normalized_score_std": np.std(
-                            normalized_scores
-                        ),
+                        # f"eval/{target_return}_normalized_score_mean": np.mean(
+                        #     normalized_scores
+                        # ),
+                        # f"eval/{target_return}_normalized_score_std": np.std(
+                        #     normalized_scores
+                        # ),
                     },
                     step=step,
                 )
