@@ -4,6 +4,7 @@ import uuid
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
+from gym.spaces import Dict as SpaceDict
 
 import gymnasium as gym
 import numpy as np
@@ -354,7 +355,13 @@ def train(config: TrainConfig):
     qdataset = qlearning_dataset(dataset)
 
     env = get_env(config.env, config.device)
-    state_dim = env.observation_space.shape[0]
+    obs_space = env.observation_space
+    if isinstance(obs_space, SpaceDict):
+    # soma todos os sub‑espaços (e.g. privileged_state + state)
+        state_dim = sum(space.shape[0] for space in obs_space.spaces.values())
+    else:
+        state_dim = obs_space.shape[0]
+
     action_dim = env.action_space.shape[0]
     max_action = 1.0
 
