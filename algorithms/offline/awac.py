@@ -355,14 +355,18 @@ def train(config: TrainConfig):
     qdataset = qlearning_dataset(dataset)
 
     env = get_env(config.env, config.device)
-    obs_space = env.observation_space
-    if isinstance(obs_space, SpaceDict):
-    # soma todos os sub‑espaços (e.g. privileged_state + state)
-        state_dim = sum(space.shape[0] for space in obs_space.spaces.values())
-    else:
-        state_dim = obs_space.shape[0]
 
-    action_dim = env.action_space.shape[0]
+    raw = env.reset()
+    if isinstance(raw, tuple):
+        raw = raw[0]
+    
+    if isinstance(raw, dict):
+        state_dim = sum(v.shape[-1] for v in raw.values())
+    else:
+        state_dim = raw.shape[-1]
+
+    action_dim = env.action_space.shape[-1]
+
     max_action = 1.0
 
     if config.normalize_reward:
