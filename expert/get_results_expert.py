@@ -100,7 +100,6 @@ def main():
             jit_reset = jax.jit(env.reset)
             jit_step = jax.jit(env.step)
             rng = jax.random.PRNGKey(0)
-
             
             rollout = []
             episode_rewards = []
