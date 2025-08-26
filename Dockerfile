@@ -15,20 +15,9 @@ RUN apt-get update -q \
 
 RUN ln -s /usr/bin/python3 /usr/bin/python
 
-# Instala MuJoCo
-RUN mkdir -p /root/.mujoco \
-    && wget https://mujoco.org/download/mujoco210-linux-x86_64.tar.gz -O mujoco.tar.gz \
-    && tar -xf mujoco.tar.gz -C /root/.mujoco \
-    && rm mujoco.tar.gz
-ENV LD_LIBRARY_PATH /root/.mujoco/mujoco210/bin:${LD_LIBRARY_PATH}
-
 # Copia requirements e instala dependências Python adicionais
 COPY requirements/requirements.txt requirements.txt
 RUN pip install --default-timeout=1000 --no-cache-dir -r requirements.txt
-
-RUN git clone https://github.com/AKCIT-RL/mujoco_playground.git \
-    && cd mujoco_playground \
-    && pip install -U -e ".[all]" 
 
 RUN git clone https://github.com/google-deepmind/mujoco_menagerie.git /mujoco_playground/mujoco_playground/external_deps/mujoco_menagerie
 
@@ -40,11 +29,12 @@ RUN curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.d
     apt-get install -y git-lfs && \
     git lfs install
 
-RUN pip install -U mujoco==3.3.0
+RUN apt install ffmpeg -y
 
 # Código da aplicação
 WORKDIR /CORL
-COPY . /CORL/
+COPY algorithms /CORL/algorithms
+COPY configs /CORL/configs
 
 ENV MINARI_DATASETS_PATH=/datasets
 

@@ -5,7 +5,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import gym
+import gymnasium as gym
 import numpy as np
 import pyrallis
 import torch
@@ -23,6 +23,7 @@ from algorithms.utils.save_video import save_video
 
 TensorBatch = List[torch.Tensor]
 
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 @dataclass
 class TrainConfig:
@@ -296,7 +297,7 @@ def wrap_env(
     def normalize_state(state):
         return (state - state_mean) / state_std
 
-    env = gym.wrappers.TransformObservation(env, normalize_state)
+    env = gym.wrappers.TransformObservation(env, normalize_state, env.observation_space)
     return env
 
 

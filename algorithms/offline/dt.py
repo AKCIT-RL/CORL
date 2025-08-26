@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, DefaultDict, Dict, List, Optional, Tuple, Union
 
 # import d4rl  # noqa
-import gym
+import gymnasium as gym
 import numpy as np
 import pyrallis
 import torch
@@ -25,8 +25,7 @@ from algorithms.utils.wrapper_gym import get_env
 from algorithms.utils.dataset import qlearning_dataset, ReplayBuffer
 from algorithms.utils.save_video import save_video
 
-# os.environ["MINARI_DATASETS_PATH"] = "/home/luanagbmartins/Documents/CEIA/offline_to_online/CORL/datasets"
-# os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 @dataclass
 class TrainConfig:
@@ -133,7 +132,7 @@ def wrap_env(
     def scale_reward(reward):
         return reward_scale * reward
 
-    env = gym.wrappers.TransformObservation(env, normalize_state)
+    env = gym.wrappers.TransformObservation(env, normalize_state, env.observation_space)
     if reward_scale != 1.0:
         env = gym.wrappers.TransformReward(env, scale_reward)
     return env
