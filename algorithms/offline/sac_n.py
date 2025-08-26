@@ -9,7 +9,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import gym
+import gymnasium as gym
 import numpy as np
 import pyrallis
 import torch
@@ -28,6 +28,8 @@ from algorithms.utils.save_video import save_video
 
 import yaml
 import etils.epath as epath
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 def get_actor_from_checkpoint(checkpoint_path: str, state_dim: int, action_dim: int, max_action: float, checkpoint_id: int = -1):
     ckpt_path = str(epath.Path(checkpoint_path).resolve())
@@ -175,7 +177,7 @@ def wrap_env(
     def scale_reward(reward):
         return reward_scale * reward
 
-    env = gym.wrappers.TransformObservation(env, normalize_state)
+    env = gym.wrappers.TransformObservation(env, normalize_state, env.observation_space)
     if reward_scale != 1.0:
         env = gym.wrappers.TransformReward(env, scale_reward)
     return env

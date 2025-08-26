@@ -34,7 +34,7 @@ def get_env(env_name: str, device: str):
     return env
 
 
-class GymWrapper(wrapper_torch.RSLRLBraxWrapper):
+class GymWrapper(wrapper_torch.RSLRLBraxWrapper, gym.Env):
     def __init__(
         self,
         env,
@@ -109,15 +109,31 @@ class GymWrapper(wrapper_torch.RSLRLBraxWrapper):
                 )
 
         # next_observation, reward, terminal, truncated, info = env.step(action)
+        obs_np = obs.cpu().numpy()
+        if obs_np.ndim > 1 and obs_np.shape[0] == 1:
+            obs_np = obs_np.squeeze(0)
+
+        reward_np = reward.cpu().numpy()
+        if reward_np.size == 1:
+            reward_np = float(reward_np.reshape(-1)[0])
+
+        done_np = done.cpu().numpy()
+        if done_np.size == 1:
+            done_np = bool(done_np.reshape(-1)[0])
+
+        trunc_np = truncation.cpu().numpy()
+        if trunc_np.size == 1:
+            trunc_np = bool(trunc_np.reshape(-1)[0])
+
         return (
-            obs.cpu().numpy(),
-            reward.cpu().numpy(),
-            done.cpu().numpy(),
-            truncation.cpu().numpy(),
+            obs_np,
+            reward_np,
+            done_np,
+            trunc_np,
             info_ret,
         )
 
-    def reset(self):
+    def reset(self, *, seed=None, options=None):
         # todo add random init like in collab examples?
         self.env_state = self.reset_fn(self.key_reset)
 
@@ -126,4 +142,7 @@ class GymWrapper(wrapper_torch.RSLRLBraxWrapper):
         # critic_obs = jax_to_torch(self.env_state.obs["privileged_state"])
         else:
             obs = wrapper_torch._jax_to_torch(self.env_state.obs)
-        return obs.cpu().numpy(), {}
+        obs_np = obs.cpu().numpy()
+        if obs_np.ndim > 1 and obs_np.shape[0] == 1:
+            obs_np = obs_np.squeeze(0)
+        return obs_np, {}

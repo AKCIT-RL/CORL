@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import gym
+import gymnasium as gym
 import numpy as np
 import pyrallis
 import torch
@@ -20,6 +20,8 @@ import minari
 
 from algorithms.utils.wrapper_gym import get_env
 from algorithms.utils.dataset import qlearning_dataset, ReplayBuffer
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 TensorBatch = List[torch.Tensor]
 
@@ -51,6 +53,8 @@ def get_actor_from_checkpoint(checkpoint_path: str, state_dim: int, action_dim: 
     policy_file = Path(latest_ckpts)
     trainer.load_state_dict(torch.load(policy_file))
     actor = trainer.actor
+    actor = actor.to(config["device"])
+    print(f"[get_actor_from_checkpoint] Loaded actor device: {next(actor.parameters()).device}")
     actor.eval()
     return actor
 
@@ -130,7 +134,7 @@ def wrap_env(
         # Please be careful, here reward is multiplied by scale!
         return reward_scale * reward
 
-    env = gym.wrappers.TransformObservation(env, normalize_state)
+    env = gym.wrappers.TransformObservation(env, normalize_state, env.observation_space)
     if reward_scale != 1.0:
         env = gym.wrappers.TransformReward(env, scale_reward)
     return env
@@ -153,7 +157,6 @@ def wandb_init(config: dict) -> None:
         name=config["name"],
         id=str(uuid.uuid4()),
     )
-    wandb.run.save()
 
 
 @torch.no_grad()
@@ -285,6 +288,8 @@ class BC:
 
 @pyrallis.wrap()
 def train(config: TrainConfig):
+    print(f"[train] Starting training with config:\n {config}")
+
     dataset = minari.load_dataset(config.dataset_id)
     qdataset = qlearning_dataset(dataset)        
     env = get_env(config.env, config.device)
@@ -322,7 +327,9 @@ def train(config: TrainConfig):
     seed = config.seed
     set_seed(seed, env)
 
-    actor = Actor(state_dim, action_dim, max_action).to(config.device)
+    actor = Actor(state_dim, action_dim, max_action)
+    actor = actor.to(config.device)
+    print(f"[train] Created actor device: {next(actor.parameters()).device}")
     actor_optimizer = torch.optim.Adam(actor.parameters(), lr=3e-4)
 
     kwargs = {
@@ -344,6 +351,8 @@ def train(config: TrainConfig):
         policy_file = Path(config.load_model)
         trainer.load_state_dict(torch.load(policy_file))
         actor = trainer.actor
+        actor = actor.to(config.device)
+        print(f"[train] Loaded actor device: {next(actor.parameters()).device}")
 
     wandb_init(asdict(config))
 
