@@ -8,6 +8,7 @@ wandb
 .vscode
 checkpoints
 datasets
+expert/logs
 expert/rollouts
 expert_checkpoints
 

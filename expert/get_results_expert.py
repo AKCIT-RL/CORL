@@ -81,11 +81,11 @@ def define_model_paths():
         {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "logs/Go2Footstand-20250818-030725/checkpoints"},
         {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "logs/Go2Footstand-20250818-050219/checkpoints"},
 
-        {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "logs/G1JoystickFlatTerrain-20250806-214823/checkpoints"},
-        {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "logs/G1JoystickFlatTerrain-20250811-163413/checkpoints"},
-        {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "logs/G1JoystickFlatTerrain-20250811-163423/checkpoints"},
-        {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "logs/G1JoystickFlatTerrain-20250813-183648/checkpoints"},
-        {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "logs/G1JoystickFlatTerrain-20250815-174612/checkpoints"}
+        # {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "logs/G1JoystickFlatTerrain-20250806-214823/checkpoints"},
+        # {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "logs/G1JoystickFlatTerrain-20250811-163413/checkpoints"},
+        # {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "logs/G1JoystickFlatTerrain-20250811-163423/checkpoints"},
+        # {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "logs/G1JoystickFlatTerrain-20250813-183648/checkpoints"},
+        # {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "logs/G1JoystickFlatTerrain-20250815-174612/checkpoints"}
 
     ]
     return path_model
@@ -208,7 +208,7 @@ def process_model(p):
 
     now = datetime.now()
     timestamp = now.strftime("%Y%m%d-%H%M%S")
-    media.write_video(f"rollouts/expert_rollout-{p['checkpoint_path'].split("/")[1]}.mp4", frames, fps=fps)
+    media.write_video(f"rollouts/expert_rollout-{p['checkpoint_path'].split('/')[1]}.mp4", frames, fps=fps)
     
     return p
 

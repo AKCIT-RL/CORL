@@ -161,7 +161,7 @@ def wandb_init(config: dict) -> None:
 
 @torch.no_grad()
 def eval_actor(
-    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
+    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int, render: bool = False
 ) -> np.ndarray:
     actor.eval()
     episode_rewards = []
@@ -172,6 +172,8 @@ def eval_actor(
         while not done:
             action = actor.act(state, device)
             state, reward, done, _, _ = env.step(action)
+            if render:
+                env.render()
             episode_reward += reward
         episode_rewards.append(episode_reward)
 
