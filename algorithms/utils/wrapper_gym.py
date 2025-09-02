@@ -5,20 +5,17 @@ from mujoco_playground import wrapper_torch, wrapper
 from mujoco_playground import registry
 import gymnasium as gym
 import numpy as np
+import jax
 import torch
+import mediapy as media
 
 from .space import NumpySpace
 
 
-def get_env(env_name: str, device: str):
+def get_env(env_name: str, device: str, render_callback=None):
     env = registry.load(env_name)
     env_cfg = registry.get_default_config(env_name)
     randomizer = registry.get_domain_randomizer(env_name)
-
-    render_trajectory = []
-
-    def render_callback(_, state):
-        render_trajectory.append(state)
 
     env = GymWrapper(
         env,
@@ -26,9 +23,9 @@ def get_env(env_name: str, device: str):
         seed=1,
         episode_length=env_cfg.episode_length,
         action_repeat=1,
-        render_callback=render_callback,
         randomization_fn=randomizer,
         device=device,
+        render_callback=render_callback,
     )
 
     return env
@@ -57,6 +54,8 @@ class GymWrapper(wrapper_torch.RSLRLBraxWrapper, gym.Env):
             render_callback,
             device_rank,
         )
+
+        self.env_unwrapped = env
 
         self.device = device
         if isinstance(self.num_obs, tuple):
@@ -134,7 +133,10 @@ class GymWrapper(wrapper_torch.RSLRLBraxWrapper, gym.Env):
         )
 
     def reset(self, *, seed=None, options=None):
-        # todo add random init like in collab examples?
+        # Generate fresh reset keys each call (collab example style)
+        # Ensures different initial states across resets without extra overhead.
+        self.key, reset_key = jax.random.split(self.key)
+        self.key_reset = jax.random.split(reset_key, self.num_envs)
         self.env_state = self.reset_fn(self.key_reset)
 
         if self.asymmetric_obs:
@@ -146,3 +148,24 @@ class GymWrapper(wrapper_torch.RSLRLBraxWrapper, gym.Env):
         if obs_np.ndim > 1 and obs_np.shape[0] == 1:
             obs_np = obs_np.squeeze(0)
         return obs_np, {}
+
+    def save_video(self, render_trajectory, save_path=None):
+        scene_option = mujoco.MjvOption()
+        scene_option.geomgroup[2] = True
+        scene_option.geomgroup[3] = False
+        scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = True
+        scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
+        scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = True
+
+        render_every = 2
+        fps = 1.0 / self.env_unwrapped.dt / render_every
+        traj = render_trajectory[::render_every]
+        frames = self.env_unwrapped.render(
+            traj,
+            camera="track",
+            height=480,
+            width=640,
+            scene_option=scene_option,
+        )
+        if save_path is not None:
+            media.write_video(save_path, frames, fps=fps)

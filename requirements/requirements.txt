@@ -1,8 +1,10 @@
 --extra-index-url https://download.pytorch.org/whl/cu128
 torch==2.8.0
 jax[cuda12-local]==0.6.0
-playground==0.0.5
+# playground==0.0.5
 minari[all]==0.5.3
 pyrallis==0.3.1
-wandb==0.21.1
+wandb==0.19.11 
 tqdm==4.67.1
+pandas==2.3.2
+mediapy==1.2.4
