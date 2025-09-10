@@ -6,13 +6,14 @@ from mujoco_playground import registry
 import gymnasium as gym
 import numpy as np
 import jax
+import jax.numpy as jp
 import torch
 import mediapy as media
 
 from .space import NumpySpace
 
 
-def get_env(env_name: str, device: str, render_callback=None):
+def get_env(env_name: str, device: str, render_callback=None, command_type=None):
     env = registry.load(env_name)
     env_cfg = registry.get_default_config(env_name)
     randomizer = registry.get_domain_randomizer(env_name)
@@ -26,6 +27,7 @@ def get_env(env_name: str, device: str, render_callback=None):
         randomization_fn=randomizer,
         device=device,
         render_callback=render_callback,
+        command_type=command_type,
     )
 
     return env
@@ -43,6 +45,7 @@ class GymWrapper(wrapper_torch.RSLRLBraxWrapper, gym.Env):
         render_callback=None,
         device_rank=None,
         device="cpu",
+        command_type=None,
     ):
         super().__init__(
             env,
@@ -56,7 +59,7 @@ class GymWrapper(wrapper_torch.RSLRLBraxWrapper, gym.Env):
         )
 
         self.env_unwrapped = env
-
+        self.command_type = command_type
         self.device = device
         if isinstance(self.num_obs, tuple):
             self.observation_space = NumpySpace(shape=self.num_obs, dtype=np.float32)
@@ -138,6 +141,13 @@ class GymWrapper(wrapper_torch.RSLRLBraxWrapper, gym.Env):
         self.key, reset_key = jax.random.split(self.key)
         self.key_reset = jax.random.split(reset_key, self.num_envs)
         self.env_state = self.reset_fn(self.key_reset)
+
+        if self.command_type == "easy":
+            command = jp.concatenate([
+                self.env_state.info["command"][:, [0]],  # shape (batch, 1)
+                jp.zeros((self.env_state.info["command"].shape[0], 2), dtype=self.env_state.info["command"].dtype)
+            ], axis=1)
+            self.env_state.info["command"] = command
 
         if self.asymmetric_obs:
             obs = wrapper_torch._jax_to_torch(self.env_state.obs["state"])
