@@ -4,10 +4,10 @@ checkpoints_path: checkpoints/BC
 device: cuda
 discount: 0.99
 env: Go2JoystickRoughTerrain
-dataset_id: playground/Go2JoystickRoughTerrain-easy-medium-v1
+dataset_id: playground/Go2JoystickRoughTerrain-direction-expert-v1
 eval_freq: 5000
 frac: 1.0
-group: bc-go2-medium-v1
+group: bc-go2-expert-v1
 load_model: ''
 max_timesteps: 1000000
 max_traj_len: 1000
@@ -16,4 +16,4 @@ name: BC
 normalize: false
 project: Offline-Benchmark
 seed: 0
-command_type: easy
+command_type: direction
