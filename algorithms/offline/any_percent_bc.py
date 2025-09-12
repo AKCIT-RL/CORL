@@ -70,6 +70,7 @@ class TrainConfig:
     # training dataset and evaluation environment
     env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
     dataset_id: str = "halfcheetah-medium-expert-v2"
+    command_type: str = None
     # total gradient updates during training
     max_timesteps: int = int(1e6)
     # training batch size
@@ -294,7 +295,7 @@ def train(config: TrainConfig):
 
     dataset = minari.load_dataset(config.dataset_id)
     qdataset = qlearning_dataset(dataset)        
-    env = get_env(config.env, config.device)
+    env = get_env(config.env, config.device, command_type=config.command_type)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 

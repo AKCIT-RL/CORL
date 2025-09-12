@@ -15,9 +15,12 @@ RUN apt-get update -q \
 
 RUN ln -s /usr/bin/python3 /usr/bin/python
 
+RUN git clone https://github.com/AKCIT-RL/mujoco_playground.git /mujoco_playground
+RUN cd /mujoco_playground && git checkout go2 && pip install -e ".[all]"
+
 # Copia requirements e instala dependências Python adicionais
 COPY requirements/requirements.txt requirements.txt
-RUN pip install --default-timeout=1000 --no-cache-dir -r requirements.txt
+RUN pip install -U --default-timeout=1000 --no-cache-dir -r requirements.txt
 
 RUN git clone https://github.com/google-deepmind/mujoco_menagerie.git /mujoco_playground/mujoco_playground/external_deps/mujoco_menagerie
 

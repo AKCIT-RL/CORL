@@ -4,7 +4,7 @@ checkpoints_path: BC
 device: cuda
 discount: 0.99
 env: Go1JoystickFlatTerrain
-dataset_id: playground/Go1JoystickFlatTerrain-expert-v0
+dataset_id: playground/Go1JoystickFlatTerrain-expert-v1
 eval_freq: 5000
 frac: 1.0
 group: bc-go1-expert-v0
@@ -14,5 +14,5 @@ max_traj_len: 1000
 n_episodes: 10
 name: BC
 normalize: false
-project: CORL
+project: Offline-Benchmark
 seed: 0

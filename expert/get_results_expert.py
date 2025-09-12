@@ -51,35 +51,35 @@ def define_model_paths():
         # {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250729-141705/checkpoints"},
         # {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250729-152746/checkpoints"},
 
-        {'env': 'Go2JoystickFlatTerrain', "model": "PPO", "checkpoint_path": "logs/Go2JoystickFlatTerrain-20250818-065703/checkpoints"},
-        {'env': 'Go2JoystickFlatTerrain', "model": "PPO", "checkpoint_path": "logs/Go2JoystickFlatTerrain-20250818-115104/checkpoints"},
-        {'env': 'Go2JoystickFlatTerrain', "model": "PPO", "checkpoint_path": "logs/Go2JoystickFlatTerrain-20250818-125223/checkpoints"},
-        {'env': 'Go2JoystickFlatTerrain', "model": "PPO", "checkpoint_path": "logs/Go2JoystickFlatTerrain-20250818-135346/checkpoints"},
-        {'env': 'Go2JoystickFlatTerrain', "model": "PPO", "checkpoint_path": "logs/Go2JoystickFlatTerrain-20250818-145517/checkpoints"}, 
+        {'env': 'Go2JoystickFlatTerrain', "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2JoystickFlatTerrain-20250904-121138/checkpoints"},
+        {'env': 'Go2JoystickFlatTerrain', "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2JoystickFlatTerrain-20250904-195514/checkpoints"},
+        {'env': 'Go2JoystickFlatTerrain', "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2JoystickFlatTerrain-20250904-205636/checkpoints"},
+        {'env': 'Go2JoystickFlatTerrain', "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2JoystickFlatTerrain-20250904-215800/checkpoints"},
+        {'env': 'Go2JoystickFlatTerrain', "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2JoystickFlatTerrain-20250904-225910/checkpoints"}, 
 
-        {"env": "Go2JoystickRoughTerrain", "model": "PPO", "checkpoint_path": "logs/Go2JoystickRoughTerrain-20250818-155634/checkpoints"}, 
-        {"env": "Go2JoystickRoughTerrain", "model": "PPO", "checkpoint_path": "logs/Go2JoystickRoughTerrain-20250818-172316/checkpoints"}, 
-        {"env": "Go2JoystickRoughTerrain", "model": "PPO", "checkpoint_path": "logs/Go2JoystickRoughTerrain-20250818-184955/checkpoints"}, 
-        {"env": "Go2JoystickRoughTerrain", "model": "PPO", "checkpoint_path": "logs/Go2JoystickRoughTerrain-20250818-201636/checkpoints"}, 
-        {"env": "Go2JoystickRoughTerrain", "model": "PPO", "checkpoint_path": "logs/Go2JoystickRoughTerrain-20250818-214317/checkpoints"},
+        {"env": "Go2JoystickRoughTerrain", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2JoystickRoughTerrain-20250905-000021/checkpoints"}, 
+        {"env": "Go2JoystickRoughTerrain", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2JoystickRoughTerrain-20250905-012621/checkpoints"}, 
+        {"env": "Go2JoystickRoughTerrain", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2JoystickRoughTerrain-20250905-025216/checkpoints"}, 
+        {"env": "Go2JoystickRoughTerrain", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2JoystickRoughTerrain-20250905-041812/checkpoints"}, 
+        {"env": "Go2JoystickRoughTerrain", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2JoystickRoughTerrain-20250905-054419/checkpoints"},
 
-        {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "logs/Go2Getup-20250816-191527/checkpoints"},
-        {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "logs/Go2Getup-20250817-104354/checkpoints"},
-        {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "logs/Go2Getup-20250817-123933/checkpoints"},
-        {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "logs/Go2Getup-20250817-172203/checkpoints"},
-        {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "logs/Go2Getup-20250819-091222/checkpoints"},
+        # {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "logs/Go2Getup-20250816-191527/checkpoints"},
+        # {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "logs/Go2Getup-20250817-104354/checkpoints"},
+        # {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "logs/Go2Getup-20250817-123933/checkpoints"},
+        # {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "logs/Go2Getup-20250817-172203/checkpoints"},
+        # {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "logs/Go2Getup-20250819-091222/checkpoints"},
 
-        {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250818-231000/checkpoints"},
-        {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250819-010441/checkpoints"},
-        {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250819-025956/checkpoints"},
-        {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250819-045444/checkpoints"},
-        {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250819-064935/checkpoints"},
+        # {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250818-231000/checkpoints"},
+        # {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250819-010441/checkpoints"},
+        # {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250819-025956/checkpoints"},
+        # {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250819-045444/checkpoints"},
+        # {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250819-064935/checkpoints"},
 
-        {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "logs/Go2Footstand-20250817-212125/checkpoints"},
-        {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "logs/Go2Footstand-20250817-231711/checkpoints"},
-        {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "logs/Go2Footstand-20250818-011229/checkpoints"},
-        {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "logs/Go2Footstand-20250818-030725/checkpoints"},
-        {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "logs/Go2Footstand-20250818-050219/checkpoints"},
+        # {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "logs/Go2Footstand-20250817-212125/checkpoints"},
+        # {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "logs/Go2Footstand-20250817-231711/checkpoints"},
+        # {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "logs/Go2Footstand-20250818-011229/checkpoints"},
+        # {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "logs/Go2Footstand-20250818-030725/checkpoints"},
+        # {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "logs/Go2Footstand-20250818-050219/checkpoints"},
 
         # {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "logs/G1JoystickFlatTerrain-20250806-214823/checkpoints"},
         # {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "logs/G1JoystickFlatTerrain-20250811-163413/checkpoints"},
@@ -208,7 +208,7 @@ def process_model(p):
 
     now = datetime.now()
     timestamp = now.strftime("%Y%m%d-%H%M%S")
-    media.write_video(f"rollouts/expert_rollout-{p['checkpoint_path'].split('/')[1]}.mp4", frames, fps=fps)
+    media.write_video(f"rollouts/expert_rollout-{p['checkpoint_path'].split('/')[-2]}.mp4", frames, fps=fps)
     
     return p
 
