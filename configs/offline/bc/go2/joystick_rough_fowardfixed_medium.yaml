@@ -1,13 +1,13 @@
 batch_size: 256
 buffer_size: 10000000
-checkpoints_path: BC
+checkpoints_path: checkpoints/BC
 device: cuda
 discount: 0.99
-env: H1InplaceGaitTracking
-dataset_id: playground/H1InplaceGaitTracking-medium-v1
+env: Go2JoystickRoughTerrain
+dataset_id: playground/Go2JoystickRoughTerrain-fowardbackward-medium-v1
 eval_freq: 5000
 frac: 1.0
-group: bc-h1-medium-v1
+group: bc-go2-medium-v1
 load_model: ''
 max_timesteps: 1000000
 max_traj_len: 1000
@@ -16,3 +16,4 @@ name: BC
 normalize: false
 project: Offline-Benchmark
 seed: 0
+command_type: fowardbackward  
