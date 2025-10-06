@@ -69,7 +69,6 @@ def collect_checkpoint_info():
                                 'dataset_id': config.get('dataset_id'),
                                 'env': config.get('env'),
                                 'model': exp_dir.name.split("-")[0],
-                                'difficulty': config.get('dataset_id').split("-")[1],
                                 'command_type': config.get('command_type', None)
                             })
     

@@ -141,28 +141,31 @@ class GymWrapper(wrapper_torch.RSLRLBraxWrapper, gym.Env):
         self.key, reset_key = jax.random.split(self.key)
         self.key_reset = jax.random.split(reset_key, self.num_envs)
         self.env_state = self.reset_fn(self.key_reset)
-
+        obs = self.env_state.obs
         if self.command_type == "fowardbackward":
             command = jp.concatenate([
                 self.env_state.info["command"][:, [0]],  # shape (batch, 1)
                 jp.zeros((self.env_state.info["command"].shape[0], 2), dtype=self.env_state.info["command"].dtype)
             ], axis=1)
             self.env_state.info["command"] = command
+            obs["state"] = obs["state"].at[..., -3:].set(command)
         elif self.command_type == "foward":
             command = jp.concatenate([
                 jp.abs(self.env_state.info["command"][:, [0]]),  # shape (batch, 1)
                 jp.zeros((self.env_state.info["command"].shape[0], 2), dtype=self.env_state.info["command"].dtype)
             ], axis=1)
             self.env_state.info["command"] = command
+            obs["state"] = obs["state"].at[..., -3:].set(command)
         elif self.command_type == "fowardfixed":
-            command = jp.array([[1.0, 0.0, 0.0]])
+            command = jp.array([[1.0, 0.0, 0.0]] * self.env_state.info["command"].shape[0])
             self.env_state.info["command"] = command
+            obs["state"] = obs["state"].at[..., -3:].set(command)
 
         if self.asymmetric_obs:
-            obs = wrapper_torch._jax_to_torch(self.env_state.obs["state"])
+            obs = wrapper_torch._jax_to_torch(obs["state"])
         # critic_obs = jax_to_torch(self.env_state.obs["privileged_state"])
         else:
-            obs = wrapper_torch._jax_to_torch(self.env_state.obs)
+            obs = wrapper_torch._jax_to_torch(obs)
         obs_np = obs.cpu().numpy()
         if obs_np.ndim > 1 and obs_np.shape[0] == 1:
             obs_np = obs_np.squeeze(0)
