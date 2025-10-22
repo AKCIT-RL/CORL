@@ -1,4 +1,4 @@
-from pyparsing import Callable
+from pyparsing import Callable, Optional
 import mujoco
 from mujoco import mjx
 
@@ -13,8 +13,12 @@ import mediapy as media
 
 from .space import NumpySpace
 
+try:
+    from algorithms.utils.save_video import render_callback
+except Exception:
+    render_callback = None
 
-def get_env(env_name: str, device: str, num_actors: int = 1,render_callback: Optional[Callable] = None):
+def get_env(env_name: str, device: str, num_actors: int = 1, render_callback: Optional[Callable] = None):
     env = registry.load(env_name)
     env_cfg = registry.get_default_config(env_name)
     randomizer = registry.get_domain_randomizer(env_name)
