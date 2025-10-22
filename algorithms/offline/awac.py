@@ -268,37 +268,6 @@ class AdvantageWeightedActorCritic:
         self._critic_2.load_state_dict(state_dict["critic_2"])
 
 
-def set_seed(
-    seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
-):
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.use_deterministic_algorithms(deterministic_torch)
-
-
-def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
-    mean = states.mean(0)
-    std = states.std(0) + eps
-    return mean, std
-
-
-def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
-    return (states - mean) / std
-
-
-def wrap_env(
-    env: gym.Env,
-    state_mean: Union[np.ndarray, float] = 0.0,
-    state_std: Union[np.ndarray, float] = 1.0,
-) -> gym.Env:
-    def normalize_state(state):
-        return (state - state_mean) / state_std
-
-    env = gym.wrappers.TransformObservation(env, normalize_state, env.observation_space)
-    return env
-
 
 @torch.no_grad()
 def eval_actor(

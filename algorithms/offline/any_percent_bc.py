@@ -137,16 +137,6 @@ def set_seed(
     torch.use_deterministic_algorithms(deterministic_torch)
 
 
-def wandb_init(config: dict) -> None:
-    wandb.init(
-        config=config,
-        project=config["project"],
-        group=config["group"],
-        name=config["name"],
-        id=str(uuid.uuid4()),
-    )
-    wandb.run.save()
-
 
 @torch.no_grad()
 def eval_actor(
