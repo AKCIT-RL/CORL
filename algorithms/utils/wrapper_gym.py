@@ -1,3 +1,4 @@
+from pyparsing import Callable
 import mujoco
 from mujoco import mjx
 
@@ -13,7 +14,7 @@ import mediapy as media
 from .space import NumpySpace
 
 
-def get_env(env_name: str, device: str, num_actors: int = 1):
+def get_env(env_name: str, device: str, num_actors: int = 1,render_callback: Optional[Callable] = None):
     env = registry.load(env_name)
     env_cfg = registry.get_default_config(env_name)
     randomizer = registry.get_domain_randomizer(env_name)
