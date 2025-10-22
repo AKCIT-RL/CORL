@@ -178,8 +178,13 @@ def wandb_init(config: dict) -> None:
         group=config["group"],
         name=config["name"],
         id=str(uuid.uuid4()),
+        settings=wandb.Settings(save_code=True), # alterei
     )
-    wandb.run.save()
+    #wandb.run.save()
+    # Se quiser subir checkpoints à medida que são criados:
+    ckpt_dir = config.get("checkpoints_path")
+    if ckpt_dir:
+        wandb.save(os.path.join(ckpt_dir, "checkpoint_*.pt"), policy="live")  # glob obrigatório
 
 
 @torch.no_grad()
