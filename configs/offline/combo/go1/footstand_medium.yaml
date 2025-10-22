@@ -28,4 +28,4 @@ policy_noise: 0.2
 project: CORL
 seed: 0
 tau: 0.005
-dynamics_epochs: 150 #<< alterado (40, 100, 200, 500)
+dynamics_epochs: 10 #<< alterado (40, 100, 200, 500)
