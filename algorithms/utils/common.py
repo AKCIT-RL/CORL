@@ -3,7 +3,7 @@ import random
 import uuid
 from typing import Optional, Tuple, Union
 
-import gym
+import gymnasium as gym #atualizado para gymnasium
 import numpy as np
 import torch
 import torch.nn as nn
