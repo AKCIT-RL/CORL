@@ -10,7 +10,6 @@ from mujoco_playground import registry
 import mediapy as media
 
 from algorithms.offline.any_percent_bc import BC, Actor
-from algorithms.utils.save_video import render_callback
 from algorithms.utils.wrapper_gym import GymWrapper
 
 
