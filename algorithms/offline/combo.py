@@ -308,7 +308,8 @@ def train_dynamics(dynamics: Dynamics, optimizer: torch.optim.Optimizer, dataset
             std = torch.exp(0.5 * log_std)
             dist = torch.distributions.Normal(mu, std)
             nll = -dist.log_prob(next_state).sum(dim=-1).mean()
-            r_loss = F.mse_loss(pred_reward, reward.unsqueeze(-1))
+            tgt = reward if reward.ndim == 2 else reward.unsqueeze(-1)
+            r_loss = F.mse_loss(pred_reward, tgt)
             loss = nll + r_loss
             optimizer.zero_grad()
             loss.backward()

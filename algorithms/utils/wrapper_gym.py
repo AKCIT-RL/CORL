@@ -73,10 +73,17 @@ class GymWrapper(wrapper_torch.RSLRLBraxWrapper, gym.Env):
         self.action_space = NumpySpace(shape=(self.num_actions,), dtype=np.float32)
 
     def step(self, action):
-        action = np.array(action)  # Convert to numpy array first
-        action = torch.from_numpy(action).to(self.device)
-        action = torch.clip(action, -1.0, 1.0)  # pytype: disable=attribute-error
-        action = wrapper_torch._torch_to_jax(action)
+        if isinstance(action, torch.Tensor):
+            action = action.to(self.device, dtype=torch.float32)
+        else:
+            action = torch.as_tensor(action, device=self.device, dtype=torch.float32)
+
+        if action.dim() == 1:
+            action = action.unsqueeze(0)                 # (1, A)
+        elif action.dim() > 2:
+            action = action.view(-1, action.shape[-1])   # (B, A)
+
+        action = torch.clamp(action, -1.0, 1.0)
         self.env_state = self.step_fn(self.env_state, action)
         critic_obs = None
         if self.asymmetric_obs:
