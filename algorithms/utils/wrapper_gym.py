@@ -1,4 +1,4 @@
-from pyparsing import Callable, Optional
+from typing import Callable, Optional
 import mujoco
 from mujoco import mjx
 
@@ -72,19 +72,19 @@ class GymWrapper(wrapper_torch.RSLRLBraxWrapper, gym.Env):
             self.observation_space = NumpySpace(shape=(self.num_obs,), dtype=np.float32)
         self.action_space = NumpySpace(shape=(self.num_actions,), dtype=np.float32)
 
-    def step(self, action):
-        if isinstance(action, torch.Tensor):
-            action = action.to(self.device, dtype=torch.float32)
-        else:
-            action = torch.as_tensor(action, device=self.device, dtype=torch.float32)
+   def step(self, action):
+        # ação -> numpy (1, A) e clamp
+        action = np.asarray(action, dtype=np.float32)
+        if action.ndim == 1:
+            action = action[None, :]
+        elif action.ndim > 2:
+            action = action.reshape(-1, action.shape[-1])
+        action = np.clip(action, -1.0, 1.0).astype(np.float32, copy=False)
 
-        if action.dim() == 1:
-            action = action.unsqueeze(0)                 # (1, A)
-        elif action.dim() > 2:
-            action = action.view(-1, action.shape[-1])   # (B, A)
+        # numpy -> jax
+        a = jp.asarray(action)
 
-        action = torch.clamp(action, -1.0, 1.0)
-        self.env_state = self.step_fn(self.env_state, action)
+        self.env_state = self.step_fn(self.env_state, a)
         critic_obs = None
         if self.asymmetric_obs:
             obs = wrapper_torch._jax_to_torch(self.env_state.obs["state"])
@@ -108,7 +108,7 @@ class GymWrapper(wrapper_torch.RSLRLBraxWrapper, gym.Env):
             last_episode_success_count = (
                 wrapper_torch._jax_to_torch(info["last_episode_success_count"])[
                     done > 0
-                ]  # pylint: disable=unsubscriptable-object
+                ]
                 .float()
                 .tolist()
             )
@@ -121,6 +121,30 @@ class GymWrapper(wrapper_torch.RSLRLBraxWrapper, gym.Env):
                 info_ret["log"][k] = (
                     wrapper_torch._jax_to_torch(v).float().mean().item()
                 )
+
+        obs_np = obs.cpu().numpy()
+        if obs_np.ndim > 1 and obs_np.shape[0] == 1:
+            obs_np = obs_np.squeeze(0)
+
+        reward_np = reward.cpu().numpy()
+        if reward_np.size == 1:
+            reward_np = float(reward_np.reshape(-1)[0])
+
+        done_np = done.cpu().numpy()
+        if done_np.size == 1:
+            done_np = bool(done_np.reshape(-1)[0])
+
+        trunc_np = truncation.cpu().numpy()
+        if trunc_np.size == 1:
+            trunc_np = bool(trunc_np.reshape(-1)[0])
+
+        return (
+            obs_np,
+            reward_np,
+            done_np,
+            trunc_np,
+            info_ret,
+        )
 
         # next_observation, reward, terminal, truncated, info = env.step(action)
         obs_np = obs.cpu().numpy()
