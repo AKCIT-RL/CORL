@@ -72,7 +72,7 @@ class GymWrapper(wrapper_torch.RSLRLBraxWrapper, gym.Env):
             self.observation_space = NumpySpace(shape=(self.num_obs,), dtype=np.float32)
         self.action_space = NumpySpace(shape=(self.num_actions,), dtype=np.float32)
 
-   def step(self, action):
+    def step(self, action):
         # ação -> numpy (1, A) e clamp
         action = np.asarray(action, dtype=np.float32)
         if action.ndim == 1:
@@ -146,30 +146,6 @@ class GymWrapper(wrapper_torch.RSLRLBraxWrapper, gym.Env):
             info_ret,
         )
 
-        # next_observation, reward, terminal, truncated, info = env.step(action)
-        obs_np = obs.cpu().numpy()
-        if obs_np.ndim > 1 and obs_np.shape[0] == 1:
-            obs_np = obs_np.squeeze(0)
-
-        reward_np = reward.cpu().numpy()
-        if reward_np.size == 1:
-            reward_np = float(reward_np.reshape(-1)[0])
-
-        done_np = done.cpu().numpy()
-        if done_np.size == 1:
-            done_np = bool(done_np.reshape(-1)[0])
-
-        trunc_np = truncation.cpu().numpy()
-        if trunc_np.size == 1:
-            trunc_np = bool(trunc_np.reshape(-1)[0])
-
-        return (
-            obs_np,
-            reward_np,
-            done_np,
-            trunc_np,
-            info_ret,
-        )
 
     def reset(self, *, seed=None, options=None):
         # Generate fresh reset keys each call (collab example style)
