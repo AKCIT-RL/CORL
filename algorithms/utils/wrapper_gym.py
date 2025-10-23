@@ -32,7 +32,7 @@ def get_env(env_name: str, device: str, num_actors: int = 1, render_callback=Non
         randomization_fn=randomizer,
         device=device,
         render_callback=render_callback,
-        command_type=command_type,
+        #command_type=command_type,
     )
 
     return env
