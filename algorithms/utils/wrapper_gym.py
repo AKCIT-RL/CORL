@@ -18,7 +18,7 @@ try:
 except Exception:
     render_callback = None
 
-def get_env(env_name: str, device: str, num_actors: int = 1, render_callback=None):
+def get_env(env_name: str, device: str, num_actors: int = 1, render_callback=None, command_type=None):
     env = registry.load(env_name)
     env_cfg = registry.get_default_config(env_name)
     randomizer = registry.get_domain_randomizer(env_name)
@@ -32,7 +32,7 @@ def get_env(env_name: str, device: str, num_actors: int = 1, render_callback=Non
         randomization_fn=randomizer,
         device=device,
         render_callback=render_callback,
-        #command_type=command_type,
+        command_type=command_type,
     )
 
     return env
