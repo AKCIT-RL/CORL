@@ -4,7 +4,7 @@ buffer_size: 10000000
 checkpoints_path: COMBO
 device: cuda
 discount: 0.99
-env: JoystickFlatTerrain
+env: Go1JoystickFlatTerrain
 dataset_id: playground/Go1JoystickFlatTerrain-medium-v0
 ensemble_size: 5
 eval_freq: 5000
