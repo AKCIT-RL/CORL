@@ -10,7 +10,7 @@ ensemble_size: 5
 eval_freq: 5000
 expl_noise: 0.1
 f: 0.1
-gen_freq: 500 #<< alterado de 1000 para 500
+gen_freq: 100 #<< alterado de 1000 para 100
 group: combo-go1-expert-v0
 load_model: ''
 max_timesteps: 1000000
