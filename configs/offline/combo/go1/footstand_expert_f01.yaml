@@ -17,7 +17,7 @@ max_timesteps: 1000000
 model_buffer_size: 100000
 model_horizon: 10
 model_lr: 3e-4
-model_num_trajectories: 10000 #<< alterado de 1000 para 200
+model_num_trajectories: 1000 #<< alterado de 1000 para 200
 n_episodes: 5
 name: COMBO
 noise_clip: 0.5
