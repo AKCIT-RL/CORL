@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-Script to evaluate expert models and generate rollouts.
-Converted from Jupyter notebook get_results_expert.ipynb
-"""
 
 import pandas as pd
 import numpy as np
@@ -33,24 +29,9 @@ os.environ['MUJOCO_GL'] = 'egl'
 def define_model_paths():
     """Define the model paths and configurations"""
     path_model = [
-        # {'env': 'H1JoystickGaitTracking', "model": "PPO", "checkpoint_path": "../expert_checkpoints/H1JoystickGaitTracking"},
-        # {'env': 'H1InplaceGaitTracking', "model": "PPO", "checkpoint_path": "../expert_checkpoints/H1InplaceGaitTracking"},
-        # {'env': 'Go1JoystickRoughTerrain', "model": "PPO", "checkpoint_path": "../expert_checkpoints/Go1JoystickRoughTerrain"}, 
-        # {'env': 'Go1JoystickFlatTerrain', "model": "PPO", "checkpoint_path": "../expert_checkpoints/Go1JoystickFlatTerrain", "policy_hidden_layer_sizes": (1024, 512, 256)},
-        # {'env': 'Go1Handstand', "model": "PPO", "checkpoint_path": "../expert_checkpoints/Go1Handstand"}, 
-        # {'env': 'Go1Getup', "model": "PPO", "checkpoint_path": "../expert_checkpoints/Go1Getup", "policy_hidden_layer_sizes": (512, 256, 128)}, 
-        # {'env': 'Go1Footstand', "model": "PPO", "checkpoint_path": "../expert_checkpoints/Go1Footstand"},
-        # {'env': 'G1JoystickRoughTerrain', "model": "PPO", "checkpoint_path": "../expert_checkpoints/G1JoystickRoughTerrain"}, 
-        # {'env': 'G1JoystickFlatTerrain', "model": "PPO", "checkpoint_path": "../expert_checkpoints/G1JoystickFlatTerrain"},
-        # {'env': 'PandaPickCube', "model": "PPO", "checkpoint_path": "../expert_checkpoints/PandaPickCube"}, 
-        # {'env': 'PandaOpenCabinet', "model": "PPO", "checkpoint_path": "../expert_checkpoints/PandaOpenCabinet"}, 
+        # ------------------------------------------------------------- LOCOMOTION -------------------------------------------------------------
 
-        # {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250729-104513/checkpoints"},
-        # {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250729-115600/checkpoints"},
-        # {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250729-130630/checkpoints"},
-        # {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250729-141705/checkpoints"},
-        # {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250729-152746/checkpoints"},
-
+        # Go2
         {'env': 'Go2JoystickFlatTerrain', "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2JoystickFlatTerrain-20250904-121138/checkpoints"},
         {'env': 'Go2JoystickFlatTerrain', "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2JoystickFlatTerrain-20250904-195514/checkpoints"},
         {'env': 'Go2JoystickFlatTerrain', "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2JoystickFlatTerrain-20250904-205636/checkpoints"},
@@ -63,29 +44,43 @@ def define_model_paths():
         {"env": "Go2JoystickRoughTerrain", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2JoystickRoughTerrain-20250905-041812/checkpoints"}, 
         {"env": "Go2JoystickRoughTerrain", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2JoystickRoughTerrain-20250905-054419/checkpoints"},
 
-        # {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "logs/Go2Getup-20250816-191527/checkpoints"},
-        # {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "logs/Go2Getup-20250817-104354/checkpoints"},
-        # {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "logs/Go2Getup-20250817-123933/checkpoints"},
-        # {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "logs/Go2Getup-20250817-172203/checkpoints"},
-        # {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "logs/Go2Getup-20250819-091222/checkpoints"},
+        {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Getup-20250904-193652/checkpoints"},
+        {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Getup-20250904-203245/checkpoints"},
+        {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Getup-20250904-212840/checkpoints"},
+        {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Getup-20250904-222453/checkpoints"},
+        {"env": "Go2Getup", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Getup-20250904-232042/checkpoints"},
 
-        # {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250818-231000/checkpoints"},
-        # {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250819-010441/checkpoints"},
-        # {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250819-025956/checkpoints"},
-        # {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250819-045444/checkpoints"},
-        # {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "logs/Go2Handstand-20250819-064935/checkpoints"},
+        {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Handstand-20250923-020756/checkpoints"},
+        {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Handstand-20250923-162557/checkpoints"},
+        {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Handstand-20250923-184055/checkpoints"},
+        {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Handstand-20250926-221335/checkpoints"},
+        {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Handstand-20250905-081318/checkpoints"},
 
-        # {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "logs/Go2Footstand-20250817-212125/checkpoints"},
-        # {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "logs/Go2Footstand-20250817-231711/checkpoints"},
-        # {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "logs/Go2Footstand-20250818-011229/checkpoints"},
-        # {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "logs/Go2Footstand-20250818-030725/checkpoints"},
-        # {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "logs/Go2Footstand-20250818-050219/checkpoints"},
+        {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Footstand-20250905-001646/checkpoints"},
+        {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Footstand-20250905-010949/checkpoints"},
+        {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Footstand-20250923-085216/checkpoints"},
+        {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Footstand-20250905-034822/checkpoints"},
+        {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Footstand-20250923-110623/checkpoints"},
 
-        # {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "logs/G1JoystickFlatTerrain-20250806-214823/checkpoints"},
-        # {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "logs/G1JoystickFlatTerrain-20250811-163413/checkpoints"},
-        # {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "logs/G1JoystickFlatTerrain-20250811-163423/checkpoints"},
-        # {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "logs/G1JoystickFlatTerrain-20250813-183648/checkpoints"},
-        # {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "logs/G1JoystickFlatTerrain-20250815-174612/checkpoints"}
+        # G1
+        {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/G1JoystickFlatTerrain-20250911-191009/checkpoints"},
+        {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/G1JoystickFlatTerrain-20250912-004740/checkpoints"},
+        {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/G1JoystickFlatTerrain-20250912-062526/checkpoints"},
+        {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/G1JoystickFlatTerrain-20250912-120239/checkpoints"},
+        {"env": "G1JoystickFlatTerrain", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/G1JoystickFlatTerrain-20250912-174017/checkpoints"},
+
+        # H1
+        {"env": "H1InplaceGaitTracking", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/H1InplaceGaitTracking-20250905-112321/checkpoints"},
+        {"env": "H1InplaceGaitTracking", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/H1InplaceGaitTracking-20250905-124236/checkpoints"},
+        {"env": "H1InplaceGaitTracking", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/H1InplaceGaitTracking-20250905-140100/checkpoints"},
+        {"env": "H1InplaceGaitTracking", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/H1InplaceGaitTracking-20250905-151947/checkpoints"},
+        {"env": "H1InplaceGaitTracking", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/H1InplaceGaitTracking-20250905-163800/checkpoints"},
+
+        {"env": "H1JoystickGaitTracking", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/H1JoystickGaitTracking-20250905-175648/checkpoints"},
+        {"env": "H1JoystickGaitTracking", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/H1JoystickGaitTracking-20250905-191408/checkpoints"},
+        {"env": "H1JoystickGaitTracking", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/H1JoystickGaitTracking-20250905-203103/checkpoints"},
+        {"env": "H1JoystickGaitTracking", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/H1JoystickGaitTracking-20250905-214821/checkpoints"},
+        {"env": "H1JoystickGaitTracking", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/H1JoystickGaitTracking-20250905-230604/checkpoints"},
 
     ]
     return path_model
@@ -118,7 +113,6 @@ def eval_expert(env, n_episodes, jit_inference_fn):
         episode_rewards.append(episode_reward)
 
     return np.asarray(episode_rewards), rollout
-
 
 def process_model(p):
     """Process a single model configuration"""
@@ -154,8 +148,10 @@ def process_model(p):
     network_factory = ppo_networks.make_ppo_networks
     if "network_factory" in ppo_params:
         del ppo_training_params["network_factory"]
+        nf = ppo_params.network_factory
+        nf["value_obs_key"] = "state"
         network_factory = functools.partial(
-            ppo_networks.make_ppo_networks, **ppo_params.network_factory
+            ppo_networks.make_ppo_networks, **nf
         )
 
     train_fn = functools.partial(
@@ -206,9 +202,9 @@ def process_model(p):
         render_every = 1
         frames = env.render(rollout[::render_every])
 
-    now = datetime.now()
-    timestamp = now.strftime("%Y%m%d-%H%M%S")
-    media.write_video(f"rollouts/expert_rollout-{p['checkpoint_path'].split('/')[-2]}.mp4", frames, fps=fps)
+    rollout_path = p['checkpoint_path'].replace("checkpoints", "rollouts")
+    os.makedirs(rollout_path, exist_ok=True)
+    media.write_video(f"{rollout_path}/rollout.mp4", frames, fps=fps)
     
     return p
 
@@ -219,18 +215,18 @@ def save_results(path_model):
     
     # Try to load existing results and concatenate
     try:
-        df = pd.read_csv("rollouts/results_expert.csv")
+        df = pd.read_csv("results_expert.csv")
         df_new = pd.concat([df_new, df], ignore_index=True)
     except FileNotFoundError:
         pass
     
-    df_new.to_csv("rollouts/results_expert.csv", index=False)
+    df_new.to_csv("results_expert.csv", index=False)
 
 
 def display_results():
     """Display the results"""
     try:
-        df = pd.read_csv("rollouts/results_expert.csv")
+        df = pd.read_csv("results_expert.csv")
         print("Results:")
         print(df[["env", "episode_rewards_mean", "episode_rewards_std"]].sort_values(by="env", ascending=True))
     except FileNotFoundError:
@@ -244,12 +240,8 @@ def main():
     
     # Process each model
     for p in path_model:
-        try:
-            p = process_model(p)
-        except Exception as e:
-            print(f"Error processing {p['env']}: {e}")
-            continue
-    
+        p = process_model(p)
+
     # Save results
     save_results(path_model)
     

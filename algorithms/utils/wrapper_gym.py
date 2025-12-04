@@ -1,3 +1,4 @@
+from this import s
 import mujoco
 from mujoco import mjx
 
@@ -10,166 +11,124 @@ import jax.numpy as jp
 import torch
 import mediapy as media
 
+from collections.abc import Mapping
+try:
+    from flax.core import frozen_dict
+except ImportError:
+    frozen_dict = None
+
 from .space import NumpySpace
 
 
 def get_env(env_name: str, device: str, render_callback=None, command_type=None):
     env = registry.load(env_name)
     env_cfg = registry.get_default_config(env_name)
-    randomizer = registry.get_domain_randomizer(env_name)
 
     env = GymWrapper(
         env,
-        num_actors=1,
+        env_cfg,
         seed=1,
-        episode_length=env_cfg.episode_length,
-        action_repeat=1,
-        randomization_fn=randomizer,
+        num_actors=1,
         device=device,
-        render_callback=render_callback,
         command_type=command_type,
     )
 
     return env
 
 
-class GymWrapper(wrapper_torch.RSLRLBraxWrapper, gym.Env):
+class GymWrapper(gym.Env):
     def __init__(
         self,
         env,
-        num_actors,
+        env_cfg,
         seed,
-        episode_length,
-        action_repeat,
-        randomization_fn=None,
-        render_callback=None,
-        device_rank=None,
+        num_actors=1,
         device="cpu",
         command_type=None,
     ):
-        super().__init__(
-            env,
-            num_actors,
-            seed,
-            episode_length,
-            action_repeat,
-            randomization_fn,
-            render_callback,
-            device_rank,
-        )
-
-        self.env_unwrapped = env
+        super().__init__()
         self.command_type = command_type
+        self.env = env
         self.device = device
-        if isinstance(self.num_obs, tuple):
-            self.observation_space = NumpySpace(shape=self.num_obs, dtype=np.float32)
+        self._reset_fn = jax.jit(jax.vmap(self.env.reset))
+        self._step_fn = jax.jit(jax.vmap(self.env.step))
+        self.rng = jax.random.PRNGKey(seed)
+
+        self.episode_length = env_cfg.episode_length
+
+        if isinstance(self.env.observation_size["state"], tuple):
+            self.observation_space = NumpySpace(shape=self.env.observation_size["state"], dtype=np.float32)
         else:
-            self.observation_space = NumpySpace(shape=(self.num_obs,), dtype=np.float32)
-        self.action_space = NumpySpace(shape=(self.num_actions,), dtype=np.float32)
+            self.observation_space = NumpySpace(shape=(self.env.observation_size["state"],), dtype=np.float32)
+        self.action_space = NumpySpace(shape=(self.env.action_size,), dtype=np.float32)
 
-    def step(self, action):
-        action = np.array([action])  # Convert to numpy array first
-        action = torch.from_numpy(action).to(self.device)
-        action = torch.clip(action, -1.0, 1.0)  # pytype: disable=attribute-error
-        action = wrapper_torch._torch_to_jax(action)
-        self.env_state = self.step_fn(self.env_state, action)
-        critic_obs = None
-        if self.asymmetric_obs:
-            obs = wrapper_torch._jax_to_torch(self.env_state.obs["state"])
-            critic_obs = wrapper_torch._jax_to_torch(
-                self.env_state.obs["privileged_state"]
-            )
+        self.num_envs = num_actors
+
+        self.timesteps = 0
+
+    def _maybe_unfreeze(self, tree):
+        if frozen_dict and isinstance(tree, frozen_dict.FrozenDict):
+            return tree.unfreeze()
+        if isinstance(tree, Mapping):
+            return dict(tree)
+        return tree
+
+    def _tree_to_numpy(self, tree):
+        if isinstance(tree, Mapping):
+            return {k: self._tree_to_numpy(v) for k, v in tree.items()}
+        if isinstance(tree, (list, tuple)):
+            return type(tree)(self._tree_to_numpy(v) for v in tree)
+        return np.asarray(tree)
+
+    def _apply_command_override(self, env_state):
+        if self.command_type is None or "command" not in env_state.info:
+            return env_state
+
+        commands = env_state.info["command"]
+        zeros = jp.zeros_like(commands)
+
+        if self.command_type == "fowardbackward":
+            command = zeros.at[..., 0].set(commands[..., 0])
+        elif self.command_type == "foward":
+            command = zeros.at[..., 0].set(jp.abs(commands[..., 0]))
+        elif self.command_type == "fowardfixed":
+            command = zeros.at[..., 0].set(1.0)
         else:
-            obs = wrapper_torch._jax_to_torch(self.env_state.obs)
-        reward = wrapper_torch._jax_to_torch(self.env_state.reward)
-        done = wrapper_torch._jax_to_torch(self.env_state.done)
-        info = self.env_state.info
-        truncation = wrapper_torch._jax_to_torch(info["truncation"])
+            return env_state
 
-        info_ret = {
-            "time_outs": truncation,
-            "observations": {"critic": critic_obs},
-            "log": {},
-        }
+        obs = self._maybe_unfreeze(env_state.obs)
+        obs["state"] = obs["state"].at[..., -3:].set(command)
 
-        if "last_episode_success_count" in info:
-            last_episode_success_count = (
-                wrapper_torch._jax_to_torch(info["last_episode_success_count"])[
-                    done > 0
-                ]  # pylint: disable=unsubscriptable-object
-                .float()
-                .tolist()
-            )
-            if len(last_episode_success_count) > 0:
-                self.success_queue.extend(last_episode_success_count)
-            info_ret["log"]["last_episode_success_count"] = np.mean(self.success_queue)
+        info = self._maybe_unfreeze(env_state.info)
+        info["command"] = command
 
-        for k, v in self.env_state.metrics.items():
-            if k not in info_ret["log"]:
-                info_ret["log"][k] = (
-                    wrapper_torch._jax_to_torch(v).float().mean().item()
-                )
-
-        # next_observation, reward, terminal, truncated, info = env.step(action)
-        obs_np = obs.cpu().numpy()
-        if obs_np.ndim > 1 and obs_np.shape[0] == 1:
-            obs_np = obs_np.squeeze(0)
-
-        reward_np = reward.cpu().numpy()
-        if reward_np.size == 1:
-            reward_np = float(reward_np.reshape(-1)[0])
-
-        done_np = done.cpu().numpy()
-        if done_np.size == 1:
-            done_np = bool(done_np.reshape(-1)[0])
-
-        trunc_np = truncation.cpu().numpy()
-        if trunc_np.size == 1:
-            trunc_np = bool(trunc_np.reshape(-1)[0])
-
-        return (
-            obs_np,
-            reward_np,
-            done_np,
-            trunc_np,
-            info_ret,
-        )
+        return env_state.replace(obs=obs, info=info)
 
     def reset(self, *, seed=None, options=None):
-        # Generate fresh reset keys each call (collab example style)
-        # Ensures different initial states across resets without extra overhead.
-        self.key, reset_key = jax.random.split(self.key)
-        self.key_reset = jax.random.split(reset_key, self.num_envs)
-        self.env_state = self.reset_fn(self.key_reset)
-        obs = self.env_state.obs
-        if self.command_type == "fowardbackward":
-            command = jp.concatenate([
-                self.env_state.info["command"][:, [0]],  # shape (batch, 1)
-                jp.zeros((self.env_state.info["command"].shape[0], 2), dtype=self.env_state.info["command"].dtype)
-            ], axis=1)
-            self.env_state.info["command"] = command
-            obs["state"] = obs["state"].at[..., -3:].set(command)
-        elif self.command_type == "foward":
-            command = jp.concatenate([
-                jp.abs(self.env_state.info["command"][:, [0]]),  # shape (batch, 1)
-                jp.zeros((self.env_state.info["command"].shape[0], 2), dtype=self.env_state.info["command"].dtype)
-            ], axis=1)
-            self.env_state.info["command"] = command
-            obs["state"] = obs["state"].at[..., -3:].set(command)
-        elif self.command_type == "fowardfixed":
-            command = jp.array([[1.0, 0.0, 0.0]] * self.env_state.info["command"].shape[0])
-            self.env_state.info["command"] = command
-            obs["state"] = obs["state"].at[..., -3:].set(command)
+        self.rng, reset_rng = jax.random.split(self.rng)
+        reset_keys = jax.random.split(reset_rng, self.num_envs)
+        self.env_state = self._reset_fn(reset_keys)
+        self.env_state = self._apply_command_override(self.env_state)
+        self.timesteps = 0
+        obs = np.asarray(self.env_state.obs["state"])
+        return obs, {}
 
-        if self.asymmetric_obs:
-            obs = wrapper_torch._jax_to_torch(obs["state"])
-        # critic_obs = jax_to_torch(self.env_state.obs["privileged_state"])
-        else:
-            obs = wrapper_torch._jax_to_torch(obs)
-        obs_np = obs.cpu().numpy()
-        if obs_np.ndim > 1 and obs_np.shape[0] == 1:
-            obs_np = obs_np.squeeze(0)
-        return obs_np, {}
+    def step(self, action):
+        if isinstance(action, torch.Tensor):
+            action = action.detach().cpu().numpy()
+        action = jp.asarray(action)
+        if len(action.shape) == 1:
+            action = action[None, ...]
+
+        self.env_state = self._step_fn(self.env_state, action)
+        self.env_state = self._apply_command_override(self.env_state)
+        self.timesteps += 1
+        obs = np.asarray(self.env_state.obs["state"])
+        rew = np.asarray(self.env_state.reward)
+        done = np.asarray(self.env_state.done)
+        truncated = np.asarray([self.timesteps >= self.episode_length for _ in range(self.num_envs)])
+        info = self._tree_to_numpy(self.env_state.info)
+        return obs, rew, done, truncated, info
 
     def save_video(self, render_trajectory, save_path=None):
         scene_option = mujoco.MjvOption()
@@ -180,9 +139,9 @@ class GymWrapper(wrapper_torch.RSLRLBraxWrapper, gym.Env):
         scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = True
 
         render_every = 2
-        fps = 1.0 / self.env_unwrapped.dt / render_every
+        fps = 1.0 / self.env.dt / render_every
         traj = render_trajectory[::render_every]
-        frames = self.env_unwrapped.render(
+        frames = self.env.render(
             traj,
             camera="track",
             height=480,

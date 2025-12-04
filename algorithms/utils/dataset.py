@@ -11,7 +11,7 @@ def qlearning_dataset(dataset: minari.MinariDataset) -> Dict[str, np.ndarray]:
         next_obs.append(episode.observations[1:].astype(np.float32))
         actions.append(episode.actions.astype(np.float32))
         rewards.append(episode.rewards)
-        dones.append(episode.terminations | episode.truncations)
+        dones.append(np.logical_or(episode.terminations, episode.truncations))
 
     return {
         "observations": np.concatenate(obs),
