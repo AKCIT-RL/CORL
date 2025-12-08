@@ -53,7 +53,7 @@ def define_model_paths():
         {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Handstand-20250923-020756/checkpoints"},
         {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Handstand-20250923-162557/checkpoints"},
         {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Handstand-20250923-184055/checkpoints"},
-        {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Handstand-20250926-221335/checkpoints"},
+        {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Handstand-20251204-230215/checkpoints"},
         {"env": "Go2Handstand", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Handstand-20250905-081318/checkpoints"},
 
         {"env": "Go2Footstand", "model": "PPO", "checkpoint_path": "/CORL/expert/logs/Go2Footstand-20250905-001646/checkpoints"},

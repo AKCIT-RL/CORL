@@ -97,7 +97,10 @@ class GymWrapper(gym.Env):
             return env_state
 
         obs = self._maybe_unfreeze(env_state.obs)
-        obs["state"] = obs["state"].at[..., -3:].set(command)
+        if isinstance(obs, dict):
+            obs["state"] = obs["state"].at[..., -3:].set(command)
+        else:
+            obs = obs.at[..., -3:].set(command)
 
         info = self._maybe_unfreeze(env_state.info)
         info["command"] = command
@@ -110,7 +113,11 @@ class GymWrapper(gym.Env):
         self.env_state = self._reset_fn(reset_keys)
         self.env_state = self._apply_command_override(self.env_state)
         self.timesteps = 0
-        obs = np.asarray(self.env_state.obs["state"])
+        obs_field = self.env_state.obs
+        if isinstance(obs_field, dict):
+            obs = np.asarray(obs_field["state"])
+        else:
+            obs = np.asarray(obs_field)
         return obs, {}
 
     def step(self, action):
@@ -123,7 +130,11 @@ class GymWrapper(gym.Env):
         self.env_state = self._step_fn(self.env_state, action)
         self.env_state = self._apply_command_override(self.env_state)
         self.timesteps += 1
-        obs = np.asarray(self.env_state.obs["state"])
+        obs_field = self.env_state.obs
+        if isinstance(obs_field, dict):
+            obs = np.asarray(obs_field["state"])
+        else:
+            obs = np.asarray(obs_field)
         rew = np.asarray(self.env_state.reward)
         done = np.asarray(self.env_state.done)
         truncated = np.asarray([self.timesteps >= self.episode_length for _ in range(self.num_envs)])
