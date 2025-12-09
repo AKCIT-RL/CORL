@@ -9,13 +9,13 @@ deterministic_torch: false
 device: cuda
 embedding_dim: 128
 embedding_dropout: 0.1
-env_name: H1InplaceGaitTracking
-dataset_id: playground/H1InplaceGaitTracking-expert-v1
+env_name: Go2Footstand
+dataset_id: playground/Go2Footstand-medium-v1
 episode_len: 1000
 eval_episodes: 100
 eval_every: 5000
 eval_seed: 42
-group: dt-h1-inplace-gait-expert-v1
+group: dt-go2-footstand-medium-v1
 learning_rate: 0.0008
 max_action: 1.0
 name: "DT"
@@ -26,7 +26,7 @@ project: Offline-Benchmark
 residual_dropout: 0.1
 reward_scale: 1.0
 seq_len: 20
-target_returns: [38, 37]
+target_returns: [20, 20]
 train_seed: 10
 update_steps: 100000
 warmup_steps: 10000
