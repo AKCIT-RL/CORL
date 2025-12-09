@@ -81,13 +81,29 @@ class DTConfig:
     checkpoints_path: Optional[str] = None
     # training random seed
     seed: int = 0
+    # training seed (alternative to seed, used in configs)
+    train_seed: int = 0
+    # evaluation seed
+    eval_seed: int = 42
     # training device
     device: str = "cuda"
+    # command type for environment (e.g., "direction", "foward", "fowardfixed")
+    command_type: Optional[str] = None
+    # deterministic torch (not used in JAX, but present in configs for compatibility)
+    deterministic_torch: bool = False
+    # number of workers (not used in JAX, but present in configs for compatibility)
+    num_workers: int = 4
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
         if self.checkpoints_path is not None:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
+        # Use train_seed if provided, otherwise use seed
+        # If train_seed was explicitly set (not default 0), use it; otherwise use seed
+        if self.train_seed != 0:
+            self.seed = self.train_seed
+        elif self.seed != 0:
+            self.train_seed = self.seed
 
 
 def default_init(scale: Optional[float] = jnp.sqrt(2)):
@@ -260,12 +276,15 @@ def get_traj(dataset_id: str):
     all_observations = []
     
     for episode in dataset.iterate_episodes():
+        terminations = np.array(episode.terminations, dtype=bool)
+        truncations = np.array(episode.truncations, dtype=bool)
+        terminals = np.logical_or(terminations, truncations).astype(np.float32)
         episode_data = {
             "observations": np.array(episode.observations[:-1], dtype=np.float32),
             "next_observations": np.array(episode.observations[1:], dtype=np.float32),
             "actions": np.array(episode.actions, dtype=np.float32),
             "rewards": np.array(episode.rewards, dtype=np.float32),
-            "terminals": np.array(episode.terminations | episode.truncations, dtype=np.float32),
+            "terminals": terminals,
         }
         paths.append(episode_data)
         all_observations.append(episode_data["observations"])
@@ -580,7 +599,7 @@ def train(config: DTConfig):
         with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
             pyrallis.dump(config, f)
 
-    env = get_env(config.env_name, config.device)
+    env = get_env(config.env_name, config.device, command_type=config.command_type)
     rng = jax.random.PRNGKey(config.seed)
     state_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]

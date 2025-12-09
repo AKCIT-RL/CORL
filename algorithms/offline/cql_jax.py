@@ -120,6 +120,10 @@ class CQLConfig:
     action_dim: Optional[int] = None
     # JAX specific
     n_jitted_updates: int = 8
+    # Optimizer type ("adam" or "sgd")
+    optimizer_type: str = "adam"
+    # command type for environment (e.g., "direction", "foward", "fowardfixed")
+    command_type: Optional[str] = None
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -878,7 +882,7 @@ def train(config: CQLConfig):
     
     minari_dataset = minari.load_dataset(config.dataset_id)
     qdataset = qlearning_dataset(minari_dataset)
-    env = get_env(config.env, config.device)
+    env = get_env(config.env, config.device, command_type=config.command_type)
     
     action_dim = env.action_space.shape[0]
     config.action_dim = action_dim
