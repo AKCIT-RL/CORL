@@ -82,6 +82,10 @@ class IQLConfig:
     # JAX-specific: whether to use cosine decay schedule for actor
     opt_decay_schedule: bool = True
 
+    command_type: str = "direction"
+    # JAX-specific: whether to use deterministic actor
+    iql_deterministic: bool = False
+
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
         if self.checkpoints_path is not None:
@@ -479,7 +483,7 @@ def train(config: IQLConfig):
             pyrallis.dump(config, f)
 
     rng = jax.random.PRNGKey(config.seed)
-    env = get_env(config.env, config.device)
+    env = get_env(config.env, config.device, command_type=config.command_type)
     dataset, obs_mean, obs_std = get_dataset(config)
     
     # create train_state

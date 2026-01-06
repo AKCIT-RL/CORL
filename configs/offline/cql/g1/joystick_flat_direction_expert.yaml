@@ -16,7 +16,7 @@ cql_temp: 1.0
 device: cuda
 discount: 0.99
 env: G1JoystickFlatTerrain
-dataset_id: playground/G1JoystickFlatTerrain_direction-expert-v1
+dataset_id: playground/G1JoystickFlatTerrain-direction-expert-v1
 eval_freq: 5000
 group: cql-g1-expert-v1
 load_model: ''
