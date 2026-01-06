@@ -56,10 +56,15 @@ class GymWrapper(gym.Env):
 
         self.episode_length = env_cfg.episode_length
 
-        if isinstance(self.env.observation_size["state"], tuple):
-            self.observation_space = NumpySpace(shape=self.env.observation_size["state"], dtype=np.float32)
+        # Handle both dict-based and int-based observation_size
+        obs_size = self.env.observation_size
+        if isinstance(obs_size, dict):
+            obs_size = obs_size["state"]
+        
+        if isinstance(obs_size, tuple):
+            self.observation_space = NumpySpace(shape=obs_size, dtype=np.float32)
         else:
-            self.observation_space = NumpySpace(shape=(self.env.observation_size["state"],), dtype=np.float32)
+            self.observation_space = NumpySpace(shape=(obs_size,), dtype=np.float32)
         self.action_space = NumpySpace(shape=(self.env.action_size,), dtype=np.float32)
 
         self.num_envs = num_actors

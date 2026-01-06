@@ -39,6 +39,7 @@ class AWACConfig:
     # training dataset and evaluation environment
     env: str = "halfcheetah-medium-expert-v2"
     dataset_id: str = "halfcheetah-medium-expert-v2"
+    command_type: str = None
     # actor and critic hidden dim
     hidden_dim: int = 256
     # actor and critic learning rate
@@ -51,7 +52,7 @@ class AWACConfig:
     # between behaviour cloning and Q-value maximization
     awac_lambda: float = 1.0
     # total number of gradient updates during training
-    max_timesteps: int = 1_000_000
+    num_train_ops: int = 1_000_000  # alias for num_train_ops
     # training batch size
     batch_size: int = 256
     # maximum size of the replay buffer
@@ -61,13 +62,14 @@ class AWACConfig:
     # whether to normalize states
     normalize_state: bool = True
     # evaluation frequency, will evaluate every eval_freq training steps
-    eval_freq: int = int(5e3)
+    eval_frequency: int = int(5e3) 
     # number of episodes to run during evaluation
-    n_episodes: int = 10
+    n_test_episodes: int = 10  # alias for n_test_episodes
     # path for checkpoints saving, optional
     checkpoints_path: Optional[str] = None
     # training random seed
     seed: int = 0
+    test_seed: int = 69  # seed for evaluation
     # training device
     device: str = "cuda"
     # NETWORK (JAX specific)
@@ -432,7 +434,7 @@ def train(config: AWACConfig):
     
     minari_dataset = minari.load_dataset(config.dataset_id)
     qdataset = qlearning_dataset(minari_dataset)
-    env = get_env(config.env, config.device)
+    env = get_env(config.env, config.device, command_type=config.command_type)
     
     dataset, obs_mean, obs_std = get_dataset(qdataset, config)
     
@@ -449,8 +451,8 @@ def train(config: AWACConfig):
     update_fn = jax.jit(algo.update_n_times, static_argnums=(3,))
     act_fn = jax.jit(algo.get_action)
 
-    num_steps = config.max_timesteps // config.n_jitted_updates
-    eval_interval = config.eval_freq // config.n_jitted_updates
+    num_steps = config.num_train_ops // config.n_jitted_updates
+    eval_interval = config.eval_frequency // config.n_jitted_updates
     for i in tqdm.tqdm(range(1, num_steps + 1), smoothing=0.1, dynamic_ncols=True):
         rng, subkey = jax.random.split(rng)
         train_state, update_info = update_fn(
@@ -470,7 +472,7 @@ def train(config: AWACConfig):
                 train_state=train_state,
             )
             normalized_score = evaluate(
-                policy_fn, env, config.n_episodes, obs_mean, obs_std
+                policy_fn, env, config.n_test_episodes, obs_mean, obs_std
             )
             print(f"Step {i}: {normalized_score}")
             eval_metrics = {"eval/score": normalized_score}
@@ -496,7 +498,7 @@ def train(config: AWACConfig):
         seed=jax.random.PRNGKey(0),
         train_state=train_state,
     )
-    normalized_score = evaluate(policy_fn, env, config.n_episodes, obs_mean, obs_std)
+    normalized_score = evaluate(policy_fn, env, config.n_test_episodes, obs_mean, obs_std)
     print("Final Evaluation Score:", normalized_score)
     wandb.log({"eval/final_score": normalized_score})
 
