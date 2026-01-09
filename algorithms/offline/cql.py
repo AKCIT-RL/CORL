@@ -137,16 +137,15 @@ def wandb_init(config: dict) -> None:
 def eval_actor(
     env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
 ) -> np.ndarray:
-    # env.seed(seed)
     actor.eval()
     episode_rewards = []
     for _ in range(n_episodes):
         state, _ = env.reset()
-        done = False
+        done = truncated = False
         episode_reward = 0.0
-        while not done:
+        while not done and not truncated:
             action = actor.act(state, device)
-            state, reward, done, _, _ = env.step(action)
+            state, reward, done, truncated, _ = env.step(action)
             episode_reward += reward
         episode_rewards.append(episode_reward)
 

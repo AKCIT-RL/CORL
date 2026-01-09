@@ -1,0 +1,4 @@
+--extra-index-url https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+jax[cuda12]==0.6.0
+flax==0.10.7
+cloudpickle==3.1.2

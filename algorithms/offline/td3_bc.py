@@ -195,11 +195,11 @@ def eval_actor(
     episode_rewards = []
     for _ in range(n_episodes):
         state, _ = env.reset()
-        done = False
+        done = truncated = False
         episode_reward = 0.0
-        while not done:
+        while not done and not truncated:
             action = actor.act(state, device)
-            state, reward, done, _, _ = env.step(action)
+            state, reward, done, truncated, _ = env.step(action)
             episode_reward += reward
         episode_rewards.append(episode_reward)
 
@@ -514,15 +514,6 @@ def train(config: TrainConfig):
                 {"eval/score": eval_score},
                 step=trainer.total_it,
             )
-
-
-    # save_video(
-    #     env_name=config.env,
-    #     actor=trainer.actor,
-    #     device=config.device,
-    #     command=[1.0, 0.0, 0.0],
-    #     path_model=config.checkpoints_path,
-    # )
 
 if __name__ == "__main__":
     train()
