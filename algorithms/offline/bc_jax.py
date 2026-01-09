@@ -5,6 +5,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple
 
 import minari
@@ -18,6 +19,7 @@ import optax
 import pyrallis
 import tqdm
 import wandb
+import yaml
 from flax.training.train_state import TrainState
 
 from algorithms.utils.wrapper_gym import get_env
@@ -261,6 +263,110 @@ def create_bc_train_state(
     return BCTrainState(
         actor=actor_train_state,
     )
+
+
+def get_actor_from_checkpoint(
+    checkpoint_path: str,
+    state_dim: int,
+    action_dim: int,
+    max_action: float = 1.0,
+) -> Dict[str, Any]:
+    """
+    Load a BC actor from a JAX checkpoint.
+    
+    Args:
+        checkpoint_path: Path to the checkpoint directory
+        state_dim: Dimension of the state/observation space
+        action_dim: Dimension of the action space
+        max_action: Maximum action value (default: 1.0)
+        checkpoint_id: Which checkpoint to load (-1 for latest, -2 for final)
+        hidden_dims: Hidden layer dimensions (default from config if available)
+    
+    Returns:
+        Dictionary containing:
+            - 'actor_fn': JIT-compiled function that takes observations and returns actions
+            - 'actor_params': The loaded model parameters
+            - 'obs_mean': Observation mean for normalization
+            - 'obs_std': Observation std for normalization
+            - 'config': The loaded config dictionary
+    """
+    ckpt_path = Path(checkpoint_path).resolve()
+    
+    # Load config if available
+    config_file = ckpt_path / "config.yaml"
+    config = None
+    if config_file.exists():
+        with open(config_file) as f:
+            config = yaml.safe_load(f)
+        # Use hidden_dims from config if available
+        if config and "hidden_dims" in config:
+            hidden_dims = tuple(config["hidden_dims"])
+    
+    # Find checkpoint files
+    ckpt_files = list(ckpt_path.glob("checkpoint_*.npz"))
+    if not ckpt_files:
+        raise FileNotFoundError(f"No checkpoint files found in {ckpt_path}")
+    
+    # Sort by step number (extract number from filename)
+    def get_step(p):
+        name = p.stem  # e.g., "checkpoint_1000" or "checkpoint_final"
+        step_str = name.split("_")[-1]
+        if step_str == "final":
+            return float("inf")
+        return int(step_str)
+    
+    ckpt_files.sort(key=get_step)
+    
+    # Look for final checkpoint specifically
+    final_ckpt = ckpt_path / "checkpoint_final.npz"
+    if final_ckpt.exists():
+        selected_ckpt = final_ckpt
+    else:
+        selected_ckpt = ckpt_files[-1]
+    
+    print(f"[get_actor_from_checkpoint] Loading checkpoint: {selected_ckpt}")
+    
+    # Load checkpoint
+    checkpoint = np.load(selected_ckpt, allow_pickle=True)
+    actor_params = checkpoint["actor_params"].item()  # .item() to extract dict from 0-d array
+    obs_mean = checkpoint["obs_mean"]
+    obs_std = checkpoint["obs_std"]
+    
+    # Create actor model
+    actor_model = BCActor(
+        hidden_dims=hidden_dims,
+        action_dim=action_dim,
+        max_action=max_action,
+    )
+    
+    # Convert params back to FrozenDict
+    actor_params = flax.serialization.from_state_dict(
+        actor_model.init(jax.random.PRNGKey(0), jnp.zeros((1, state_dim))),
+        actor_params
+    )
+    
+    # Create JIT-compiled action function
+    @jax.jit
+    def actor_fn(obs: jnp.ndarray) -> jnp.ndarray:
+        actions = actor_model.apply(actor_params, obs)
+        return jnp.clip(actions, -max_action, max_action)
+    
+    # Create a normalized action function that includes obs normalization
+    def get_action(obs: np.ndarray) -> np.ndarray:
+        obs_normalized = (obs - obs_mean) / (obs_std + 1e-5)
+        action = actor_fn(jnp.array(obs_normalized))
+        return np.array(action)
+    
+    print(f"[get_actor_from_checkpoint] Loaded actor with hidden_dims={hidden_dims}, action_dim={action_dim}")
+    
+    return {
+        "actor_fn": actor_fn,
+        "get_action": get_action,
+        "actor_params": actor_params,
+        "obs_mean": obs_mean,
+        "obs_std": obs_std,
+        "config": config,
+    }
 
 
 def evaluate(

@@ -1,4 +1,3 @@
-from this import s
 import mujoco
 from mujoco import mjx
 
@@ -31,6 +30,7 @@ def get_env(env_name: str, device: str, render_callback=None, command_type=None)
         num_actors=1,
         device=device,
         command_type=command_type,
+        render_callback=render_callback,
     )
 
     return env
@@ -45,6 +45,7 @@ class GymWrapper(gym.Env):
         num_actors=1,
         device="cpu",
         command_type=None,
+        render_callback=None,
     ):
         super().__init__()
         self.command_type = command_type
@@ -53,7 +54,7 @@ class GymWrapper(gym.Env):
         self._reset_fn = jax.jit(jax.vmap(self.env.reset))
         self._step_fn = jax.jit(jax.vmap(self.env.step))
         self.rng = jax.random.PRNGKey(seed)
-
+        self.render_callback = render_callback
         self.episode_length = env_cfg.episode_length
 
         # Handle both dict-based and int-based observation_size
@@ -145,6 +146,12 @@ class GymWrapper(gym.Env):
         truncated = np.asarray([self.timesteps >= self.episode_length for _ in range(self.num_envs)])
         info = self._tree_to_numpy(self.env_state.info)
         return obs, rew, done, truncated, info
+
+    def render(self):  # pylint: disable=unused-argument
+        if self.render_callback is not None:
+            self.render_callback(self.env, self.env_state)
+        else:
+            raise ValueError("No render callback specified")
 
     def save_video(self, render_trajectory, save_path=None):
         scene_option = mujoco.MjvOption()
