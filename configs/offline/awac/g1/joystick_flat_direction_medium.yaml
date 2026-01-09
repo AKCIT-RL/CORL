@@ -3,9 +3,9 @@ batch_size: 256
 buffer_size: 10000000
 checkpoints_path: checkpoints/AWAC
 device: cuda
-env: Go1JoystickFlatTerrain
+env: G1JoystickFlatTerrain
 dataset_id: playground/G1JoystickFlatTerrain-direction-medium-v1
-eval_frequency: 1000
+eval_frequency: 5000
 gamma: 0.99
 group: awac-g1-joystick-flat-medium-v1
 hidden_dim: 256

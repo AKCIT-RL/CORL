@@ -5,7 +5,7 @@ checkpoints_path: checkpoints/AWAC
 device: cuda
 env: H1JoystickGaitTracking
 dataset_id: playground/H1JoystickGaitTracking-direction-expert-v1
-eval_frequency: 1000
+eval_frequency: 5000
 gamma: 0.99
 group: awac-h1-joystick-flat-expert-v1
 hidden_dim: 256

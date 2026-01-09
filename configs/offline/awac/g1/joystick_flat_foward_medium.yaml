@@ -5,7 +5,7 @@ checkpoints_path: checkpoints/AWAC
 device: cuda
 env: G1JoystickFlatTerrain
 dataset_id: playground/G1JoystickFlatTerrain-foward-medium-v1
-eval_frequency: 1000
+eval_frequency: 5000
 gamma: 0.99
 group: awac-g1-joystick-flat-medium-v1
 hidden_dim: 256
