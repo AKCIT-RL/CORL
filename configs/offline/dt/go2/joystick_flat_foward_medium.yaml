@@ -1,5 +1,5 @@
 attention_dropout: 0.1
-batch_size: 4096
+batch_size: 512
 betas:
 - 0.9
 - 0.999
@@ -13,7 +13,7 @@ env_name: Go2JoystickFlatTerrain
 dataset_id: playground/Go2JoystickFlatTerrain-foward-medium-v1
 command_type: foward
 episode_len: 1000
-eval_episodes: 100
+eval_episodes: 10
 eval_every: 5000
 eval_seed: 42
 group: dt-go2-joystick-flat-medium-v1

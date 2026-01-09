@@ -525,6 +525,9 @@ def evaluate(
     total_timesteps = 0
     state_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
+    # Convert state_mean and state_std to JAX arrays and ensure correct shape
+    state_mean = jnp.array(state_mean).reshape(-1) if not isinstance(state_mean, (int, float)) else jnp.array([state_mean] * state_dim)
+    state_std = jnp.array(state_std).reshape(-1) if not isinstance(state_std, (int, float)) else jnp.array([state_std] * state_dim)
     # same as timesteps used for training the transformer
     timesteps = jnp.arange(0, config.episode_len, 1, jnp.int32)
     # repeat
@@ -542,12 +545,15 @@ def evaluate(
         )
         # init episode
         running_state, _ = env.reset()
+        # Ensure running_state is 1D
+        running_state = np.array(running_state).flatten()
         running_reward = 0
         running_rtg = target_return * config.reward_scale
         for t in range(config.episode_len):
             total_timesteps += 1
             # add state in placeholder and normalize
-            states = states.at[0, t].set((running_state - state_mean) / state_std)
+            normalized_state = (jnp.array(running_state) - state_mean) / state_std
+            states = states.at[0, t].set(normalized_state)
             # calculate running rtg and add in placeholder
             running_rtg = running_rtg - (running_reward * config.reward_scale)
             rewards_to_go = rewards_to_go.at[0, t].set(running_rtg)
@@ -570,6 +576,8 @@ def evaluate(
                 )
                 act = act_preds[0, -1]
             running_state, running_reward, done, truncated, _ = env.step(np.array(act))
+            # Ensure running_state is 1D
+            running_state = np.array(running_state).flatten()
             # add action in placeholder
             actions = actions.at[0, t].set(act)
             total_reward += running_reward
