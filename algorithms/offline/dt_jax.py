@@ -25,6 +25,11 @@ from algorithms.utils.wrapper_gym import get_env
 
 os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True"
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 
 @dataclass
 class DTConfig:
@@ -509,6 +514,150 @@ def create_dt_train_state(
     )
     train_state = TrainState.create(apply_fn=model.apply, params=params, tx=tx)
     return DTTrainState(train_state)
+
+
+def get_dt_from_checkpoint(
+    checkpoint_path: str,
+    state_dim: int,
+    action_dim: int,
+) -> Dict[str, Any]:
+    """
+    Load a Decision Transformer from a JAX checkpoint.
+    
+    Args:
+        checkpoint_path: Path to the checkpoint directory
+        state_dim: Dimension of the state/observation space
+        action_dim: Dimension of the action space
+    
+    Returns:
+        Dictionary containing:
+            - 'transformer_fn': JIT-compiled transformer function
+            - 'get_action': Function that takes observations and returns actions
+            - 'transformer_params': The loaded model parameters
+            - 'obs_mean': Observation mean for normalization
+            - 'obs_std': Observation std for normalization
+            - 'config': The loaded config dictionary
+    """
+    from pathlib import Path
+    
+    ckpt_path = Path(checkpoint_path).resolve()
+    
+    # Load config if available
+    config_file = ckpt_path / "config.yaml"
+    config = None
+    if config_file.exists():
+        if yaml is None:
+            raise ImportError("PyYAML is required to load config. Install with: pip install pyyaml")
+        with open(config_file) as f:
+            config = yaml.safe_load(f)
+    else:
+        raise FileNotFoundError(f"Config file not found: {config_file}")
+    
+    # Extract config parameters
+    embedding_dim = config.get("embedding_dim", 128)
+    num_layers = config.get("num_layers", 3)
+    num_heads = config.get("num_heads", 1)
+    seq_len = config.get("seq_len", 20)
+    attention_dropout = config.get("attention_dropout", 0.1)
+    residual_dropout = config.get("residual_dropout", 0.1)
+    embedding_dropout = config.get("embedding_dropout", 0.1)
+    
+    # Find checkpoint files
+    ckpt_files = list(ckpt_path.glob("checkpoint_*.npz"))
+    if not ckpt_files:
+        raise FileNotFoundError(f"No checkpoint files found in {ckpt_path}")
+    
+    # Sort by step number (extract number from filename)
+    def get_step(p):
+        name = p.stem  # e.g., "checkpoint_1000" or "checkpoint_final"
+        step_str = name.split("_")[-1]
+        if step_str == "final":
+            return float("inf")
+        return int(step_str)
+    
+    ckpt_files.sort(key=get_step)
+    
+    # Look for final checkpoint specifically
+    final_ckpt = ckpt_path / "checkpoint_final.npz"
+    if final_ckpt.exists():
+        selected_ckpt = final_ckpt
+    else:
+        selected_ckpt = ckpt_files[-1]
+    
+    print(f"[get_dt_from_checkpoint] Loading checkpoint: {selected_ckpt}")
+    
+    # Load checkpoint
+    checkpoint = np.load(selected_ckpt, allow_pickle=True)
+    transformer_params = checkpoint["transformer_params"].item()  # .item() to extract dict from 0-d array
+    obs_mean = checkpoint["state_mean"]
+    obs_std = checkpoint["state_std"]
+    
+    # Create Decision Transformer model
+    dt_model = DecisionTransformer(
+        state_dim=state_dim,
+        act_dim=action_dim,
+        num_layers=num_layers,
+        h_dim=embedding_dim,
+        seq_len=seq_len,
+        n_heads=num_heads,
+        attention_dropout=attention_dropout,
+        residual_dropout=residual_dropout,
+        embedding_dropout=embedding_dropout,
+    )
+    
+    # Convert params back to FrozenDict
+    transformer_params = flax.serialization.from_state_dict(
+        dt_model.init(
+            jax.random.PRNGKey(0),
+            timesteps=jnp.zeros((1, seq_len), jnp.int32),
+            states=jnp.zeros((1, seq_len, state_dim), jnp.float32),
+            actions=jnp.zeros((1, seq_len, action_dim), jnp.float32),
+            returns_to_go=jnp.zeros((1, seq_len, 1), jnp.float32),
+            training=False,
+        ),
+        transformer_params
+    )
+    
+    # Create JIT-compiled transformer function
+    @jax.jit
+    def transformer_fn(
+        timesteps: jnp.ndarray,
+        states: jnp.ndarray,
+        actions: jnp.ndarray,
+        returns_to_go: jnp.ndarray,
+    ) -> jnp.ndarray:
+        state_preds, action_preds, return_preds = dt_model.apply(
+            transformer_params,
+            timesteps,
+            states,
+            actions,
+            returns_to_go,
+            training=False,
+        )
+        return action_preds
+    
+    # Create a get_action function for easier inference
+    def get_action(
+        timesteps: jnp.ndarray,
+        states: jnp.ndarray,
+        actions: jnp.ndarray,
+        returns_to_go: jnp.ndarray,
+    ) -> np.ndarray:
+        """Get action from the Decision Transformer."""
+        action_preds = transformer_fn(timesteps, states, actions, returns_to_go)
+        return np.array(action_preds)
+    
+    print(f"[get_dt_from_checkpoint] Loaded DT with embedding_dim={embedding_dim}, "
+          f"num_layers={num_layers}, seq_len={seq_len}")
+    
+    return {
+        "transformer_fn": transformer_fn,
+        "get_action": get_action,
+        "transformer_params": transformer_params,
+        "obs_mean": obs_mean,
+        "obs_std": obs_std,
+        "config": config,
+    }
 
 
 def evaluate(

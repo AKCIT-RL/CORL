@@ -4,6 +4,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple
 
 import distrax
@@ -18,6 +19,7 @@ import optax
 import pyrallis
 import tqdm
 import wandb
+import yaml
 from flax.training.train_state import TrainState
 
 from algorithms.utils.wrapper_gym import get_env
@@ -462,6 +464,117 @@ def evaluate(
             episode_return += reward
         episode_returns.append(episode_return)
     return np.mean(episode_returns)
+
+
+def get_actor_from_checkpoint(
+    checkpoint_path: str,
+    state_dim: int,
+    action_dim: int,
+    max_action: float = 1.0,
+) -> Dict[str, Any]:
+    """
+    Load an IQL actor from a JAX checkpoint.
+
+    Args:
+        checkpoint_path: Path to the checkpoint directory
+        state_dim: Dimension of the state/observation space
+        action_dim: Dimension of the action space
+        max_action: Maximum action value (default: 1.0)
+
+    Returns:
+        Dictionary containing:
+            - 'actor_fn': JIT-compiled function that takes (obs, seed, temperature) and
+                          returns a sampled action
+            - 'get_action': Convenience wrapper that applies obs normalisation and returns
+                            a numpy action. Uses temperature=0.0 (deterministic) by default.
+            - 'actor_params': The loaded model parameters
+            - 'obs_mean': Observation mean for normalisation
+            - 'obs_std': Observation std for normalisation
+            - 'config': The loaded config dictionary
+    """
+    ckpt_path = Path(checkpoint_path).resolve()
+
+    # Load config if available
+    hidden_dims = (256, 256)
+    config = None
+    config_file = ckpt_path / "config.yaml"
+    if config_file.exists():
+        with open(config_file) as f:
+            config = yaml.safe_load(f)
+        if config and "hidden_dims" in config:
+            hidden_dims = tuple(config["hidden_dims"])
+
+    # Find checkpoint files
+    ckpt_files = list(ckpt_path.glob("checkpoint_*.npz"))
+    if not ckpt_files:
+        raise FileNotFoundError(f"No checkpoint files found in {ckpt_path}")
+
+    def get_step(p):
+        step_str = p.stem.split("_")[-1]
+        return float("inf") if step_str == "final" else int(step_str)
+
+    ckpt_files.sort(key=get_step)
+
+    final_ckpt = ckpt_path / "checkpoint_final.npz"
+    selected_ckpt = final_ckpt if final_ckpt.exists() else ckpt_files[-1]
+
+    print(f"[get_actor_from_checkpoint] Loading checkpoint: {selected_ckpt}")
+
+    # Load checkpoint
+    checkpoint = np.load(selected_ckpt, allow_pickle=True)
+    actor_params_dict = checkpoint["actor_params"].item()
+    obs_mean = checkpoint["obs_mean"]
+    obs_std = checkpoint["obs_std"]
+
+    # Reconstruct actor model
+    actor_model = GaussianPolicy(
+        hidden_dims=hidden_dims,
+        action_dim=action_dim,
+    )
+
+    # Restore params into a proper FrozenDict
+    dummy_obs = jnp.zeros((1, state_dim))
+    actor_params = flax.serialization.from_state_dict(
+        actor_model.init(jax.random.PRNGKey(0), dummy_obs),
+        actor_params_dict,
+    )
+
+    # JIT-compiled sampling function
+    @jax.jit
+    def actor_fn(
+        obs: jnp.ndarray,
+        seed: jax.random.PRNGKey,
+        temperature: float = 1.0,
+    ) -> jnp.ndarray:
+        dist = actor_model.apply(actor_params, obs, temperature=temperature)
+        actions = dist.sample(seed=seed)
+        return jnp.clip(actions, -max_action, max_action)
+
+    # Convenience wrapper: normalises obs, uses temperature=0.0 for deterministic actions
+    def get_action(
+        obs: np.ndarray,
+        seed: Optional[jax.random.PRNGKey] = None,
+        temperature: float = 0.0,
+    ) -> np.ndarray:
+        if seed is None:
+            seed = jax.random.PRNGKey(0)
+        obs_normalized = (obs - obs_mean) / (obs_std + 1e-5)
+        action = actor_fn(jnp.array(obs_normalized), seed=seed, temperature=temperature)
+        return np.array(action)
+
+    print(
+        f"[get_actor_from_checkpoint] Loaded IQL actor with "
+        f"hidden_dims={hidden_dims}, action_dim={action_dim}"
+    )
+
+    return {
+        "actor_fn": actor_fn,
+        "get_action": get_action,
+        "actor_params": actor_params,
+        "obs_mean": obs_mean,
+        "obs_std": obs_std,
+        "config": config,
+    }
 
 
 @pyrallis.wrap()

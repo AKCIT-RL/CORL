@@ -8,3 +8,4 @@ wandb==0.19.11
 tqdm==4.67.1
 pandas==2.3.2
 mediapy==1.2.4
+distrax==0.1.5

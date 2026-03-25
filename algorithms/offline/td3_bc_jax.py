@@ -5,6 +5,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple
 
 import minari
@@ -18,6 +19,7 @@ import optax
 import pyrallis
 import tqdm
 import wandb
+import yaml
 from flax.training.train_state import TrainState
 
 from algorithms.utils.wrapper_gym import get_env
@@ -413,6 +415,98 @@ def evaluate(
         return env.get_normalized_score(mean_return) * 100
     else:
         return mean_return
+
+
+def get_actor_from_checkpoint(
+    checkpoint_path: str,
+    state_dim: int,
+    action_dim: int,
+    max_action: float = 1.0,
+) -> Dict[str, Any]:
+    """
+    Load a TD3+BC actor from a JAX checkpoint.
+
+    Args:
+        checkpoint_path: Path to the checkpoint directory.
+        state_dim: Dimension of the state/observation space.
+        action_dim: Dimension of the action space.
+        max_action: Maximum action magnitude (default: 1.0).
+
+    Returns:
+        Dictionary containing:
+            - 'actor_fn': JIT-compiled function that takes observations and returns actions.
+            - 'get_action': Convenience wrapper that applies obs normalisation and returns
+                            a numpy action.
+            - 'actor_params': The loaded model parameters.
+            - 'obs_mean': Observation mean for normalisation.
+            - 'obs_std': Observation std for normalisation.
+            - 'config': The loaded config dictionary.
+    """
+    ckpt_path = Path(checkpoint_path).resolve()
+
+    # Load config if available
+    hidden_dims = (256, 256)
+    config = None
+    config_file = ckpt_path / "config.yaml"
+    if config_file.exists():
+        with open(config_file) as f:
+            config = yaml.safe_load(f)
+        if config and "hidden_dims" in config:
+            hidden_dims = tuple(config["hidden_dims"])
+
+    # Locate checkpoint file
+    ckpt_files = list(ckpt_path.glob("checkpoint_*.npz"))
+    if not ckpt_files:
+        raise FileNotFoundError(f"No checkpoint files found in {ckpt_path}")
+
+    def _get_step(p: Path) -> float:
+        step_str = p.stem.split("_")[-1]
+        return float("inf") if step_str == "final" else int(step_str)
+
+    ckpt_files.sort(key=_get_step)
+
+    final_ckpt = ckpt_path / "checkpoint_final.npz"
+    selected_ckpt = final_ckpt if final_ckpt.exists() else ckpt_files[-1]
+    print(f"[get_actor_from_checkpoint] Loading checkpoint: {selected_ckpt}")
+
+    # Load parameters
+    checkpoint = np.load(selected_ckpt, allow_pickle=True)
+    actor_params_dict = checkpoint["actor_params"].item()
+    obs_mean = checkpoint["obs_mean"]
+    obs_std = checkpoint["obs_std"]
+
+    # Build model and restore params
+    actor_model = TD3Actor(
+        hidden_dims=hidden_dims,
+        action_dim=action_dim,
+        max_action=max_action,
+    )
+    actor_params = flax.serialization.from_state_dict(
+        actor_model.init(jax.random.PRNGKey(0), jnp.zeros((1, state_dim))),
+        actor_params_dict,
+    )
+
+    @jax.jit
+    def actor_fn(obs: jnp.ndarray) -> jnp.ndarray:
+        return jnp.clip(actor_model.apply(actor_params, obs), -max_action, max_action)
+
+    def get_action(obs: np.ndarray) -> np.ndarray:
+        obs_normalized = (obs - obs_mean) / (obs_std + 1e-5)
+        return np.array(actor_fn(jnp.array(obs_normalized)))
+
+    print(
+        f"[get_actor_from_checkpoint] Loaded TD3+BC actor with "
+        f"hidden_dims={hidden_dims}, action_dim={action_dim}"
+    )
+
+    return {
+        "actor_fn": actor_fn,
+        "get_action": get_action,
+        "actor_params": actor_params,
+        "obs_mean": obs_mean,
+        "obs_std": obs_std,
+        "config": config,
+    }
 
 
 @pyrallis.wrap()
