@@ -92,6 +92,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Directory to write the video file (defaults to the pickle's directory).",
     )
+    parser.add_argument(
+        "--randomize",
+        action="store_true",
+        help="Randomize the environment.",
+    )
     return parser.parse_args()
 
 
@@ -115,7 +120,7 @@ def main() -> None:
         render_trajectory.append(state)
 
     render_cb = render_callback if args.save_video else None
-    env = get_env(args.env_name, "cuda", render_cb, command_type=args.command_type, randomize=False)
+    env = get_env(args.env_name, "cuda", render_cb, command_type=args.command_type, randomize=args.randomize)
 
     # Evaluate
     episode_returns = evaluate(
@@ -125,9 +130,44 @@ def main() -> None:
         render=args.render,
     )
 
+    import json
+
+    mean_return = float(episode_returns.mean())
+    std_return = float(episode_returns.std())
+    results = {
+        "pickle_path": args.pickle_path,
+        "env_name": args.env_name,
+        "command_type": args.command_type,
+        "randomize": args.randomize,
+        "n_episodes": args.n_episodes,
+        "mean_return": mean_return,
+        "std_return": std_return,
+    }
+
     print(f"\nResults over {args.n_episodes} episodes:")
-    print(f"  Mean return : {episode_returns.mean():.4f}")
-    print(f"  Std  return : {episode_returns.std():.4f}")
+    print(f"  Mean return : {mean_return:.4f}")
+    print(f"  Std  return : {std_return:.4f}")
+
+    results_path = "results_evaluate_actor.json"
+
+    # If file exists, load, append result, else create new list
+    if os.path.exists(results_path):
+        try:
+            with open(results_path, "r") as f:
+                prev_results = json.load(f)
+            if isinstance(prev_results, list):
+                prev_results.append(results)
+                to_write = prev_results
+            else:
+                to_write = [prev_results, results]
+        except Exception:
+            to_write = [results]
+    else:
+        to_write = [results]
+
+    with open(results_path, "w") as f:
+        json.dump(to_write, f, indent=2)
+    print(f"Results saved to: {results_path}")
   
 
     # Save video
