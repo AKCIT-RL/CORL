@@ -19,7 +19,13 @@ except ImportError:
 from .space import NumpySpace
 
 
-def get_env(env_name: str, device: str, render_callback=None, command_type=None):
+def get_env(
+    env_name: str,
+    device: str,
+    render_callback=None,
+    command_type=None,
+    num_actors: int = 1,
+):
     env = registry.load(env_name)
     env_cfg = registry.get_default_config(env_name)
 
@@ -27,7 +33,7 @@ def get_env(env_name: str, device: str, render_callback=None, command_type=None)
         env,
         env_cfg,
         seed=1,
-        num_actors=1,
+        num_actors=num_actors,
         device=device,
         command_type=command_type,
         render_callback=render_callback,
