@@ -1,10 +1,28 @@
-[tool.ruff]
-select = ["E", "F", "I001", "RUF100"]
-ignore = ["E402"]
-line-length = 89
-target-version = "py39"
+[project]
+name = "corl"
+version = "0.1.0"
+description = "High-quality single-file implementations of SOTA Offline and Offline-to-Online RL algorithms"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "jax[cuda12-local]==0.6.0",
+    "mediapy==1.2.4",
+    "minari[all]==0.5.3",
+    "pandas==2.3.2",
+    "playground",
+    "pyrallis==0.3.1",
+    "torch==2.8.0",
+    "tqdm==4.67.1",
+    "wandb==0.25.1",
+]
 
-[tool.ruff.isort]
-combine-as-imports = true
-lines-after-imports = 1
-order-by-type = false
+[tool.uv]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+playground = { git = "https://github.com/AKCIT-RL/mujoco_playground.git", rev = "go2" }
