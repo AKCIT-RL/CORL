@@ -514,6 +514,8 @@ def train(config: BCConfig):
         checkpoint_path = os.path.join(config.checkpoints_path, f"checkpoint_final.npz")
         np.savez(checkpoint_path, **checkpoint)
         print(f"Saved final checkpoint to {checkpoint_path}")
+        
+    wandb.finish()
 
 if __name__ == "__main__":
     train() # type: ignore
