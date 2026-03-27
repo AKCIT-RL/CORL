@@ -5,7 +5,7 @@ description = "High-quality single-file implementations of SOTA Offline and Offl
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "jax[cuda12-local]==0.6.0",
+    "jax[cuda12]==0.6.0",
     "mediapy==1.2.4",
     "minari[all]==0.5.3",
     "pandas==2.3.2",
