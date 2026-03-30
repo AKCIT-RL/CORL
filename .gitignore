@@ -152,4 +152,6 @@ dmypy.json
 .json
 .yaml
 wandb
+videos
+logs
 #assets/
