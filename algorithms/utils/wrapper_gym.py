@@ -24,11 +24,8 @@ def get_env(
     device: str,
     render_callback=None,
     command_type=None,
-<<<<<<< HEAD
     randomize: bool = False,
-=======
     num_actors: int = 1,
->>>>>>> origin
 ):
     env = registry.load(env_name)
     env_cfg = registry.get_default_config(env_name)
