@@ -24,7 +24,11 @@ def get_env(
     device: str,
     render_callback=None,
     command_type=None,
+<<<<<<< HEAD
     randomize: bool = False,
+=======
+    num_actors: int = 1,
+>>>>>>> origin
 ):
     env = registry.load(env_name)
     env_cfg = registry.get_default_config(env_name)
@@ -37,7 +41,7 @@ def get_env(
         env,
         env_cfg,
         seed=1,
-        num_actors=1,
+        num_actors=num_actors,
         device=device,
         command_type=command_type,
         render_callback=render_callback,

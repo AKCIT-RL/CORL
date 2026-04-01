@@ -3,7 +3,7 @@
 import os
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple
@@ -21,12 +21,13 @@ import tqdm
 import wandb
 import yaml
 from flax.training.train_state import TrainState
+import flax.serialization
+from flax.core import FrozenDict
 
-from algorithms.utils.wrapper_gym import get_env
+from algorithms.utils.wrapper_gym import GymWrapper, get_env
 from algorithms.utils.dataset import qlearning_dataset
 
 os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True"
-
 
 @dataclass
 class BCConfig:
@@ -39,7 +40,7 @@ class BCConfig:
     # training dataset and evaluation environment
     env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
     dataset_id: str = "halfcheetah-medium-expert-v2"
-    command_type: str = None
+    command_type: Optional[str] = None
     # total gradient updates during training
     max_timesteps: int = int(1e6)
     # training batch size
@@ -47,13 +48,13 @@ class BCConfig:
     # maximum size of the replay buffer
     buffer_size: int = 2_000_000
     # what top fraction of the dataset (sorted by return) to use
-    frac: float = 0.1
+    frac: float = 0.1 # WARNING: NOT USED
     # maximum possible trajectory length
-    max_traj_len: int = 1000
+    max_traj_len: int = 1000 # WARNING: NOT USED
     # whether to normalize states
     normalize: bool = True
     # discount factor
-    discount: float = 0.99
+    discount: float = 0.99 # WARNING: NOT USED
     # evaluation frequency, will evaluate eval_freq training steps
     eval_freq: int = int(5e3)
     # number of episodes to run during evaluation
@@ -61,7 +62,7 @@ class BCConfig:
     # path for checkpoints saving, optional
     checkpoints_path: Optional[str] = None
     # file name for loading a model, optional
-    load_model: str = ""
+    load_model: Optional[str] = None
     # training random seed
     seed: int = 0
     # training device
@@ -82,7 +83,7 @@ class BCConfig:
         return hash(self.__repr__())
 
 
-def default_init(scale: Optional[float] = jnp.sqrt(2)):
+def default_init(scale: Optional[float] = jnp.sqrt(2).item()):
     return nn.initializers.orthogonal(scale)
 
 
@@ -129,7 +130,7 @@ class Transition(NamedTuple):
 
 def get_dataset(
     dataset, config: BCConfig, clip_to_eps: bool = True, eps: float = 1e-5
-) -> Transition:
+) -> Tuple:
     # dataset = d4rl.qlearning_dataset(env)
 
     if clip_to_eps:
@@ -154,7 +155,7 @@ def get_dataset(
     # shuffle data and select the first buffer_size samples
     data_size = min(config.buffer_size, len(dataset.observations))
     rng = jax.random.PRNGKey(config.seed)
-    rng, rng_permute, rng_select = jax.random.split(rng, 3)
+    rng, rng_permute = jax.random.split(rng, 2)
     perm = jax.random.permutation(rng_permute, len(dataset.observations))
     dataset = jax.tree_util.tree_map(lambda x: x[perm], dataset)
     assert len(dataset.observations) >= data_size
@@ -191,10 +192,10 @@ class BC(object):
         self,
         train_state: BCTrainState,
         batch: Transition,
-        rng: jax.random.PRNGKey,
+        rng: jax.Array,
         config: BCConfig,
     ) -> Tuple["BCTrainState", jnp.ndarray]:
-        def actor_loss_fn(actor_params: flax.core.FrozenDict[str, Any]) -> jnp.ndarray:
+        def actor_loss_fn(actor_params: FrozenDict[str, Any]) -> jnp.ndarray:
             predicted_action = train_state.actor.apply_fn(
                 actor_params, batch.observations
             )
@@ -210,7 +211,7 @@ class BC(object):
         self,
         train_state: BCTrainState,
         data: Transition,
-        rng: jax.random.PRNGKey,
+        rng: jax.Array,
         config: BCConfig,
     ) -> Tuple["BCTrainState", Dict]:
         actor_loss = 0.0
@@ -241,9 +242,32 @@ class BC(object):
         action = action.clip(-max_action, max_action)
         return action
 
+def load_bc_train_state(
+    actions: jnp.ndarray,
+    config: BCConfig
+) -> BCTrainState:
+    if config.load_model is None:
+        raise ValueError("No checkpoint specified for loading.")
+    
+    checkpoint = np.load(config.load_model, allow_pickle=True)
+    actor_params = checkpoint["actor_params"].item()
+    
+    actor_model = BCActor(
+        action_dim=actions.shape[-1],
+        hidden_dims=config.hidden_dims,
+    )
+    actor_train_state = TrainState.create(
+        apply_fn=actor_model.apply,
+        params=actor_params,
+        tx=optax.adam(config.actor_lr),
+    )
+    
+    return BCTrainState(
+        actor=actor_train_state,
+    )    
 
 def create_bc_train_state(
-    rng: jax.random.PRNGKey,
+    rng: jax.Array,
     observations: jnp.ndarray,
     actions: jnp.ndarray,
     config: BCConfig,
@@ -349,7 +373,7 @@ def get_actor_from_checkpoint(
     @jax.jit
     def actor_fn(obs: jnp.ndarray) -> jnp.ndarray:
         actions = actor_model.apply(actor_params, obs)
-        return jnp.clip(actions, -max_action, max_action)
+        return jnp.clip(jnp.asarray(actions), -max_action, max_action)
     
     # Create a normalized action function that includes obs normalization
     def get_action(obs: np.ndarray) -> np.ndarray:
@@ -371,7 +395,7 @@ def get_actor_from_checkpoint(
 
 def evaluate(
     policy_fn: Callable[[jnp.ndarray], jnp.ndarray],
-    env: gym.Env,
+    env: GymWrapper,
     num_episodes: int,
     obs_mean,
     obs_std,
@@ -382,26 +406,26 @@ def evaluate(
         observation, _ = env.reset()
         done = truncated = False
         while not done and not truncated:
-            observation = (observation - obs_mean) / obs_std
-            action = policy_fn(obs=observation)
-            observation, reward, done, truncated, info = env.step(action)
+            observation = (observation - obs_mean) / (obs_std + 1e-5)
+            action = policy_fn(observation)
+            observation, reward, done, truncated, _ = env.step(action)
             episode_return += reward
         episode_returns.append(episode_return)
     
     mean_return = np.mean(episode_returns)
     # Use normalized score if available (D4RL), otherwise return raw score
     if hasattr(env, 'get_normalized_score'):
-        return env.get_normalized_score(mean_return) * 100
+        return env.get_normalized_score(mean_return) * 100 # type: ignore
     else:
-        return mean_return
+        return mean_return.item()
 
-@pyrallis.wrap()
+@pyrallis.wrap()  # type: ignore
 def train(config: BCConfig):
     wandb.init(
         project=config.project,
         group=config.group,
         name=config.name,
-        config=config,
+        config=asdict(config),
         id=str(uuid.uuid4()),
     )
 
@@ -409,7 +433,7 @@ def train(config: BCConfig):
         print(f"Checkpoints path: {config.checkpoints_path}")
         os.makedirs(config.checkpoints_path, exist_ok=True)
         with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
-            pyrallis.dump(config, f)
+            yaml.dump(asdict(config), f)
 
     minari_dataset = minari.load_dataset(config.dataset_id)
     dataset = qlearning_dataset(minari_dataset)
@@ -420,9 +444,13 @@ def train(config: BCConfig):
     # create train_state
     rng, subkey = jax.random.split(rng)
     example_batch: Transition = jax.tree_util.tree_map(lambda x: x[0], dataset)
-    train_state = create_bc_train_state(
-        subkey, example_batch.observations, example_batch.actions, config
-    )
+    if config.load_model is not None:
+        print(f"Loading model from checkpoint: {config.load_model}")
+        train_state = load_bc_train_state(example_batch.actions,config)
+    else:
+        train_state = create_bc_train_state(
+            subkey, example_batch.observations, example_batch.actions, config
+        )
     algo = BC()
     update_fn = jax.jit(algo.update_n_times, static_argnums=(3,))
     act_fn = jax.jit(algo.get_action)
@@ -441,7 +469,7 @@ def train(config: BCConfig):
         wandb.log(train_metrics, step=i)
 
         if i % eval_interval == 0:
-            policy_fn = partial(act_fn, train_state=train_state)
+            policy_fn = partial(act_fn, train_state)
             normalized_score = evaluate(
                 policy_fn,
                 env,
@@ -464,7 +492,7 @@ def train(config: BCConfig):
                 print(f"Saved checkpoint to {checkpoint_path}")
 
     # final evaluation
-    policy_fn = partial(act_fn, train_state=train_state)
+    policy_fn = partial(act_fn, train_state)
     normalized_score = evaluate(
         policy_fn,
         env,
@@ -486,10 +514,9 @@ def train(config: BCConfig):
         checkpoint_path = os.path.join(config.checkpoints_path, f"checkpoint_final.npz")
         np.savez(checkpoint_path, **checkpoint)
         print(f"Saved final checkpoint to {checkpoint_path}")
-
+        
     wandb.finish()
 
-
 if __name__ == "__main__":
-    train()
+    train() # type: ignore
 
