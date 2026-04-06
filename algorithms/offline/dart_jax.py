@@ -779,7 +779,7 @@ def train(config: DARTConfig):
         print(f"Checkpoints path: {config.checkpoints_path}")
         os.makedirs(config.checkpoints_path, exist_ok=True)
         with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
-            yaml.dump(asdict(config), f)
+            yaml.safe_dump(asdict(config), f)
     if not Path(config.expert_checkpoint).exists():
         raise FileNotFoundError(f"Expert checkpoint not found: {config.expert_checkpoint}")
 

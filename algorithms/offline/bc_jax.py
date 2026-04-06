@@ -433,7 +433,7 @@ def train(config: BCConfig):
         print(f"Checkpoints path: {config.checkpoints_path}")
         os.makedirs(config.checkpoints_path, exist_ok=True)
         with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
-            yaml.dump(asdict(config), f)
+            yaml.safe_dump(asdict(config), f)
 
     minari_dataset = minari.load_dataset(config.dataset_id)
     dataset = qlearning_dataset(minari_dataset)
