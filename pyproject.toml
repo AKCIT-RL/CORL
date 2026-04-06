@@ -19,6 +19,9 @@ dependencies = [
 [tool.uv]
 
 [[tool.uv.index]]
+url = "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"
+
+[[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
@@ -26,3 +29,11 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 playground = { git = "https://github.com/AKCIT-RL/mujoco_playground.git", rev = "go2" }
+
+[dependency-groups]
+minimum = [
+    "cloudpickle==3.1.2",
+    "distrax==0.1.5",
+    "flax==0.10.7",
+    "jax[cuda12]==0.6.0",
+]
