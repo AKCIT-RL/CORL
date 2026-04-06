@@ -4,7 +4,7 @@ checkpoints_path: BC
 device: cuda
 discount: 0.99
 env: H1JoystickGaitTracking
-dataset_id: playground/H1JoystickGaitTracking-foward-medium-v1
+dataset_id: playground/H1JoystickGaitTracking-forward-medium-v1
 eval_freq: 5000
 frac: 1.0
 group: bc-h1-medium-v1

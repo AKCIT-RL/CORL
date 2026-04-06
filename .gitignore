@@ -12,6 +12,7 @@ expert/logs
 expert/rollouts
 expert_checkpoints
 *.sqsh
+*.pkl
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

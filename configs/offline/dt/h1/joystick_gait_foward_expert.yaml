@@ -1,5 +1,5 @@
 attention_dropout: 0.1
-batch_size: 4096
+batch_size: 512
 betas:
 - 0.9
 - 0.999
@@ -10,10 +10,10 @@ device: cuda
 embedding_dim: 128
 embedding_dropout: 0.1
 env_name: H1JoystickGaitTracking
-dataset_id: playground/H1JoystickGaitTracking-foward-expert-v1
-command_type: foward
+dataset_id: playground/H1JoystickGaitTracking-forward-expert-v1
+command_type: forward
 episode_len: 1000
-eval_episodes: 100
+eval_episodes: 10
 eval_every: 5000
 eval_seed: 42
 group: dt-h1-joystick-gait-expert-v1

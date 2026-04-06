@@ -5,6 +5,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple
 
 import distrax
@@ -18,6 +19,7 @@ import optax
 import pyrallis
 import tqdm
 import wandb
+import yaml
 from flax.training.train_state import TrainState
 
 import minari
@@ -413,6 +415,63 @@ def evaluate(
     else:
         return mean_return
 
+
+def get_actor_from_checkpoint(checkpoint_path: str, state_dim: int) -> dict:
+
+    ckpt_path = Path(checkpoint_path).resolve()
+
+    with open(ckpt_path / "config.yaml") as f:
+        config_dict = yaml.safe_load(f)
+
+    checkpoint_data = np.load(
+        ckpt_path / "checkpoint_final.npz", allow_pickle=True
+    )
+
+    raw_actor_params = checkpoint_data["actor_params"].item()
+    obs_mean = jnp.array(checkpoint_data["obs_mean"])
+    obs_std = jnp.array(checkpoint_data["obs_std"])
+
+    print(f"obs_mean: {obs_mean[:5]}... (first 5)")
+    print(f"obs_std:  {obs_std[:5]}... (first 5)")
+
+    params_tree = raw_actor_params.get("params", raw_actor_params)
+    action_dim = params_tree["log_stds"].shape[0]
+
+    actor_model = GaussianPolicy(
+        hidden_dims=config_dict["actor_hidden_dims"],
+        action_dim=action_dim,
+    )
+
+    dummy_obs = jnp.zeros((1, state_dim))
+    initial_vars = actor_model.init(jax.random.PRNGKey(0), dummy_obs)
+    actor_params = flax.serialization.from_state_dict(initial_vars, raw_actor_params)
+
+    @jax.jit
+    def actor_fn_deterministic(params, observations):
+        return actor_model.apply(params, observations, temperature=0.0).loc
+
+    @jax.jit
+    def actor_fn_stochastic(params, observations, temperature):
+        dist = actor_model.apply(params, observations, temperature=temperature)
+        return dist.sample(seed=jax.random.PRNGKey(0))
+
+    def get_action(obs: np.ndarray, temperature: float = 0.0) -> np.ndarray:
+        norm_obs = (obs - obs_mean) / (obs_std + 1e-5)
+        if temperature == 0.0:
+            action = actor_fn_deterministic(actor_params, norm_obs)
+        else:
+            action = actor_fn_stochastic(actor_params, norm_obs, temperature)
+        return np.array(jnp.clip(action, -1.0, 1.0))
+
+    return {
+        "actor_fn_deterministic": actor_fn_deterministic,
+        "actor_fn_stochastic": actor_fn_stochastic,
+        "get_action": get_action,
+        "actor_params": actor_params,
+        "obs_mean": obs_mean,
+        "obs_std": obs_std,
+        "config": config_dict,
+    }
 
 @pyrallis.wrap()
 def train(config: AWACConfig):

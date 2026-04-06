@@ -70,11 +70,13 @@ def save_video(
 
     # Render
     scene_option = mujoco.MjvOption()
+    # Visual mesh geoms (group 2) are stripped at compile time; collision capsules
+    # (group 3) are the only robot geometry present, so enable group 3.
     scene_option.geomgroup[2] = True
-    scene_option.geomgroup[3] = False
-    scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = True
+    scene_option.geomgroup[3] = True
+    scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = False
     scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
-    scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = True
+    scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = False
 
     render_every = 2
     fps = 1.0 / env.dt / render_every

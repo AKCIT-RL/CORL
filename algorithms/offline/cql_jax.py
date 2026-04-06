@@ -122,7 +122,7 @@ class CQLConfig:
     n_jitted_updates: int = 8
     # Optimizer type ("adam" or "sgd")
     optimizer_type: str = "adam"
-    # command type for environment (e.g., "direction", "foward", "fowardfixed")
+    # command type for environment (e.g., "direction", "forward", "forwardfixed")
     command_type: Optional[str] = None
 
     def __post_init__(self):

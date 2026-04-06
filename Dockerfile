@@ -36,8 +36,6 @@ RUN apt install ffmpeg -y
 
 # Código da aplicação
 WORKDIR /CORL
-COPY algorithms /CORL/algorithms
-COPY configs /CORL/configs
 
 ENV MINARI_DATASETS_PATH=/datasets
 
