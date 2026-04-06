@@ -6,7 +6,7 @@ checkpoints_path: checkpoints/IQL
 device: cuda
 discount: 0.99
 env: H1JoystickGaitTracking
-dataset_id: playground/H1JoystickGaitTracking-fowardfixed-medium-v1
+dataset_id: playground/H1JoystickGaitTracking-forwardfixed-medium-v1
 eval_freq: 5000
 group: iql-h1-joystick-gait-medium-v1
 iql_deterministic: false
@@ -22,4 +22,4 @@ project: Offline-Benchmark
 seed: 0
 tau: 0.005
 vf_lr: 3e-4
-command_type: fowardfixed  
+command_type: forwardfixed  

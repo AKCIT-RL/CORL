@@ -10,8 +10,8 @@ device: cuda
 embedding_dim: 128
 embedding_dropout: 0.1
 env_name: G1JoystickFlatTerrain
-dataset_id: playground/G1JoystickFlatTerrain-foward-medium-v1
-command_type: foward
+dataset_id: playground/G1JoystickFlatTerrain-forward-medium-v1
+command_type: forward
 episode_len: 1000
 eval_episodes: 10
 eval_every: 5000

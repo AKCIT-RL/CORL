@@ -160,13 +160,13 @@ class GymWrapper(gym.Env):
         commands = env_state.info["command"]
         zeros = jp.zeros_like(commands)
 
-        if self.command_type == "fowardbackward":
+        if self.command_type == "forwardbackward":
             command = zeros.at[..., 0].set(commands[..., 0])
-        elif self.command_type == "foward":
+        elif self.command_type == "forward":
             command = zeros.at[..., 0].set(jp.abs(commands[..., 0]))
-        elif self.command_type == "fowardfixed":
+        elif self.command_type == "forwardfixed":
             command = zeros.at[..., 0].set(1.0)
-        elif self.command_type == "foward_realrobot":
+        elif self.command_type == "forward_realrobot":
             command = zeros.at[..., 0].set(0.2)
         else:
             return env_state

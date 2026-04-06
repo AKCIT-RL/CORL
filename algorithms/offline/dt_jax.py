@@ -92,7 +92,7 @@ class DTConfig:
     eval_seed: int = 42
     # training device
     device: str = "cuda"
-    # command type for environment (e.g., "direction", "foward", "fowardfixed")
+    # command type for environment (e.g., "direction", "forward", "forwardfixed")
     command_type: Optional[str] = None
     # deterministic torch (not used in JAX, but present in configs for compatibility)
     deterministic_torch: bool = False

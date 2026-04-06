@@ -10,8 +10,8 @@ device: cuda
 embedding_dim: 128
 embedding_dropout: 0.1
 env_name: H1JoystickGaitTracking
-dataset_id: playground/H1JoystickGaitTracking-fowardfixed-expert-v1
-command_type: fowardfixed
+dataset_id: playground/H1JoystickGaitTracking-forwardfixed-expert-v1
+command_type: forwardfixed
 episode_len: 1000
 eval_episodes: 10
 eval_every: 5000
