@@ -3,7 +3,7 @@ name = "corl"
 version = "0.1.0"
 description = "High-quality single-file implementations of SOTA Offline and Offline-to-Online RL algorithms"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.12"
 dependencies = [
     "jax[cuda12]==0.6.0",
     "mediapy==1.2.4",
@@ -37,3 +37,27 @@ minimum = [
     "flax==0.10.7",
     "jax[cuda12]==0.6.0",
 ]
+
+isaac-minimum = [
+    "cloudpickle==3.1.2",
+    "distrax==0.1.5",
+    "flax==0.10.7",
+    "jax[cuda12]==0.6.0",
+    "numpy==1.26.0",
+]
+
+isaac-test = [
+    "cloudpickle==3.1.2",
+    "distrax==0.1.5",
+    "flax==0.10.7",
+    "jax[cuda12]==0.6.0",
+    "numpy==1.26.0",
+    "playground",
+    "minari[all]==0.5.3",
+    "torch==2.8.0",
+    "tqdm==4.67.1",
+]
+
+[tool.uv.dependency-groups]
+isaac-minimum = {requires-python = "==3.11.13"}
+isaac-test = {requires-python = "==3.11.13"}
