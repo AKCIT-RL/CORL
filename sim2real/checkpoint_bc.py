@@ -6,33 +6,41 @@ import numpy as np
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 import sys
+import warnings
 
 import jax
 import jax.numpy as jnp
 import flax
 import flax.linen as nn
 
-
 def _register_numpy2_compat_aliases() -> None:
     """Register aliases so NumPy 1.x can unpickle objects saved with NumPy 2.x."""
-    np_core = np.core
-    sys.modules.setdefault("numpy._core", np_core)
-    for submodule in (
-        "_multiarray_umath",
-        "multiarray",
-        "umath",
-        "overrides",
-        "numeric",
-        "numerictypes",
-        "fromnumeric",
-        "shape_base",
-        "function_base",
-        "getlimits",
-        "_methods",
-    ):
-        target = getattr(np_core, submodule, None)
-        if target is not None:
-            sys.modules.setdefault(f"numpy._core.{submodule}", target)
+    
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            category=DeprecationWarning,
+            message=r".*numpy\.core.*"
+        )
+        
+        np_core = np.core
+        sys.modules.setdefault("numpy._core", np_core)
+        for submodule in (
+            "_multiarray_umath",
+            "multiarray",
+            "umath",
+            "overrides",
+            "numeric",
+            "numerictypes",
+            "fromnumeric",
+            "shape_base",
+            "function_base",
+            "getlimits",
+            "_methods",
+        ):
+            target = getattr(np_core, submodule, None)
+            if target is not None:
+                sys.modules.setdefault(f"numpy._core.{submodule}", target)
 
 # ---------------------------------------------------------------------------
 # Defaults
