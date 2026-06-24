@@ -3,7 +3,7 @@ name = "corl"
 version = "0.1.0"
 description = "High-quality single-file implementations of SOTA Offline and Offline-to-Online RL algorithms"
 readme = "README.md"
-requires-python = ">=3.10,<3.12"
+requires-python = ">=3.11"
 dependencies = [
     "jax[cuda12]==0.6.0",
     "mediapy==1.2.4",
@@ -14,10 +14,20 @@ dependencies = [
     "torch==2.8.0",
     "tqdm==4.67.1",
     "wandb==0.25.1",
-    "mujoco==3.7.0.dev895794022",
+    # Pinned to the warp-compatible set: mujoco-mjx 3.6.0 imports the warp GraphMode
+    # from `warp.jax_experimental.ffi`, which matches warp-lang 1.11.0. Newer
+    # mujoco-mjx (>=3.7) import `warp._src.jax_experimental.ffi`, a path not exposed
+    # by any released warp-lang, which breaks impl="warp".
+    "mujoco==3.6.0",
+    "mujoco-mjx==3.6.0",
+    "warp-lang==1.11.0",
 ]
 
 [tool.uv]
+# minari declares `typer[all]`, but typer removed the `all` extra (the base
+# package now bundles everything). Override to drop the non-existent extra and
+# silence uv's resolution warning.
+override-dependencies = ["typer>=0.20.0"]
 
 [[tool.uv.index]]
 url = "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"
@@ -27,15 +37,9 @@ name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
-[[tool.uv.index]]
-name = "mujoco-nightly"
-url = "https://py.mujoco.org/"
-explicit = true
-
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 playground = { git = "https://github.com/AKCIT-RL/mujoco_playground.git", rev = "go2" }
-mujoco = { index = "mujoco-nightly" }
 
 [dependency-groups]
 minimum = [
