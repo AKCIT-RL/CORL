@@ -2437,7 +2437,7 @@ wheels = [
 [[package]]
 name = "playground"
 version = "0.2.0"
-source = { git = "https://github.com/AKCIT-RL/mujoco_playground.git?rev=go2#3f6810fbc5d01efd4845b42c8b928c2fd33197d4" }
+source = { git = "https://github.com/AKCIT-RL/mujoco_playground.git?rev=go2#30e3fdfbdfb3795b2e1f2f52ae684ce73825df03" }
 dependencies = [
     { name = "absl-py" },
     { name = "brax" },
