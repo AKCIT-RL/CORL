@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Mapping, Optional, Protocol, Sequence, Tuple, Union
 
-import cloudpickle
 import numpy as np
 
 import jax
@@ -15,6 +14,8 @@ import flax
 from flax import linen, struct
 from etils import epath
 from orbax import checkpoint as ocp
+
+from portable_actor import PortableActor, load_actor, ordered_dense_from_flax, save_actor
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -801,39 +802,70 @@ def main() -> None:
         checkpoint_step=args.checkpoint_step,
     )
 
-    pickle_path = f"./actor-PPOExpert-{env_name}-{run_id}.pkl"
+    # Extract weights into a pure-NumPy portable actor (no JAX/Flax/orbax needed
+    # to load it later). The deterministic Brax PPO policy is:
+    #   logits = swish-MLP(normalize(obs))            # last layer = 2*action_dim
+    #   loc    = logits[..., :action_dim]
+    #   action = tanh(loc)
+    # Observations are normalised with the running-statistics state stored in
+    # params[0] (mean/std per obs_key), with no extra epsilon (std already has
+    # std_eps baked in) and no clipping.
+    params = actor["actor_params"]
+    norm_state = params[0]
+    policy_params = params[1]
+    policy_tree = policy_params.get("params", policy_params)
+    layers = ordered_dense_from_flax(policy_tree, "hidden")
 
-    with open(pickle_path, "wb") as f:
-        cloudpickle.dump(
-            {
-                "actor_fn": actor["actor_fn"],
-                "get_action": actor["get_action"],
-                "actor_params": actor["actor_params"],
-                "network_config": actor["network_config"],
-                "env_name": env_name,
-                "state_dim": state_dim,
-                "action_dim": action_dim,
-                "max_action": max_action,
-            },
-            f,
-        )
+    obs_key = DEFAULT_NETWORK_CONFIG["policy_obs_key"]
+    norm_mean = norm_state.mean
+    norm_std = norm_state.std
+    obs_mean = norm_mean[obs_key] if isinstance(norm_mean, Mapping) else norm_mean
+    obs_std = norm_std[obs_key] if isinstance(norm_std, Mapping) else norm_std
+
+    portable = PortableActor(
+        layers=layers,
+        activation="swish",
+        output={"type": "split_tanh", "action_dim": action_dim},
+        obs_mean=np.asarray(obs_mean),
+        obs_std=np.asarray(obs_std),
+        obs_norm_eps=0.0,
+        meta={
+            "algo": "PPOExpert",
+            "env_name": env_name,
+            "state_dim": state_dim,
+            "action_dim": action_dim,
+            "max_action": max_action,
+            "obs_key": obs_key,
+        },
+    )
+
+    pickle_path = f"./actor-PPOExpert-{env_name}-{run_id}.pkl"
+    save_actor(pickle_path, portable)
     print(f"Saved actor to: {pickle_path}")
     print(f"File size: {os.path.getsize(pickle_path) / 1024 / 1024:.2f} MB")
 
-    # Verify round-trip
-    with open(pickle_path, "rb") as f:
-        loaded_actor = cloudpickle.load(f)
+    # Verify round-trip against the original JAX actor (array and dict inputs).
+    loaded_actor = load_actor(pickle_path)
 
     test_obs_array = np.random.randn(state_dim).astype(np.float32)
     test_obs_dict = {"state": jnp.array(test_obs_array)}
 
     action_array = actor["get_action"](test_obs_array)
-    action_dict = actor["get_action"](test_obs_dict)
-    loaded_action = loaded_actor["get_action"](test_obs_array)
+    loaded_action = loaded_actor["get_action"](obs=test_obs_array)
+    loaded_action_dict = loaded_actor["get_action"](obs={"state": test_obs_array})
 
-    print(f"Array input  — action shape: {action_array.shape}, range: [{action_array.min():.3f}, {action_array.max():.3f}]")
-    print(f"Dict input   — actions identical to array input: {np.allclose(action_array, action_dict)}")
-    print(f"Loaded actor — actions match original: {np.allclose(action_array, loaded_action)}")
+    print(
+        f"Array input  — action shape: {action_array.shape}, "
+        f"range: [{action_array.min():.3f}, {action_array.max():.3f}]"
+    )
+    print(
+        f"Portable dict input identical to array input: "
+        f"{np.allclose(loaded_action, loaded_action_dict, atol=1e-6)}"
+    )
+    print(
+        f"Loaded actor — actions match original: "
+        f"{np.allclose(action_array, loaded_action, atol=1e-5)}"
+    )
 
 
 if __name__ == "__main__":

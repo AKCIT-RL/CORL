@@ -1,7 +1,6 @@
 import argparse
 import os
 import yaml
-import cloudpickle
 import numpy as np
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
@@ -10,6 +9,13 @@ import jax
 import jax.numpy as jnp
 import flax
 import flax.linen as nn
+
+from portable_actor import (
+    PortableActor,
+    load_actor,
+    ordered_dense_from_flax,
+    save_actor,
+)
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -197,37 +203,42 @@ def main() -> None:
         max_action=max_action,
     )
 
-    # Serialize with cloudpickle so JAX JIT functions are preserved
+    # Extract weights into a pure-NumPy portable actor (no JAX/Flax needed to
+    # load it later). TD3Actor: a single MLP whose Dense layers are hidden +
+    # output, ReLU after every layer except the last, then ``max_action*tanh``.
+    mlp_params = actor["actor_params"]["params"]["MLP_0"]
+    layers = ordered_dense_from_flax(mlp_params, "Dense")
+    portable = PortableActor(
+        layers=layers,
+        activation="relu",
+        output={"type": "tanh_scaled", "max_action": max_action},
+        obs_mean=actor["obs_mean"],
+        obs_std=actor["obs_std"],
+        obs_norm_eps=1e-5,
+        meta={
+            "algo": "TD3BC",
+            "env_name": env_name,
+            "state_dim": state_dim,
+            "action_dim": action_dim,
+            "max_action": max_action,
+        },
+    )
+
     run_id = Path(checkpoint_path).name.split("-")[-1]
     pickle_path = f"./actor-TD3BC-{env_name}-{run_id}.pkl"
-
-    with open(pickle_path, "wb") as f:
-        cloudpickle.dump(
-            {
-                "actor_fn": actor["actor_fn"],
-                "get_action": actor["get_action"],
-                "obs_mean": actor["obs_mean"],
-                "obs_std": actor["obs_std"],
-                "env_name": env_name,
-                "state_dim": state_dim,
-                "action_dim": action_dim,
-                "max_action": max_action,
-            },
-            f,
-        )
+    save_actor(pickle_path, portable)
     print(f"Saved actor to: {pickle_path}")
 
-    # Verify round-trip
-    with open(pickle_path, "rb") as f:
-        loaded_actor = cloudpickle.load(f)
+    # Verify round-trip against the original JAX actor.
+    loaded_actor = load_actor(pickle_path)
 
     test_obs = np.random.randn(1, state_dim).astype(np.float32)
     original_action = actor["get_action"](test_obs)
-    loaded_action = loaded_actor["get_action"](test_obs)
+    loaded_action = loaded_actor["get_action"](obs=test_obs)
 
     print("Original action:", original_action)
     print("Loaded action:  ", loaded_action)
-    print(f"Actions match: {np.allclose(original_action, loaded_action)}")
+    print(f"Actions match: {np.allclose(original_action, loaded_action, atol=1e-5)}")
 
 
 if __name__ == "__main__":
