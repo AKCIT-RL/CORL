@@ -21,6 +21,9 @@ dependencies = [
     "mujoco==3.6.0",
     "mujoco-mjx==3.6.0",
     "warp-lang==1.11.0",
+    # numpy 2.5 made npt.NDArray a non-subclassable TypeAliasType, which breaks
+    # mediapy's `class _VideoArray(npt.NDArray)`. Cap below 2.5 until mediapy fixes it.
+    "numpy<2.5",
 ]
 
 [tool.uv]
