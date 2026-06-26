@@ -346,6 +346,15 @@ def main(argv):
   def progress(num_steps, metrics):
     times.append(time.monotonic())
 
+    # Derive arrival / truncation rates for goal-reaching tasks (e.g.
+    # Go2GetupWalk), where the episode terminates only on success ("arrived")
+    # or on timeout. The "arrived" metric is monotonic 0->1 within an episode,
+    # so its episodic mean is the arrival rate; the rest are truncated.
+    if "eval/episode_arrived" in metrics:
+      arrival_rate = float(metrics["eval/episode_arrived"])
+      metrics["eval/arrival_rate"] = arrival_rate
+      metrics["eval/truncation_rate"] = 1.0 - arrival_rate
+
     # Log to Weights & Biases
     if _USE_WANDB.value and not _PLAY_ONLY.value:
       wandb.log(metrics, step=num_steps)
@@ -356,7 +365,15 @@ def main(argv):
         writer.add_scalar(key, value, num_steps)
       writer.flush()
 
-    print(f"{num_steps}: reward={metrics['eval/episode_reward']:.3f}")
+    if "eval/arrival_rate" in metrics:
+      print(
+          f"{num_steps}: reward={metrics['eval/episode_reward']:.3f} "
+          f"arrival_rate={metrics['eval/arrival_rate']:.3f} "
+          f"truncation_rate={metrics['eval/truncation_rate']:.3f}"
+      )
+    else:
+      print(f"{num_steps}: reward={metrics['eval/episode_reward']:.3f}")
+
 
   # Load evaluation environment
   eval_env = (
