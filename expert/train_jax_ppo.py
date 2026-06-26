@@ -233,7 +233,11 @@ def main(argv):
 
   # Initialize Weights & Biases if required
   if _USE_WANDB.value and not _PLAY_ONLY.value:
-    wandb.init(project="mjxrl", name=exp_name)
+    wandb.init(
+        entity="akcit-offlinerl",
+        project="Experts-Offline-Benchmark",
+        name=exp_name,
+    )
     wandb.config.update(env_cfg.to_dict())
     wandb.config.update({"env_name": _ENV_NAME.value})
 
@@ -315,6 +319,16 @@ def main(argv):
   if "num_eval_envs" in training_params:
     del training_params["num_eval_envs"]
 
+  # Select the environment wrapper. The terrain-curriculum env needs a custom
+  # auto-reset that repositions each agent onto a new difficulty tile between
+  # episodes (the standard brax auto-reset cannot do score-based respawning).
+  if _ENV_NAME.value == "Go2RoughCurriculum":
+    from mujoco_playground._src.locomotion.go2 import rough_curriculum
+
+    wrap_env_fn = rough_curriculum.wrap_for_curriculum_training
+  else:
+    wrap_env_fn = wrapper.wrap_for_brax_training
+
   train_fn = functools.partial(
       ppo.train,
       **training_params,
@@ -322,7 +336,7 @@ def main(argv):
       policy_params_fn=policy_params_fn,
       seed=_SEED.value,
       restore_checkpoint_path=restore_checkpoint_path,
-      wrap_env_fn=None if _VISION.value else wrapper.wrap_for_brax_training,
+      wrap_env_fn=None if _VISION.value else wrap_env_fn,
       num_eval_envs=num_eval_envs,
   )
 
