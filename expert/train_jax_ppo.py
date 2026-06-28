@@ -50,11 +50,20 @@ xla_flags += " --xla_gpu_triton_gemm_any=True"
 os.environ["XLA_FLAGS"] = xla_flags
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["MUJOCO_GL"] = "egl"
+os.environ["PYOPENGL_PLATFORM"] = "egl"
 
 # Ignore the info logs from brax
 logging.set_verbosity(logging.WARNING)
 
 # Suppress warnings
+
+# Silencia os avisos do GLFW emitidos quando não há DISPLAY (ambiente headless).
+try:
+  from glfw import GLFWError
+
+  warnings.filterwarnings("ignore", category=GLFWError)
+except Exception:
+  pass
 
 # Suppress RuntimeWarnings from JAX
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="jax")
@@ -233,7 +242,11 @@ def main(argv):
 
   # Initialize Weights & Biases if required
   if _USE_WANDB.value and not _PLAY_ONLY.value:
-    wandb.init(project="mjxrl", name=exp_name)
+    wandb.init(
+        entity="akcit-offlinerl",
+        project="Experts-Offline-Benchmark",
+        name=exp_name,
+    )
     wandb.config.update(env_cfg.to_dict())
     wandb.config.update({"env_name": _ENV_NAME.value})
 
@@ -417,10 +430,11 @@ def main(argv):
   scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = False
 
   frames = eval_env.render(
-      traj, height=480, width=640, scene_option=scene_option
+      traj, camera="track", height=480, width=640, scene_option=scene_option
   )
-  media.write_video("rollout.mp4", frames, fps=fps)
-  print("Rollout video saved as 'rollout.mp4'.")
+  video_path = logdir / "rollout.mp4"
+  media.write_video(video_path, frames, fps=fps)
+  print(f"Rollout video saved as '{video_path}'.")
 
 
 if __name__ == "__main__":
