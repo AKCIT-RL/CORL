@@ -68,6 +68,19 @@ def save_video(
     gl_context = mujoco.egl.GLContext(1024, 1024)
     gl_context.make_current()
 
+    # Cenas de terreno irregular (ex.: Go2 rough) não definem nenhuma <light>
+    # nem <headlight> no XML e usam uma textura de rocha escura — o vídeo fica
+    # quase preto. Quando a cena não tem luzes, reforça a headlight e clareia a
+    # textura do terreno diretamente no modelo compilado.
+    if env.mj_model.nlight == 0:
+        import numpy as np
+        env.mj_model.vis.headlight.ambient[:] = [0.4, 0.4, 0.4]
+        env.mj_model.vis.headlight.diffuse[:] = [0.8, 0.8, 0.8]
+        env.mj_model.vis.headlight.specular[:] = [1.0, 1.0, 1.0]
+        env.mj_model.tex_data[:] = np.clip(
+            env.mj_model.tex_data.astype(np.float32) * 2.0, 0, 255
+        ).astype(np.uint8)
+
     # Render
     scene_option = mujoco.MjvOption()
     # Visual mesh geoms (group 2) are stripped at compile time; collision capsules

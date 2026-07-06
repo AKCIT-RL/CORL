@@ -97,8 +97,13 @@ def main():
     parser.add_argument("--env", type=str, default=None,
                         help="Nome do ambiente. Padrão: inferido do nome do run.")
     parser.add_argument("--episodes", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Semente do gerador de números aleatórios do rollout.")
     parser.add_argument("--out", type=str, default=None,
                         help="Caminho do vídeo de saída. Padrão: <run>/rollout.mp4")
+    parser.add_argument("--impl", type=str, default=None,
+                        help="Override do backend do MJX (ex.: 'jax' para rodar em CPU, "
+                             "'warp' para GPU). Padrão: usa o do config do ambiente.")
     args = parser.parse_args()
 
     run_dir = Path(args.run).resolve() if args.run else find_latest_run(LOGS_DIR)
@@ -110,7 +115,12 @@ def main():
     print(f"Env:        {env_name}")
     print(f"Checkpoint: {restore_checkpoint_path}")
 
-    env = registry.load(env_name)
+    config_overrides = {"impl": args.impl} if args.impl else None
+
+    def load_env():
+        return registry.load(env_name, config_overrides=config_overrides)
+
+    env = load_env()
     randomizer = registry.get_domain_randomizer(env_name)
 
     try:
@@ -136,8 +146,8 @@ def main():
     )
 
     make_inference_fn, params, _ = train_fn(
-        environment=registry.load(env_name),
-        eval_env=registry.load(env_name),
+        environment=load_env(),
+        eval_env=load_env(),
         wrap_env_fn=wrapper.wrap_for_brax_training,
         restore_checkpoint_path=restore_checkpoint_path,
         seed=1,
@@ -145,7 +155,7 @@ def main():
 
     jit_inference_fn = jax.jit(make_inference_fn(params, deterministic=True))
 
-    episode_rewards, rollout = eval_expert(env, args.episodes, jit_inference_fn)
+    episode_rewards, rollout = eval_expert(env, args.episodes, jit_inference_fn, seed=args.seed)
     print(f"Reward médio: {episode_rewards.mean():.2f} +/- {episode_rewards.std():.2f}")
 
     render_every = 2
@@ -154,6 +164,18 @@ def main():
 
     gl_context = mujoco.egl.GLContext(1024, 1024)
     gl_context.make_current()
+
+    # Cenas de terreno irregular (ex.: Go2 rough) não definem nenhuma <light>
+    # nem <headlight> no XML e usam uma textura de rocha escura — o vídeo fica
+    # quase preto. Quando a cena não tem luzes, reforça a headlight e clareia a
+    # textura do terreno diretamente no modelo compilado.
+    if env.mj_model.nlight == 0:
+        env.mj_model.vis.headlight.ambient[:] = [0.4, 0.4, 0.4]
+        env.mj_model.vis.headlight.diffuse[:] = [0.8, 0.8, 0.8]
+        env.mj_model.vis.headlight.specular[:] = [1.0, 1.0, 1.0]
+        env.mj_model.tex_data[:] = np.clip(
+            env.mj_model.tex_data.astype(np.float32) * 2.0, 0, 255
+        ).astype(np.uint8)
 
     scene_option = mujoco.MjvOption()
     scene_option.geomgroup[2] = True
