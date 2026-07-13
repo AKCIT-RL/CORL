@@ -1,0 +1,32 @@
+# Decision Transformer (dt_jax) shared hyperparameters.
+# Dataset-specific fields (env_name, dataset_id, command_type, group,
+# target_returns) are injected per run from configs/offline/_datasets.yaml
+# by the runner script (target_returns comes from dt_target_returns).
+project: Offline-Benchmark
+name: DT
+checkpoints_path: checkpoints/DT
+device: cuda
+train_seed: 10
+eval_seed: 42
+deterministic_torch: false
+
+attention_dropout: 0.1
+batch_size: 512
+betas: [0.9, 0.999]
+clip_grad: 0.25
+embedding_dim: 128
+embedding_dropout: 0.1
+episode_len: 1000
+eval_episodes: 10
+eval_every: 5000
+learning_rate: 0.0008
+max_action: 1.0
+num_heads: 1
+num_layers: 3
+num_workers: 4
+residual_dropout: 0.1
+reward_scale: 1.0
+seq_len: 20
+update_steps: 100000
+warmup_steps: 10000
+weight_decay: 0.0001

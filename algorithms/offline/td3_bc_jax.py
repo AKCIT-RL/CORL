@@ -410,11 +410,12 @@ def evaluate(
         episode_returns.append(episode_return)
     
     mean_return = np.mean(episode_returns)
-    # Use normalized score if available (D4RL), otherwise return raw score
+    # Compute normalized score if available (D4RL), otherwise fall back to raw
     if hasattr(env, 'get_normalized_score'):
-        return env.get_normalized_score(mean_return) * 100
+        normalized_score = env.get_normalized_score(mean_return) * 100
     else:
-        return mean_return
+        normalized_score = mean_return
+    return normalized_score, mean_return
 
 
 def get_actor_from_checkpoint(
@@ -556,14 +557,17 @@ def train(config: TD3BCConfig):
 
         if i % eval_interval == 0:
             policy_fn = partial(act_fn, train_state=train_state)
-            normalized_score = evaluate(
+            normalized_score, raw_score = evaluate(
                 policy_fn,
                 env,
                 num_episodes=config.n_episodes,
                 obs_mean=obs_mean,
                 obs_std=obs_std,
             )
-            eval_metrics = {f"eval/score": normalized_score}
+            eval_metrics = {
+                "eval/score": normalized_score,
+                "eval/raw_score": raw_score,
+            }
             wandb.log(eval_metrics, step=i)
 
             if config.checkpoints_path is not None:
@@ -582,7 +586,7 @@ def train(config: TD3BCConfig):
 
     # final evaluation
     policy_fn = partial(act_fn, train_state=train_state)
-    normalized_score = evaluate(
+    normalized_score, raw_score = evaluate(
         policy_fn,
         env,
         num_episodes=config.n_episodes,
@@ -590,7 +594,10 @@ def train(config: TD3BCConfig):
         obs_std=obs_std,
     )
     print("Final Evaluation Score:", normalized_score)
-    wandb.log({f"eval/final_score": normalized_score})
+    wandb.log({
+        "eval/final_score": normalized_score,
+        "eval/final_raw_score": raw_score,
+    })
 
     # Save final checkpoint
     if config.checkpoints_path is not None:

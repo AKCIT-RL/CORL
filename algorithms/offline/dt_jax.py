@@ -733,11 +733,12 @@ def evaluate(
             if done or truncated:
                 break
     mean_reward = total_reward / config.eval_episodes
-    # Use normalized score if available, otherwise return raw score
+    # Compute normalized score if available, otherwise fall back to raw
     if hasattr(env, 'get_normalized_score'):
-        return env.get_normalized_score(mean_reward) * 100
+        normalized_score = env.get_normalized_score(mean_reward) * 100
     else:
-        return mean_reward
+        normalized_score = mean_reward
+    return normalized_score, mean_reward
 
 
 @pyrallis.wrap()
@@ -786,11 +787,14 @@ def train(config: DTConfig):
         if i % config.eval_every == 0:
             # evaluate on env for each target return
             for target_return in config.target_returns:
-                score = evaluate(
+                score, raw_score = evaluate(
                     algo.get_action, train_state, env, config, target_return, state_mean, state_std
                 )
                 wandb.log(
-                    {f"eval/{target_return}_score": score},
+                    {
+                        f"eval/{target_return}_score": score,
+                        f"eval/{target_return}_raw_score": raw_score,
+                    },
                     step=i,
                 )
                 print(f"Step {i}, Target Return {target_return}: {score}")
@@ -808,10 +812,13 @@ def train(config: DTConfig):
 
     # final evaluation
     for target_return in config.target_returns:
-        score = evaluate(
+        score, raw_score = evaluate(
             algo.get_action, train_state, env, config, target_return, state_mean, state_std
         )
-        wandb.log({f"eval/{target_return}_final_score": score})
+        wandb.log({
+            f"eval/{target_return}_final_score": score,
+            f"eval/{target_return}_final_raw_score": raw_score,
+        })
         print(f"Final Score for Target Return {target_return}: {score}")
 
     # Save final checkpoint

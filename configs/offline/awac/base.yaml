@@ -1,0 +1,19 @@
+# AWAC (awac_jax) shared hyperparameters.
+# Dataset-specific fields (env, dataset_id, command_type, group) are injected
+# per run from configs/offline/_datasets.yaml by the runner script.
+project: Offline-Benchmark
+checkpoints_path: checkpoints/AWAC
+device: cuda
+seed: 42
+test_seed: 69
+
+awac_lambda: 0.1
+batch_size: 256
+buffer_size: 10000000
+gamma: 0.99
+hidden_dim: 256
+learning_rate: 0.0003
+n_test_episodes: 10
+num_train_ops: 1000000
+eval_frequency: 5000
+tau: 0.005

@@ -463,7 +463,14 @@ def evaluate(
             observation, reward, done, truncated, info = env.step(np.array(action))
             episode_return += reward
         episode_returns.append(episode_return)
-    return np.mean(episode_returns)
+
+    mean_return = np.mean(episode_returns)
+    # Compute normalized score if available (D4RL), otherwise fall back to raw
+    if hasattr(env, 'get_normalized_score'):
+        normalized_score = env.get_normalized_score(mean_return) * 100
+    else:
+        normalized_score = mean_return
+    return normalized_score, mean_return
 
 
 def get_actor_from_checkpoint(
@@ -630,15 +637,18 @@ def train(config: IQLConfig):
                 seed=jax.random.PRNGKey(0),
                 train_state=train_state,
             )
-            eval_score = evaluate(
+            normalized_score, raw_score = evaluate(
                 policy_fn,
                 env,
                 num_episodes=config.n_episodes,
                 obs_mean=obs_mean,
                 obs_std=obs_std,
             )
-            print(f"Step: {current_step}, Eval Score: {eval_score}")
-            eval_metrics = {f"{config.env}/eval_score": eval_score}
+            print(f"Step: {current_step}, Eval Score: {normalized_score}")
+            eval_metrics = {
+                "eval/score": normalized_score,
+                "eval/raw_score": raw_score,
+            }
             wandb.log(eval_metrics, step=current_step)
 
             # Save checkpoint
@@ -663,15 +673,18 @@ def train(config: IQLConfig):
         seed=jax.random.PRNGKey(0),
         train_state=train_state,
     )
-    final_score = evaluate(
+    normalized_score, raw_score = evaluate(
         policy_fn,
         env,
         num_episodes=config.n_episodes,
         obs_mean=obs_mean,
         obs_std=obs_std,
     )
-    print("Final Evaluation", final_score)
-    wandb.log({f"{config.env}/final_eval_score": final_score})
+    print("Final Evaluation Score:", normalized_score)
+    wandb.log({
+        "eval/final_score": normalized_score,
+        "eval/final_raw_score": raw_score,
+    })
 
     # Save final checkpoint
     if config.checkpoints_path is not None:

@@ -1,0 +1,25 @@
+# IQL (iql_jax) shared hyperparameters.
+# Dataset-specific fields (env, dataset_id, command_type, group) are injected
+# per run from configs/offline/_datasets.yaml by the runner script.
+project: Offline-Benchmark
+name: IQL
+checkpoints_path: checkpoints/IQL
+device: cuda
+seed: 0
+
+actor_lr: 3e-4
+qf_lr: 3e-4
+vf_lr: 3e-4
+batch_size: 256
+beta: 3.0
+buffer_size: 10000000
+discount: 0.99
+eval_freq: 5000
+iql_deterministic: false
+iql_tau: 0.7
+max_timesteps: 1000000
+n_episodes: 10
+normalize: true
+normalize_reward: false
+tau: 0.005
+load_model: ''

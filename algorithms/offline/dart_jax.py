@@ -542,11 +542,12 @@ def evaluate(
         episode_returns.append(episode_return)
     
     mean_return = np.mean(episode_returns)
-    # Use normalized score if available (D4RL), otherwise return raw score
+    # Compute normalized score if available (D4RL), otherwise fall back to raw
     if hasattr(env, 'get_normalized_score'):
-        return env.get_normalized_score(mean_return) * 100 # type: ignore
+        normalized_score = env.get_normalized_score(mean_return) * 100 # type: ignore
     else:
-        return mean_return.item()
+        normalized_score = mean_return.item()
+    return normalized_score, mean_return.item()
 
 def training_loop(
     config: DARTConfig,
@@ -577,7 +578,7 @@ def training_loop(
 
         if i % eval_interval == 0:
             policy_fn = partial(act_fn, train_state)
-            normalized_score = evaluate(
+            normalized_score, raw_score = evaluate(
                 policy_fn,
                 env,
                 num_episodes=config.n_episodes,
@@ -585,7 +586,10 @@ def training_loop(
                 obs_std=obs_std,
                 record_video=config.video_dir is not None,
             )
-            eval_metrics = {f"eval/score": normalized_score}
+            eval_metrics = {
+                "eval/score": normalized_score,
+                "eval/raw_score": raw_score,
+            }
             wandb.log(eval_metrics, step=index + i)
 
             if config.video_dir is not None and config.n_episodes > 0:
@@ -886,7 +890,7 @@ def train(config: DARTConfig):
 
     # final evaluation
     policy_fn = partial(act_fn, train_state)
-    normalized_score = evaluate(
+    normalized_score, raw_score = evaluate(
         policy_fn,
         env,
         num_episodes=config.n_episodes,
@@ -895,7 +899,10 @@ def train(config: DARTConfig):
         record_video=config.video_dir is not None,
     )
     print("Final Evaluation Score:", normalized_score)
-    wandb.log({f"eval/final_score": normalized_score})
+    wandb.log({
+        "eval/final_score": normalized_score,
+        "eval/final_raw_score": raw_score,
+    })
 
     # Save final video
     if config.video_dir is not None and config.n_episodes > 0:

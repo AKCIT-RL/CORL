@@ -1,0 +1,53 @@
+# Dataset registry for the offline benchmark (datasets/playground).
+#
+# One entry per task_id (the folder name under datasets/playground). These
+# fields are shared across ALL algorithms and ALL difficulties, so they live
+# here once instead of being duplicated in every per-run config.
+#
+#   env                gym / mujoco_playground env id used for evaluation
+#   command_type       command override for joystick envs (null = none)
+#   dt_target_returns  Decision Transformer eval targets [high, lower],
+#                      derived from the expert dataset return (~[peak, 0.95*peak])
+#
+# The dataset_id passed to minari is:  playground/<task_id>/<difficulty>-v0
+# (env and command_type are also stored in each dataset's metadata.json).
+
+difficulties: [expert, medium, medium-expert, medium-replay]
+
+tasks:
+  go2-getup:
+    env: Go2Getup
+    command_type: null
+    dt_target_returns: [18, 17]
+  go2-getup-walk:
+    env: Go2GetupWalk
+    command_type: null
+    dt_target_returns: [98, 93]
+  go2-footstand:
+    env: Go2Footstand
+    command_type: null
+    dt_target_returns: [20, 19]
+  go2-handstand:
+    env: Go2Handstand
+    command_type: null
+    dt_target_returns: [20, 19]
+  go2-push-recovery:
+    env: Go2PushRecovery
+    command_type: null
+    dt_target_returns: [21, 20]
+  go2-joystick-direction:
+    env: Go2JoystickFlatTerrain
+    command_type: null
+    dt_target_returns: [31, 29]
+  go2-flat-forward:
+    env: Go2JoystickFlatTerrain
+    command_type: forwardfixed
+    dt_target_returns: [31, 29]
+  g1-joystick-direction:
+    env: G1JoystickFlatTerrain
+    command_type: null
+    dt_target_returns: [35, 33]
+  h1-gait-tracking:
+    env: H1JoystickGaitTracking
+    command_type: forwardfixed
+    dt_target_returns: [134, 127]
