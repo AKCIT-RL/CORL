@@ -5,6 +5,7 @@ from mujoco_playground import wrapper_torch, wrapper
 from mujoco_playground import registry
 import gymnasium as gym
 import numpy as np
+import os
 import jax
 import jax.numpy as jp
 import torch
@@ -26,6 +27,7 @@ def get_env(
     command_type=None,
     randomize: bool = False,
     num_actors: int = 1,
+    dataset=None,
 ):
     env = registry.load(env_name)
     env_cfg = registry.get_default_config(env_name)
@@ -43,6 +45,7 @@ def get_env(
         command_type=command_type,
         render_callback=render_callback,
         randomization_fn=randomization_fn,
+        dataset=dataset,
     )
 
     return env
@@ -60,6 +63,7 @@ class GymWrapper(gym.Env):
         render_callback=None,
         randomization_fn=None,
         randomize_every_episode: bool = True,
+        dataset=None,
     ):
         super().__init__()
         self.command_type = command_type
@@ -69,6 +73,21 @@ class GymWrapper(gym.Env):
         self.render_callback = render_callback
         self.episode_length = env_cfg.episode_length
         self._randomize_every_episode = randomize_every_episode
+
+        # D4RL-style normalization reference scores, read from the Minari
+        # dataset metadata written at collection time (return_min = weakest
+        # checkpoint return, return_expert = expert peak). Kept as None when no
+        # dataset is provided so get_normalized_score falls back to raw returns.
+        self.ref_min_score = None
+        self.ref_max_score = None
+        if dataset is not None:
+            metadata = getattr(dataset.storage, "metadata", None) or {}
+            self.ref_min_score = metadata.get(
+                "return_min", metadata.get("ref_min_score")
+            )
+            self.ref_max_score = metadata.get(
+                "return_expert", metadata.get("ref_max_score")
+            )
 
         # Handle both dict-based and int-based observation_size
         obs_size = self.env.observation_size
@@ -182,6 +201,15 @@ class GymWrapper(gym.Env):
 
         return env_state.replace(obs=obs, info=info)
 
+    def reset_rng(self, seed: int = 0):
+        """Reseed the internal RNG so evaluation rollouts are reproducible.
+
+        Calling this at the start of an evaluation makes every eval use the same
+        sequence of reset states, so scores are comparable across checkpoints
+        and the final evaluation matches the intermediate ones for a fixed policy.
+        """
+        self.rng = jax.random.PRNGKey(seed)
+
     def reset(self, *, seed=None, options=None):
         self.rng, reset_rng = jax.random.split(self.rng)
         reset_keys = jax.random.split(reset_rng, self.num_envs)
@@ -230,6 +258,22 @@ class GymWrapper(gym.Env):
         info = self._tree_to_numpy(self.env_state.info)
         return obs, rew, done, truncated, info
 
+    def get_normalized_score(self, score):
+        """D4RL-style normalized score, where ~1.0 corresponds to the expert.
+
+            (score - ref_min) / (ref_max - ref_min)
+
+        Returns None when reference scores are unavailable (no dataset was
+        passed) so callers can fall back to the raw return.
+        """
+        if (
+            self.ref_min_score is None
+            or self.ref_max_score is None
+            or self.ref_max_score <= self.ref_min_score
+        ):
+            return None
+        return (score - self.ref_min_score) / (self.ref_max_score - self.ref_min_score)
+
     def render(self):  # pylint: disable=unused-argument
         if self.render_callback is not None:
             self.render_callback(self.env, self.env_state)
@@ -269,3 +313,70 @@ class GymWrapper(gym.Env):
         )
         if save_path is not None:
             media.write_video(save_path, frames, fps=fps)
+
+
+def record_policy_video(
+    env_name: str,
+    act,
+    obs_mean,
+    obs_std,
+    device: str,
+    save_path: str,
+    command_type=None,
+    seed: int = 1,
+):
+    """Roll out a policy for a single episode and save an mp4 of the rollout.
+
+    Args:
+        env_name: mujoco_playground env id (same value used for evaluation).
+        act: callable mapping a normalized observation (np.ndarray) to an action.
+        obs_mean, obs_std: observation normalization stats used during training.
+        device: jax device string (e.g. "cuda:0").
+        save_path: destination path for the .mp4 file.
+        command_type: optional command override for joystick envs.
+        seed: env reset seed.
+
+    Returns:
+        The (raw) episode return obtained during the recorded rollout.
+    """
+    # Headless rendering backend (matches algorithms/utils/save_video.py).
+    os.environ.setdefault("MUJOCO_GL", "egl")
+
+    render_trajectory = []
+
+    def render_callback(_, state):
+        render_trajectory.append(state)
+
+    env = get_env(
+        env_name,
+        device,
+        render_callback=render_callback,
+        command_type=command_type,
+    )
+
+    observation, _ = env.reset()
+    done = truncated = False
+    episode_return = 0.0
+    while not done and not truncated:
+        obs_n = (observation - obs_mean) / (obs_std + 1e-5)
+        action = np.asarray(act(obs_n))
+        observation, reward, done, truncated, _ = env.step(action)
+        env.render()
+        episode_return += float(np.asarray(reward).reshape(-1)[0])
+        done = bool(np.asarray(done).reshape(-1)[0])
+        truncated = bool(np.asarray(truncated).reshape(-1)[0])
+
+    # Establish a headless GL context before rendering (mirrors save_video.py).
+    try:
+        import mujoco.egl
+
+        gl_context = mujoco.egl.GLContext(1024, 1024)
+        gl_context.make_current()
+    except Exception as e:  # pragma: no cover - depends on GPU/driver
+        print(f"[record_policy_video] could not create EGL context: {e}")
+
+    save_dir = os.path.dirname(os.path.abspath(save_path))
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    env.save_video(render_trajectory, save_path=save_path)
+    return episode_return

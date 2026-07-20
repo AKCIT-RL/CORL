@@ -22,7 +22,7 @@ import wandb
 import yaml
 from flax.training.train_state import TrainState
 
-from algorithms.utils.wrapper_gym import get_env
+from algorithms.utils.wrapper_gym import get_env, record_policy_video
 from algorithms.utils.dataset import qlearning_dataset
 
 os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True"
@@ -67,8 +67,14 @@ class IQLConfig:
     eval_freq: int = int(5e3)
     # number of episodes to run during evaluation
     n_episodes: int = 10
+    # number of episodes for the final evaluation (larger -> lower variance)
+    n_eval_episodes_final: int = 50
+    # fixed seed for evaluation rollouts (reproducible / comparable)
+    eval_seed: int = 0
     # path for checkpoints saving, optional
     checkpoints_path: Optional[str] = None
+    # save an intermediate checkpoint every N evaluations (final always saved)
+    checkpoints_every: int = 10
     # file name for loading a model, optional
     load_model: str = ""
     # training random seed
@@ -450,8 +456,9 @@ def create_iql_train_state(
 
 
 def evaluate(
-    policy_fn, env: gym.Env, num_episodes: int, obs_mean: float, obs_std: float
+    policy_fn, env: gym.Env, num_episodes: int, obs_mean: float, obs_std: float, seed: int = 0
 ) -> float:
+    env.reset_rng(seed)
     episode_returns = []
     for _ in range(num_episodes):
         episode_return = 0
@@ -465,11 +472,10 @@ def evaluate(
         episode_returns.append(episode_return)
 
     mean_return = np.mean(episode_returns)
-    # Compute normalized score if available (D4RL), otherwise fall back to raw
-    if hasattr(env, 'get_normalized_score'):
-        normalized_score = env.get_normalized_score(mean_return) * 100
-    else:
-        normalized_score = mean_return
+    # Normalize using the env's D4RL-style reference scores (loaded from the
+    # dataset metadata). Falls back to the raw return when refs are absent.
+    normalized = env.get_normalized_score(mean_return)
+    normalized_score = normalized * 100 if normalized is not None else mean_return
     return normalized_score, mean_return
 
 
@@ -603,7 +609,8 @@ def train(config: IQLConfig):
             pyrallis.dump(config, f)
 
     rng = jax.random.PRNGKey(config.seed)
-    env = get_env(config.env, config.device, command_type=config.command_type)
+    minari_dataset = minari.load_dataset(config.dataset_id)
+    env = get_env(config.env, config.device, command_type=config.command_type, dataset=minari_dataset)
     dataset, obs_mean, obs_std = get_dataset(config)
     
     # create train_state
@@ -643,6 +650,7 @@ def train(config: IQLConfig):
                 num_episodes=config.n_episodes,
                 obs_mean=obs_mean,
                 obs_std=obs_std,
+                seed=config.eval_seed,
             )
             print(f"Step: {current_step}, Eval Score: {normalized_score}")
             eval_metrics = {
@@ -652,7 +660,7 @@ def train(config: IQLConfig):
             wandb.log(eval_metrics, step=current_step)
 
             # Save checkpoint
-            if config.checkpoints_path is not None:
+            if config.checkpoints_path is not None and (i // eval_interval) % config.checkpoints_every == 0:
                 checkpoint = {
                     "actor_params": flax.serialization.to_state_dict(train_state.actor.params),
                     "critic_params": flax.serialization.to_state_dict(train_state.critic.params),
@@ -676,9 +684,10 @@ def train(config: IQLConfig):
     normalized_score, raw_score = evaluate(
         policy_fn,
         env,
-        num_episodes=config.n_episodes,
+        num_episodes=config.n_eval_episodes_final,
         obs_mean=obs_mean,
         obs_std=obs_std,
+        seed=config.eval_seed,
     )
     print("Final Evaluation Score:", normalized_score)
     wandb.log({
@@ -700,6 +709,24 @@ def train(config: IQLConfig):
         checkpoint_path = os.path.join(config.checkpoints_path, "checkpoint_final.npz")
         np.savez(checkpoint_path, **checkpoint)
         print(f"Saved final checkpoint to {checkpoint_path}")
+
+    # Record a rollout video of the final policy
+    try:
+        video_dir = config.checkpoints_path if config.checkpoints_path is not None else "videos"
+        video_path = os.path.join(video_dir, f"{config.name}.mp4")
+        record_policy_video(
+            env_name=config.env,
+            act=lambda o: policy_fn(observations=o),
+            obs_mean=obs_mean,
+            obs_std=obs_std,
+            device=config.device,
+            save_path=video_path,
+            command_type=config.command_type,
+        )
+        wandb.log({"eval/video": wandb.Video(video_path)})
+        print(f"Saved rollout video to {video_path}")
+    except Exception as e:
+        print(f"[video] failed to record rollout video: {e}")
 
     wandb.finish()
 

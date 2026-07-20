@@ -525,7 +525,7 @@ def evaluate(
     obs_mean,
     obs_std,
     record_video: bool = False,
-) -> float:  # D4RL specific
+) -> float:
     episode_returns = []
     for episode in range(num_episodes):
         render_trajectory.clear()  # Clear previous trajectory
@@ -542,11 +542,10 @@ def evaluate(
         episode_returns.append(episode_return)
     
     mean_return = np.mean(episode_returns)
-    # Compute normalized score if available (D4RL), otherwise fall back to raw
-    if hasattr(env, 'get_normalized_score'):
-        normalized_score = env.get_normalized_score(mean_return) * 100 # type: ignore
-    else:
-        normalized_score = mean_return.item()
+    # Normalize using the env's D4RL-style reference scores (loaded from the
+    # dataset metadata). Falls back to the raw return when refs are absent.
+    normalized = env.get_normalized_score(mean_return)
+    normalized_score = normalized * 100 if normalized is not None else mean_return.item()
     return normalized_score, mean_return.item()
 
 def training_loop(
@@ -796,11 +795,13 @@ def train(config: DARTConfig):
 
     minari_dataset = minari.load_dataset(config.dataset_id)
     dataset = qlearning_dataset(minari_dataset)
+
     env = get_env(
         config.env,
         config.device,
         command_type=config.command_type,
-        render_callback=render_callback
+        render_callback=render_callback,
+        dataset=minari_dataset,
     )
     collect_env = get_env(
         config.env,

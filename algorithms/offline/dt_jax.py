@@ -80,10 +80,16 @@ class DTConfig:
     target_returns: Tuple[float, ...] = (12000.0, 6000.0)
     # number of episodes to run during evaluation
     eval_episodes: int = 10
+    # number of episodes for the final evaluation (larger -> lower variance)
+    n_eval_episodes_final: int = 50
+    # fixed seed for evaluation rollouts (reproducible / comparable)
+    eval_seed: int = 0
     # evaluation frequency, will evaluate eval_every training steps
     eval_every: int = 10_000
     # path for checkpoints saving, optional
     checkpoints_path: Optional[str] = None
+    # save an intermediate checkpoint every N evaluations (final always saved)
+    checkpoints_every: int = 10
     # training random seed
     seed: int = 0
     # training seed (alternative to seed, used in configs)
@@ -668,7 +674,11 @@ def evaluate(
     target_return: float,
     state_mean=0,
     state_std=1,
+    seed: int = 0,
+    num_episodes: Optional[int] = None,
 ) -> float:
+    env.reset_rng(seed)
+    n_eps = num_episodes if num_episodes is not None else config.eval_episodes
     eval_batch_size = 1  # required for forward pass
     total_reward = 0
     total_timesteps = 0
@@ -681,7 +691,7 @@ def evaluate(
     timesteps = jnp.arange(0, config.episode_len, 1, jnp.int32)
     # repeat
     timesteps = jnp.repeat(timesteps[None, :], eval_batch_size, axis=0)
-    for _ in range(config.eval_episodes):
+    for _ in range(n_eps):
         # zeros place holders
         actions = jnp.zeros(
             (eval_batch_size, config.episode_len, act_dim), dtype=jnp.float32
@@ -732,13 +742,105 @@ def evaluate(
             total_reward += running_reward
             if done or truncated:
                 break
-    mean_reward = total_reward / config.eval_episodes
-    # Compute normalized score if available, otherwise fall back to raw
-    if hasattr(env, 'get_normalized_score'):
-        normalized_score = env.get_normalized_score(mean_reward) * 100
-    else:
-        normalized_score = mean_reward
+    mean_reward = total_reward / n_eps
+    # Normalize using the env's D4RL-style reference scores (loaded from the
+    # dataset metadata). Falls back to the raw return when refs are absent.
+    normalized = env.get_normalized_score(mean_reward)
+    normalized_score = normalized * 100 if normalized is not None else mean_reward
     return normalized_score, mean_reward
+
+
+def record_dt_video(
+    policy_fn: Callable,
+    train_state: DTTrainState,
+    config: DTConfig,
+    target_return: float,
+    save_path: str,
+    state_mean=0,
+    state_std=1,
+):
+    """Roll out the DT policy for a single episode and save an mp4 of it."""
+    # Headless rendering backend (matches algorithms/utils/save_video.py).
+    os.environ.setdefault("MUJOCO_GL", "egl")
+
+    render_trajectory = []
+
+    def render_callback(_, state):
+        render_trajectory.append(state)
+
+    env = get_env(
+        config.env_name,
+        config.device,
+        render_callback=render_callback,
+        command_type=config.command_type,
+    )
+
+    state_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
+    state_mean = (
+        jnp.array(state_mean).reshape(-1)
+        if not isinstance(state_mean, (int, float))
+        else jnp.array([state_mean] * state_dim)
+    )
+    state_std = (
+        jnp.array(state_std).reshape(-1)
+        if not isinstance(state_std, (int, float))
+        else jnp.array([state_std] * state_dim)
+    )
+    timesteps = jnp.arange(0, config.episode_len, 1, jnp.int32)[None, :]
+
+    actions = jnp.zeros((1, config.episode_len, act_dim), dtype=jnp.float32)
+    states = jnp.zeros((1, config.episode_len, state_dim), dtype=jnp.float32)
+    rewards_to_go = jnp.zeros((1, config.episode_len, 1), dtype=jnp.float32)
+
+    running_state, _ = env.reset()
+    running_state = np.array(running_state).flatten()
+    running_reward = 0
+    running_rtg = target_return * config.reward_scale
+    for t in range(config.episode_len):
+        normalized_state = (jnp.array(running_state) - state_mean) / state_std
+        states = states.at[0, t].set(normalized_state)
+        running_rtg = running_rtg - (running_reward * config.reward_scale)
+        rewards_to_go = rewards_to_go.at[0, t].set(running_rtg)
+        if t < config.seq_len:
+            act_preds = policy_fn(
+                train_state,
+                timesteps[:, : t + 1],
+                states[:, : t + 1],
+                actions[:, : t + 1],
+                rewards_to_go[:, : t + 1],
+            )
+        else:
+            act_preds = policy_fn(
+                train_state,
+                timesteps[:, t - config.seq_len + 1 : t + 1],
+                states[:, t - config.seq_len + 1 : t + 1],
+                actions[:, t - config.seq_len + 1 : t + 1],
+                rewards_to_go[:, t - config.seq_len + 1 : t + 1],
+            )
+        act = act_preds[0, -1]
+        running_state, running_reward, done, truncated, _ = env.step(np.array(act))
+        env.render()
+        running_state = np.array(running_state).flatten()
+        actions = actions.at[0, t].set(act)
+        if bool(np.asarray(done).reshape(-1)[0]) or bool(
+            np.asarray(truncated).reshape(-1)[0]
+        ):
+            break
+
+    # Establish a headless GL context before rendering (mirrors save_video.py).
+    try:
+        import mujoco.egl
+
+        gl_context = mujoco.egl.GLContext(1024, 1024)
+        gl_context.make_current()
+    except Exception as e:  # pragma: no cover - depends on GPU/driver
+        print(f"[record_dt_video] could not create EGL context: {e}")
+
+    save_dir = os.path.dirname(os.path.abspath(save_path))
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    env.save_video(render_trajectory, save_path=save_path)
 
 
 @pyrallis.wrap()
@@ -757,7 +859,7 @@ def train(config: DTConfig):
         with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
             pyrallis.dump(config, f)
 
-    env = get_env(config.env_name, config.device, command_type=config.command_type)
+    env = get_env(config.env_name, config.device, command_type=config.command_type, dataset=minari.load_dataset(config.dataset_id))
     rng = jax.random.PRNGKey(config.seed)
     state_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
@@ -788,7 +890,7 @@ def train(config: DTConfig):
             # evaluate on env for each target return
             for target_return in config.target_returns:
                 score, raw_score = evaluate(
-                    algo.get_action, train_state, env, config, target_return, state_mean, state_std
+                    algo.get_action, train_state, env, config, target_return, state_mean, state_std, seed=config.eval_seed
                 )
                 wandb.log(
                     {
@@ -799,7 +901,7 @@ def train(config: DTConfig):
                 )
                 print(f"Step {i}, Target Return {target_return}: {score}")
 
-            if config.checkpoints_path is not None:
+            if config.checkpoints_path is not None and (i // config.eval_every) % config.checkpoints_every == 0:
                 checkpoint = {
                     "transformer_params": flax.serialization.to_state_dict(train_state.transformer.params),
                     "state_mean": np.array(state_mean),
@@ -813,7 +915,8 @@ def train(config: DTConfig):
     # final evaluation
     for target_return in config.target_returns:
         score, raw_score = evaluate(
-            algo.get_action, train_state, env, config, target_return, state_mean, state_std
+            algo.get_action, train_state, env, config, target_return, state_mean, state_std,
+            seed=config.eval_seed, num_episodes=config.n_eval_episodes_final,
         )
         wandb.log({
             f"eval/{target_return}_final_score": score,
@@ -832,6 +935,24 @@ def train(config: DTConfig):
         checkpoint_path = os.path.join(config.checkpoints_path, f"checkpoint_final.npz")
         np.savez(checkpoint_path, **checkpoint)
         print(f"Saved final checkpoint to {checkpoint_path}")
+
+    # Record a rollout video of the final policy (highest target return)
+    try:
+        video_dir = config.checkpoints_path if config.checkpoints_path is not None else "videos"
+        video_path = os.path.join(video_dir, f"{config.name}.mp4")
+        record_dt_video(
+            algo.get_action,
+            train_state,
+            config,
+            config.target_returns[0],
+            video_path,
+            state_mean,
+            state_std,
+        )
+        wandb.log({"eval/video": wandb.Video(video_path)})
+        print(f"Saved rollout video to {video_path}")
+    except Exception as e:
+        print(f"[video] failed to record rollout video: {e}")
 
     wandb.finish()
 

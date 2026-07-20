@@ -23,7 +23,7 @@ from flax.training.train_state import TrainState
 
 import minari
 
-from algorithms.utils.wrapper_gym import get_env
+from algorithms.utils.wrapper_gym import get_env, record_policy_video
 from algorithms.utils.dataset import qlearning_dataset
 
 os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True"
@@ -48,10 +48,16 @@ class CQLConfig:
     eval_freq: int = int(5e3)
     # number of episodes to run during evaluation
     n_episodes: int = 10
+    # number of episodes for the final evaluation (larger -> lower variance)
+    n_eval_episodes_final: int = 50
+    # fixed seed for evaluation rollouts (reproducible / comparable)
+    eval_seed: int = 0
     # total gradient updates during training
     max_timesteps: int = int(1e6)
     # path for checkpoints saving, optional
     checkpoints_path: Optional[str] = None
+    # save an intermediate checkpoint every N evaluations (final always saved)
+    checkpoints_every: int = 10
     # file name for loading a model, optional
     load_model: str = ""
     # maximum size of the replay buffer
@@ -842,7 +848,9 @@ def evaluate(
     num_episodes: int,
     obs_mean=0,
     obs_std=1,
+    seed: int = 0,
 ):
+    env.reset_rng(seed)
     episode_returns = []
     for _ in range(num_episodes):
         obs, _ = env.reset()
@@ -855,11 +863,10 @@ def evaluate(
             total_reward += reward
         episode_returns.append(total_reward)
     mean_return = np.mean(episode_returns)
-    # Compute normalized score if available, otherwise fall back to raw
-    if hasattr(env, 'get_normalized_score'):
-        normalized_score = env.get_normalized_score(mean_return) * 100
-    else:
-        normalized_score = mean_return
+    # Normalize using the env's D4RL-style reference scores (loaded from the
+    # dataset metadata). Falls back to the raw return when refs are absent.
+    normalized = env.get_normalized_score(mean_return)
+    normalized_score = normalized * 100 if normalized is not None else mean_return
     return normalized_score, mean_return
 
 
@@ -883,7 +890,7 @@ def train(config: CQLConfig):
     
     minari_dataset = minari.load_dataset(config.dataset_id)
     qdataset = qlearning_dataset(minari_dataset)
-    env = get_env(config.env, config.device, command_type=config.command_type)
+    env = get_env(config.env, config.device, command_type=config.command_type, dataset=minari_dataset)
     
     action_dim = env.action_space.shape[0]
     config.action_dim = action_dim
@@ -924,7 +931,7 @@ def train(config: CQLConfig):
         if i % eval_interval == 0:
             policy_fn = partial(act_fn, train_state=train_state)
             normalized_score, raw_score = evaluate(
-                policy_fn, env, config.n_episodes, obs_mean=obs_mean, obs_std=obs_std
+                policy_fn, env, config.n_episodes, obs_mean=obs_mean, obs_std=obs_std, seed=config.eval_seed
             )
             eval_metrics = {
                 "eval/score": normalized_score,
@@ -933,7 +940,7 @@ def train(config: CQLConfig):
             wandb.log(eval_metrics, step=i)
             print(f"Step {i}: {normalized_score}")
 
-            if config.checkpoints_path is not None:
+            if config.checkpoints_path is not None and (i // eval_interval) % config.checkpoints_every == 0:
                 checkpoint = {
                     "policy_params": flax.serialization.to_state_dict(train_state.policy.params),
                     "qf1_params": flax.serialization.to_state_dict(train_state.qf1.params),
@@ -951,7 +958,7 @@ def train(config: CQLConfig):
     # final evaluation
     policy_fn = partial(act_fn, train_state=train_state)
     normalized_score, raw_score = evaluate(
-        policy_fn, env, config.n_episodes, obs_mean=obs_mean, obs_std=obs_std
+        policy_fn, env, config.n_eval_episodes_final, obs_mean=obs_mean, obs_std=obs_std, seed=config.eval_seed
     )
     print("Final Evaluation Score:", normalized_score)
     wandb.log({
@@ -974,6 +981,24 @@ def train(config: CQLConfig):
         checkpoint_path = os.path.join(config.checkpoints_path, f"checkpoint_final.npz")
         np.savez(checkpoint_path, **checkpoint)
         print(f"Saved final checkpoint to {checkpoint_path}")
+
+    # Record a rollout video of the final policy
+    try:
+        video_dir = config.checkpoints_path if config.checkpoints_path is not None else "videos"
+        video_path = os.path.join(video_dir, f"{config.name}.mp4")
+        record_policy_video(
+            env_name=config.env,
+            act=lambda o: policy_fn(obs=o),
+            obs_mean=obs_mean,
+            obs_std=obs_std,
+            device=config.device,
+            save_path=video_path,
+            command_type=config.command_type,
+        )
+        wandb.log({"eval/video": wandb.Video(video_path)})
+        print(f"Saved rollout video to {video_path}")
+    except Exception as e:
+        print(f"[video] failed to record rollout video: {e}")
 
     wandb.finish()
 

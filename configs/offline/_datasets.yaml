@@ -43,6 +43,10 @@ tasks:
     env: Go2JoystickFlatTerrain
     command_type: forwardfixed
     dt_target_returns: [31, 29]
+  go2-rough-terrain:
+    env: Go2RoughCurriculum
+    command_type: null
+    dt_target_returns: [46, 44]
   g1-joystick-direction:
     env: G1JoystickFlatTerrain
     command_type: null
