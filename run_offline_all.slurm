@@ -19,7 +19,9 @@
 # <algo> is one of: bc awac td3_bc cql iql dt
 set -euo pipefail
 
-REPO="/home/luana/Documents/OfflineRL/Benchmark/CORL"
+# Repository root. Override by exporting REPO before submitting,
+# e.g. REPO=/path/to/CORL sbatch run_offline_all.slurm bc
+REPO="${REPO:-/home/luana/Documents/OfflineRL/Benchmark/CORL}"
 cd "$REPO"
 mkdir -p logs
 

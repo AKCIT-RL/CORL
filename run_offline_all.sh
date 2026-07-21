@@ -28,7 +28,9 @@ fi
 
 ALGO="$1"; shift
 
-REPO="/home/luana/Documents/OfflineRL/Benchmark/CORL"
+# Repository root. Override by exporting REPO or passing it on the command line,
+# e.g. REPO=/path/to/CORL ./run_offline_all.sh bc
+REPO="${REPO:-/home/luana/Documents/OfflineRL/Benchmark/CORL}"
 cd "$REPO"
 
 # Refresh the mujoco_playground fork to the latest commit of its pinned branch

@@ -45,6 +45,10 @@ torch = { index = "pytorch-cu128" }
 playground = { git = "https://github.com/AKCIT-RL/mujoco_playground.git", rev = "go2" }
 
 [dependency-groups]
+dev = [
+    "ruff>=0.14",
+]
+
 minimum = [
     "cloudpickle==3.1.2",
     "distrax==0.1.5",
@@ -75,3 +79,19 @@ isaac-test = [
 [tool.uv.dependency-groups]
 isaac-minimum = {requires-python = "==3.11.13"}
 isaac-test = {requires-python = "==3.11.13"}
+
+[tool.ruff]
+target-version = "py311"
+# Lint only the project source. Exploratory notebooks and generated/output
+# directories are excluded so `ruff check` focuses on the actual code.
+extend-exclude = [
+    "notebooks",
+    "wandb",
+    "checkpoints",
+    "datasets",
+    "*.ipynb",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# __init__.py re-exports symbols for the public API; unused-import is expected.
+"__init__.py" = ["F401"]
