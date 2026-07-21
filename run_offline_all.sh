@@ -79,7 +79,7 @@ mkdir -p "$DONE_DIR"
 # Optional args filter by task_id. Datasets missing on disk are downloaded from
 # the Hugging Face hub (akcit-rl/playground) into DATA_ROOT before being emitted.
 manifest="$("$PY" - "$REGISTRY" "$DATA_ROOT" "$ALGO" "$@" <<'PY'
-import os, sys, yaml
+import os, sys, yaml, json
 
 registry = yaml.safe_load(open(sys.argv[1]))
 data_root = sys.argv[2]
@@ -127,12 +127,16 @@ for task, info in registry["tasks"].items():
     ct = "" if ct is None else str(ct)
     tr = info.get("dt_target_returns") or []
     tr = "[%s]" % ", ".join(str(x) for x in tr) if tr else ""
+    # Optional Tier-5 shifted-eval overrides -> compact single-line JSON (no
+    # tabs/newlines) so it survives the tab-delimited manifest.
+    es = info.get("eval_shift")
+    es = json.dumps(es, separators=(",", ":")) if es else ""
     for diff in registry["difficulties"]:
         if not ensure_dataset(task, diff):
             continue
         dataset_id = f"playground/{task}/{diff}-v0"
         group = f"{algo}-{task}-{diff}"
-        print("\t".join([dataset_id, env, ct, group, tr]))
+        print("\t".join([dataset_id, env, ct, group, tr, es]))
 PY
 )"
 
@@ -149,7 +153,7 @@ echo "wandb  -> ${WANDB_ENTITY}/Offline-Benchmark"
 echo "minari -> ${MINARI_DATASETS_PATH}"
 echo
 
-while IFS=$'\t' read -r dataset_id env command_type group target_returns; do
+while IFS=$'\t' read -r dataset_id env command_type group target_returns eval_shift; do
   [[ -z "$dataset_id" ]] && continue
   marker="$DONE_DIR/${group}-seed${SEED}.done"
   if [[ "$FORCE" != "1" && -f "$marker" ]]; then
@@ -167,6 +171,9 @@ while IFS=$'\t' read -r dataset_id env command_type group target_returns; do
   )
   if [[ -n "$command_type" ]]; then
     args+=(--command_type "$command_type")
+  fi
+  if [[ -n "$eval_shift" ]]; then
+    args+=(--eval_shift "$eval_shift")
   fi
   if [[ "$ALGO" == "dt" && -n "$target_returns" ]]; then
     args+=(--target_returns "$target_returns")

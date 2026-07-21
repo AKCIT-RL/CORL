@@ -6,6 +6,7 @@ from mujoco_playground import registry
 import gymnasium as gym
 import numpy as np
 import os
+import json
 import jax
 import jax.numpy as jp
 import torch
@@ -28,8 +29,24 @@ def get_env(
     randomize: bool = False,
     num_actors: int = 1,
     dataset=None,
+    config_overrides=None,
 ):
-    env = registry.load(env_name)
+    # ``config_overrides`` is a flattened-dotted-key dict forwarded to
+    # ``registry.load`` (applied via ``ConfigDict.update_from_flattened_dict``).
+    # It is used by the Tier-5 shifted evaluation to build an env whose
+    # perturbation regime differs from the one seen during collection (e.g.
+    # stronger push-recovery kicks) while the D4RL reference scores below still
+    # come from the (in-distribution) dataset metadata, so the shifted score
+    # stays on the same scale as the in-distribution one.
+    #
+    # Curriculum/rough-terrain envs must use the JAX/MJX collision backend: the
+    # warp CCD path is unreliable on the procedural heightfield (it OOMs the GPU
+    # or silently drops contacts). Force ``impl=jax`` here so eval dynamics match
+    # the dataset, mirroring the collection-time override in
+    # Offline-RL-Benchmark/collect_data.py. An explicit caller override still wins.
+    if env_name == "Go2RoughCurriculum":
+        config_overrides = {"impl": "jax", **(config_overrides or {})}
+    env = registry.load(env_name, config_overrides=config_overrides)
     env_cfg = registry.get_default_config(env_name)
 
     randomization_fn = None
@@ -49,6 +66,28 @@ def get_env(
     )
 
     return env
+
+
+def maybe_get_shifted_env(env_name, device, command_type=None, dataset=None, eval_shift=None):
+    """Build a Tier-5 shifted-evaluation env, or return None when not requested.
+
+    ``eval_shift`` is the per-task ``eval_shift`` block from _datasets.yaml, passed
+    as a JSON string (via ``--eval_shift``) or an already-parsed dict. Its keys are
+    flattened-dotted env-config overrides (e.g. ``pert_config.velocity_kick``) that
+    define a harder / held-out regime than the collection one. The dataset is still
+    forwarded so the D4RL reference scores stay in-distribution, keeping the shifted
+    score comparable to the in-distribution one.
+    """
+    if not eval_shift:
+        return None
+    overrides = json.loads(eval_shift) if isinstance(eval_shift, str) else dict(eval_shift)
+    return get_env(
+        env_name,
+        device,
+        command_type=command_type,
+        dataset=dataset,
+        config_overrides=overrides,
+    )
 
 
 class GymWrapper(gym.Env):
@@ -103,6 +142,26 @@ class GymWrapper(gym.Env):
         self.num_envs = num_actors
         self.timesteps = 0
 
+        # Curriculum envs (e.g. Go2RoughCurriculum) expose ``reset_to(rng, level,
+        # col)`` and a ``num_rows x num_cols`` terrain grid. Their plain ``reset``
+        # always spawns on the easiest level (row 0), so evaluating through it
+        # would only ever measure tier-0 terrain. Detect the curriculum interface
+        # here so ``reset`` can instead spread episodes across *all* difficulty
+        # levels (matching how the dataset was collected), giving an all-level
+        # average score. The curriculum auto-reset promotion/regression is a
+        # training-only wrapper and is intentionally not used at eval time.
+        base = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+        self._is_curriculum = (
+            hasattr(base, "reset_to")
+            and hasattr(base, "num_rows")
+            and hasattr(base, "num_cols")
+        )
+        if self._is_curriculum:
+            self._curriculum_base = base
+            self._num_rows = int(base.num_rows)
+            self._num_cols = int(base.num_cols)
+            self._next_level = 0  # round-robin cursor across successive resets
+
         if randomization_fn is not None:
             self._setup_domain_randomization(randomization_fn, num_actors)
         else:
@@ -112,6 +171,8 @@ class GymWrapper(gym.Env):
             self._in_axes = None
             self._reset_fn = jax.jit(jax.vmap(self.env.reset))
             self._step_fn = jax.jit(jax.vmap(self.env.step))
+            if self._is_curriculum:
+                self._reset_to_fn = jax.jit(jax.vmap(self._curriculum_base.reset_to))
 
     def _setup_domain_randomization(self, randomization_fn, num_actors):
         """Build JIT-compiled vmapped reset/step functions with domain randomization.
@@ -209,6 +270,10 @@ class GymWrapper(gym.Env):
         and the final evaluation matches the intermediate ones for a fixed policy.
         """
         self.rng = jax.random.PRNGKey(seed)
+        # Restart the curriculum level round-robin so every evaluation covers the
+        # difficulty levels in the same, balanced order.
+        if getattr(self, "_is_curriculum", False):
+            self._next_level = 0
 
     def reset(self, *, seed=None, options=None):
         self.rng, reset_rng = jax.random.split(self.rng)
@@ -222,6 +287,24 @@ class GymWrapper(gym.Env):
                     self._base_mjx_model, dr_keys
                 )
             self.env_state = self._reset_fn(self._mjx_model_v, reset_keys)
+        elif self._is_curriculum:
+            # Spread episodes across all difficulty levels via ``reset_to`` in a
+            # round-robin over successive resets (random terrain column each
+            # time). Over a full evaluation every level gets an equal share of
+            # episodes, so the aggregate score reflects all tiers instead of just
+            # the easiest one.
+            levels = (self._next_level + jp.arange(self.num_envs)) % self._num_rows
+            self._next_level = int(
+                (self._next_level + self.num_envs) % self._num_rows
+            )
+            self.rng, col_rng = jax.random.split(self.rng)
+            cols = jax.random.randint(
+                col_rng, (self.num_envs,), 0, self._num_cols
+            )
+            self._last_levels = np.asarray(levels)
+            self.env_state = self._reset_to_fn(
+                reset_keys, levels.astype(jp.int32), cols.astype(jp.int32)
+            )
         else:
             self.env_state = self._reset_fn(reset_keys)
 

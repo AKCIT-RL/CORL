@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 import minari
 
-from algorithms.utils.wrapper_gym import get_env
+from algorithms.utils.wrapper_gym import get_env, maybe_get_shifted_env
 
 os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True"
 
@@ -100,6 +100,11 @@ class DTConfig:
     device: str = "cuda"
     # command type for environment (e.g., "direction", "forward", "forwardfixed")
     command_type: Optional[str] = None
+    # Optional Tier-5 shifted evaluation: JSON string of flattened env-config
+    # overrides (e.g. stronger push-recovery kicks) applied only to a second eval
+    # env. Normalization reuses the in-distribution dataset refs, so the shifted
+    # score is comparable to the final score (their gap = robustness gap).
+    eval_shift: Optional[str] = None
     # deterministic torch (not used in JAX, but present in configs for compatibility)
     deterministic_torch: bool = False
     # number of workers (not used in JAX, but present in configs for compatibility)
@@ -860,6 +865,10 @@ def train(config: DTConfig):
             pyrallis.dump(config, f)
 
     env = get_env(config.env_name, config.device, command_type=config.command_type, dataset=minari.load_dataset(config.dataset_id))
+    shifted_env = maybe_get_shifted_env(
+        config.env_name, config.device, command_type=config.command_type,
+        dataset=minari.load_dataset(config.dataset_id), eval_shift=config.eval_shift,
+    )
     rng = jax.random.PRNGKey(config.seed)
     state_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
@@ -923,6 +932,21 @@ def train(config: DTConfig):
             f"eval/{target_return}_final_raw_score": raw_score,
         })
         print(f"Final Score for Target Return {target_return}: {score}")
+
+        # Tier-5 shifted evaluation: same policy under a harder / held-out
+        # perturbation regime. Reuses the in-distribution refs, so the gap
+        # measures robustness.
+        if shifted_env is not None:
+            shifted_score, shifted_raw = evaluate(
+                algo.get_action, train_state, shifted_env, config, target_return, state_mean, state_std,
+                seed=config.eval_seed, num_episodes=config.n_eval_episodes_final,
+            )
+            wandb.log({
+                f"eval/shifted_{target_return}_final_score": shifted_score,
+                f"eval/shifted_{target_return}_final_raw_score": shifted_raw,
+                f"eval/{target_return}_robustness_gap": score - shifted_score,
+            })
+            print(f"Final Shifted Score for Target Return {target_return}: {shifted_score}")
 
     # Save final checkpoint
     if config.checkpoints_path is not None:

@@ -23,7 +23,7 @@ from flax.training.train_state import TrainState
 
 import minari
 
-from algorithms.utils.wrapper_gym import get_env, record_policy_video
+from algorithms.utils.wrapper_gym import get_env, maybe_get_shifted_env, record_policy_video
 from algorithms.utils.dataset import qlearning_dataset
 
 os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True"
@@ -130,6 +130,11 @@ class CQLConfig:
     optimizer_type: str = "adam"
     # command type for environment (e.g., "direction", "forward", "forwardfixed")
     command_type: Optional[str] = None
+    # Optional Tier-5 shifted evaluation: JSON string of flattened env-config
+    # overrides (e.g. stronger push-recovery kicks) applied only to a second eval
+    # env. Normalization reuses the in-distribution dataset refs, so the shifted
+    # score is comparable to eval/final_score (their gap = robustness gap).
+    eval_shift: Optional[str] = None
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -891,6 +896,10 @@ def train(config: CQLConfig):
     minari_dataset = minari.load_dataset(config.dataset_id)
     qdataset = qlearning_dataset(minari_dataset)
     env = get_env(config.env, config.device, command_type=config.command_type, dataset=minari_dataset)
+    shifted_env = maybe_get_shifted_env(
+        config.env, config.device, command_type=config.command_type,
+        dataset=minari_dataset, eval_shift=config.eval_shift,
+    )
     
     action_dim = env.action_space.shape[0]
     config.action_dim = action_dim
@@ -965,6 +974,19 @@ def train(config: CQLConfig):
         "eval/final_score": normalized_score,
         "eval/final_raw_score": raw_score,
     })
+
+    # Tier-5 shifted evaluation: same policy under a harder / held-out perturbation
+    # regime. Reuses the in-distribution refs, so the gap measures robustness.
+    if shifted_env is not None:
+        shifted_score, shifted_raw = evaluate(
+            policy_fn, shifted_env, config.n_eval_episodes_final, obs_mean=obs_mean, obs_std=obs_std, seed=config.eval_seed
+        )
+        print("Final Shifted Evaluation Score:", shifted_score)
+        wandb.log({
+            "eval/shifted_final_score": shifted_score,
+            "eval/shifted_final_raw_score": shifted_raw,
+            "eval/robustness_gap": normalized_score - shifted_score,
+        })
 
     # Save final checkpoint
     if config.checkpoints_path is not None:
