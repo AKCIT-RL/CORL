@@ -1,5 +1,4 @@
 import argparse
-import os
 import yaml
 import numpy as np
 from pathlib import Path
@@ -196,7 +195,6 @@ def main() -> None:
     checkpoint_path = args.checkpoint_path
     env_name = args.env_name
     state_dim = args.state_dim
-    action_dim = args.action_dim
     max_action = args.max_action
 
     actor = load_awac_checkpoint(checkpoint_path=checkpoint_path, state_dim=state_dim)

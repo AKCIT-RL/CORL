@@ -22,7 +22,6 @@ import minari
 from torch.utils.data import DataLoader
 from algorithms.utils.wrapper_gym import get_env
 from algorithms.utils.dataset import qlearning_dataset, ReplayBuffer
-from algorithms.utils.save_video import save_video
 
 TensorBatch = List[torch.Tensor]
 

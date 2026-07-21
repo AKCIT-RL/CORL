@@ -1,11 +1,10 @@
 # source https://github.com/nikhilbarhate99/min-decision-transformer
 # https://arxiv.org/abs/2106.01345
-import collections
 import os
 import uuid
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
 import flax
 import gymnasium as gym
@@ -956,7 +955,7 @@ def train(config: DTConfig):
             "state_std": np.array(state_std),
             "step": config.update_steps,
         }
-        checkpoint_path = os.path.join(config.checkpoints_path, f"checkpoint_final.npz")
+        checkpoint_path = os.path.join(config.checkpoints_path, "checkpoint_final.npz")
         np.savez(checkpoint_path, **checkpoint)
         print(f"Saved final checkpoint to {checkpoint_path}")
 

@@ -95,3 +95,6 @@ extend-exclude = [
 [tool.ruff.lint.per-file-ignores]
 # __init__.py re-exports symbols for the public API; unused-import is expected.
 "__init__.py" = ["F401"]
+# This test sets MUJOCO_GL and initializes an EGL context before importing the
+# modules that rely on it, so module-level imports intentionally come later.
+"test/offline/bc_jax.py" = ["E402"]

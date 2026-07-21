@@ -1,7 +1,6 @@
 # source https://github.com/ikostrikov/jaxrl
 # https://arxiv.org/abs/2006.09359
 import os
-import time
 import uuid
 from dataclasses import dataclass
 from functools import partial
@@ -607,7 +606,7 @@ def train(config: AWACConfig):
             "obs_std": np.array(obs_std),
             "step": num_steps,
         }
-        checkpoint_path = os.path.join(config.checkpoints_path, f"checkpoint_final.npz")
+        checkpoint_path = os.path.join(config.checkpoints_path, "checkpoint_final.npz")
         np.savez(checkpoint_path, **checkpoint)
         print(f"Saved final checkpoint to {checkpoint_path}")
 

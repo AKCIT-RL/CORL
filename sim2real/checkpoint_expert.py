@@ -3,7 +3,6 @@ import abc
 import dataclasses
 import enum
 import os
-from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Mapping, Optional, Protocol, Sequence, Tuple, Union
 
 import numpy as np
@@ -848,7 +847,6 @@ def main() -> None:
     loaded_actor = load_actor(pickle_path)
 
     test_obs_array = np.random.randn(state_dim).astype(np.float32)
-    test_obs_dict = {"state": jnp.array(test_obs_array)}
 
     action_array = actor["get_action"](test_obs_array)
     loaded_action = loaded_actor["get_action"](obs=test_obs_array)

@@ -4,10 +4,8 @@ import pandas as pd
 import numpy as np
 import functools
 import os
-from datetime import datetime
 
 import jax
-import numpy as np
 from etils import epath
 from tqdm import tqdm
 
@@ -122,7 +120,6 @@ def process_model(p):
     print()
 
     env = registry.load(p["env"])
-    env_cfg = registry.get_default_config(p["env"])
     randomizer = registry.get_domain_randomizer(p["env"])
 
     # ------------- EXPERT EVALUATION
@@ -136,7 +133,7 @@ def process_model(p):
 
     try:
         ppo_params = locomotion_params.brax_ppo_config(p["env"])
-    except:
+    except Exception:
         ppo_params = manipulation_params.brax_ppo_config(p["env"])
 
     ppo_training_params = dict(ppo_params)
@@ -198,7 +195,7 @@ def process_model(p):
             width=640,
             height=480,
         )
-    except:
+    except Exception:
         render_every = 1
         frames = env.render(rollout[::render_every])
 

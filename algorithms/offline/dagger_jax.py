@@ -1,7 +1,6 @@
 # Database Aggregation implementation in JAX
 # Simple supervised learning approach for offline RL
 import os
-import time
 import uuid
 from dataclasses import asdict, dataclass
 from functools import partial
@@ -860,7 +859,7 @@ def train(config: DAggerConfig):
     
     # Save final video
     if config.video_dir is not None and config.n_episodes > 0:
-        video_path = os.path.join(config.video_dir, f"eval/final.mp4")
+        video_path = os.path.join(config.video_dir, "eval/final.mp4")
         env.save_video(render_trajectory, save_path=video_path)
 
     # Save final checkpoint
@@ -872,7 +871,7 @@ def train(config: DAggerConfig):
             "obs_std": np.array(obs_std),
             "step": num_steps,
         }
-        checkpoint_path = os.path.join(config.checkpoints_path, f"checkpoint_final.npz")
+        checkpoint_path = os.path.join(config.checkpoints_path, "checkpoint_final.npz")
         np.savez(checkpoint_path, **checkpoint)
         print(f"Saved final checkpoint to {checkpoint_path}")
 

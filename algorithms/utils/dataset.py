@@ -1,7 +1,6 @@
 import minari
 import numpy as np
 from typing import Dict
-import torch
 
 def qlearning_dataset(dataset: minari.MinariDataset) -> Dict[str, np.ndarray]:
     obs, next_obs, actions, rewards, dones = [], [], [], [], []

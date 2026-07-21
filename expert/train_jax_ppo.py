@@ -33,7 +33,6 @@ import jax
 import jax.numpy as jp
 import mediapy as media
 from ml_collections import config_dict
-import mujoco
 from orbax import checkpoint as ocp
 from tensorboardX import SummaryWriter
 import wandb

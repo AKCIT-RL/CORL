@@ -1,15 +1,11 @@
 import os    
-from etils import epath
-from pathlib import Path
-import yaml
-import torch
 
 from jax import numpy as jp
 
 from mujoco_playground import registry
 import mediapy as media
 
-from algorithms.offline.any_percent_bc import BC, Actor
+from algorithms.offline.any_percent_bc import Actor
 from algorithms.utils.wrapper_gym import GymWrapper
 
 
@@ -44,10 +40,6 @@ def save_video(
         device=device,
     )
             
-    state_dim = env_wrapped.observation_space.shape[0]
-    action_dim = env_wrapped.action_space.shape[0]
-    max_action = 1.0
-
     command = jp.array([command])
 
     actor.eval()

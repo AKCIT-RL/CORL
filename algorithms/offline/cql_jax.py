@@ -1,12 +1,11 @@
 # source https://github.com/young-geng/JaxCQL
 # https://arxiv.org/abs/2006.04779
 import os
-import time
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
 import distrax
 import flax
@@ -1000,7 +999,7 @@ def train(config: CQLConfig):
             "obs_std": np.array(obs_std),
             "step": num_steps,
         }
-        checkpoint_path = os.path.join(config.checkpoints_path, f"checkpoint_final.npz")
+        checkpoint_path = os.path.join(config.checkpoints_path, "checkpoint_final.npz")
         np.savez(checkpoint_path, **checkpoint)
         print(f"Saved final checkpoint to {checkpoint_path}")
 

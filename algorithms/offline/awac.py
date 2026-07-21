@@ -19,7 +19,6 @@ import minari
 
 from algorithms.utils.wrapper_gym import get_env
 from algorithms.utils.dataset import qlearning_dataset, ReplayBuffer
-from algorithms.utils.save_video import save_video
 
 TensorBatch = List[torch.Tensor]
 
@@ -365,7 +364,6 @@ def train(config: TrainConfig):
     env = get_env(config.env, config.device)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
-    max_action = 1.0
 
     if config.normalize_reward:
         modify_reward(qdataset, config.env)

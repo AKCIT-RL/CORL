@@ -10,7 +10,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "../CORL"))
 
 import cloudpickle
 import numpy as np
-from datetime import datetime
 
 from algorithms.utils.wrapper_gym import get_env
 

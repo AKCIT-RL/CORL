@@ -1,7 +1,6 @@
 # Behavioral Cloning implementation in JAX
 # Simple supervised learning approach for offline RL
 import os
-import time
 import uuid
 from dataclasses import asdict, dataclass
 from functools import partial
@@ -11,7 +10,6 @@ from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple
 import minari
 import flax
 import flax.linen as nn
-import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -554,7 +552,7 @@ def train(config: BCConfig):
             "obs_std": np.array(obs_std),
             "step": num_steps,
         }
-        checkpoint_path = os.path.join(config.checkpoints_path, f"checkpoint_final.npz")
+        checkpoint_path = os.path.join(config.checkpoints_path, "checkpoint_final.npz")
         np.savez(checkpoint_path, **checkpoint)
         print(f"Saved final checkpoint to {checkpoint_path}")
         

@@ -1,7 +1,5 @@
 import mujoco
-from mujoco import mjx
 
-from mujoco_playground import wrapper_torch, wrapper
 from mujoco_playground import registry
 import gymnasium as gym
 import numpy as np
