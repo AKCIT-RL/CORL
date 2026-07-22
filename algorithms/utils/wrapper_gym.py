@@ -4,6 +4,7 @@ from mujoco_playground import registry
 import gymnasium as gym
 import numpy as np
 import os
+import ast
 import json
 import jax
 import jax.numpy as jp
@@ -78,7 +79,15 @@ def maybe_get_shifted_env(env_name, device, command_type=None, dataset=None, eva
     """
     if not eval_shift:
         return None
-    overrides = json.loads(eval_shift) if isinstance(eval_shift, str) else dict(eval_shift)
+    if isinstance(eval_shift, str):
+        try:
+            overrides = json.loads(eval_shift)
+        except json.JSONDecodeError:
+            # pyrallis may round-trip the JSON through yaml/str(), turning it
+            # into a single-quoted Python dict repr; fall back to literal_eval.
+            overrides = ast.literal_eval(eval_shift)
+    else:
+        overrides = dict(eval_shift)
     return get_env(
         env_name,
         device,
