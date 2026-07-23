@@ -90,7 +90,7 @@ class IQLConfig:
     # JAX-specific: whether to use cosine decay schedule for actor
     opt_decay_schedule: bool = True
 
-    command_type: str = "direction"
+    command_type: Optional[str] = None
     # Optional Tier-5 shifted evaluation: JSON string of flattened env-config
     # overrides (e.g. stronger push-recovery kicks) applied only to a second eval
     # env. Normalization reuses the in-distribution dataset refs, so the shifted
@@ -604,7 +604,6 @@ def train(config: IQLConfig):
         name=config.name,
         id=str(uuid.uuid4()),
     )
-    wandb.run.save()
 
     # Setup checkpoints
     if config.checkpoints_path is not None:

@@ -425,6 +425,9 @@ name = "corl"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "cloudpickle" },
+    { name = "distrax" },
+    { name = "flax" },
     { name = "jax", extra = ["cuda12"] },
     { name = "mediapy" },
     { name = "minari", extra = ["all"] },
@@ -472,6 +475,9 @@ minimum = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cloudpickle", specifier = "==3.1.2" },
+    { name = "distrax", specifier = "==0.1.5" },
+    { name = "flax", specifier = "==0.10.7" },
     { name = "jax", extras = ["cuda12"], specifier = "==0.6.0" },
     { name = "mediapy", specifier = "==1.2.4" },
     { name = "minari", extras = ["all"], specifier = "==0.5.3" },
