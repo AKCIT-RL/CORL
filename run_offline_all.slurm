@@ -19,15 +19,23 @@
 # <algo> is one of: bc awac td3_bc cql iql dt
 set -euo pipefail
 
-# Repository root. Override by exporting REPO before submitting,
+# Repository root. Override by exporting REPO or by passing REPO=/path/to/CORL
+# as the first sbatch argument.
 # e.g. REPO=/path/to/CORL sbatch run_offline_all.slurm bc
-REPO="${REPO:-/home/luana/Documents/OfflineRL/Benchmark/CORL}"
+# e.g. sbatch run_offline_all.slurm REPO=/path/to/CORL bc
+if [[ "${1:-}" == REPO=* ]]; then
+	REPO="${1#REPO=}"
+	shift
+else
+	REPO="${REPO:-${SLURM_SUBMIT_DIR:-$PWD}}"
+fi
+export REPO
 cd "$REPO"
 mkdir -p logs
 
 echo "Job $SLURM_JOB_ID on $(hostname) starting $(date)"
 nvidia-smi -L || true
 
-srun ./run_offline_all.sh "$@"
+srun bash "$REPO/run_offline_all.sh" "$@"
 
 echo "Job $SLURM_JOB_ID finished $(date)"

@@ -67,8 +67,13 @@ fi
 export MINARI_DATASETS_PATH="$REPO/datasets"
 # wandb destination: akcit-offlinerl/Offline-Benchmark
 export WANDB_ENTITY="akcit-offlinerl"
+# wandb auth: export WANDB_API_KEY before submitting to override the default.
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
+if [[ -z "$WANDB_API_KEY" ]]; then
+  echo "WANDB_API_KEY is not set; export it before running (export WANDB_API_KEY=...)." >&2
+  exit 1
+fi
 SEED="${SEED:-0}"
-
 # Skip datasets already trained so a resubmission resumes instead of redoing the
 # whole sweep (each finished dataset drops a marker under .done_runs). Without
 # this, every resubmission creates a fresh wandb run in the same group -> duplicates.

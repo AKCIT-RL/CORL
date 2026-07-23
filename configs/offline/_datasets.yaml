@@ -62,6 +62,17 @@ tasks:
     env: Go2RoughCurriculum
     command_type: null
     dt_target_returns: [46, 44]
+    # Tier-5 shifted eval: held-out terrain instance (new procedural seed) at a
+    # difficulty range that extrapolates beyond the [0,1] seen in the dataset.
+    # Probes robustness to unseen terrain geometry / steeper relief, mirroring
+    # the push-recovery "stronger kicks" shift. Reward is unchanged, so the
+    # in-distribution dataset refs keep shifted_final_score comparable to
+    # final_score (their difference is the robustness gap). NOTE: tile elevation
+    # is hard-capped at _MAX_TILE_HEIGHT=0.30, so the amplitude bump mainly
+    # stresses rough/stairs (slope saturates at difficulty 1).
+    eval_shift:
+      terrain.seed: 7
+      terrain.difficulty_range: [1.0, 1.6]
   g1-joystick-direction:
     env: G1JoystickFlatTerrain
     command_type: null
