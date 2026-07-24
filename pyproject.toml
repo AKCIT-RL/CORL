@@ -79,6 +79,10 @@ isaac-test = [
     "tqdm==4.67.1",
 ]
 
+stats = [
+    "scipy>=1.16.3",
+]
+
 [tool.uv.dependency-groups]
 isaac-minimum = {requires-python = "==3.11.13"}
 isaac-test = {requires-python = "==3.11.13"}
