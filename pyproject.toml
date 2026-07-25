@@ -105,3 +105,4 @@ extend-exclude = [
 # This test sets MUJOCO_GL and initializes an EGL context before importing the
 # modules that rely on it, so module-level imports intentionally come later.
 "test/offline/bc_jax.py" = ["E402"]
+"scripts/compare_randomize.py" = ["E402"]

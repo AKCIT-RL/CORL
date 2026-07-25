@@ -1,6 +1,6 @@
 from dataclasses import dataclass, fields
+from datetime import datetime
 import os
-import sys
 from typing import Callable, List, Optional, Tuple, cast
 import numpy as np
 import jax
@@ -26,6 +26,7 @@ class CompareRandomizeAttributes:
    n_actors: int = 4
    n_episodes: int = 20
    seed: int = 0
+   render: bool = False
    device: str = "cuda"
    
 @dataclass
@@ -205,9 +206,6 @@ def evaluate(
 
       return episode_returns
 
-from typing import List
-import numpy as np
-
 def print_results(base_returns: List[float], randomize_returns: List[float]):
    print(f"{'='*10} RESULTADOS {'='*10}")
    
@@ -216,13 +214,13 @@ def print_results(base_returns: List[float], randomize_returns: List[float]):
    
    base_mean = np.mean(base_arr)
    base_std = np.std(base_arr)
-   print(f"Baseline:")
+   print("Baseline:")
    print(f" - Média: {base_mean:.2f}")
    print(f" - Std: {base_std:.2f}")
    
    randomize_mean = np.mean(rand_arr)
    randomize_std = np.std(rand_arr)
-   print(f"Randomizado:")
+   print("Randomizado:")
    print(f" - Média: {randomize_mean:.2f}")
    print(f" - Std: {randomize_std:.2f}")
    
@@ -278,7 +276,7 @@ def evaluate_robustness(base_arr: np.ndarray, rand_arr: np.ndarray):
    
 def _main(attrs: CompareRandomizeAttributes):
    # Get config
-   print(f"Carregando configuração do checkpoint...")
+   print("Carregando configuração do checkpoint...")
    config = load_config(attrs)
    
    print("Configuração carregada:")
@@ -287,7 +285,7 @@ def _main(attrs: CompareRandomizeAttributes):
       print(f" - {field.name}: {value}")
    
    # Get base environment
-   print(f"\nCarregando ambiente base...")
+   print("\nCarregando ambiente base...")
    num_actors = max(1, min(attrs.n_actors, attrs.n_episodes))
    base_env = get_env(
       env_name=config.env,
@@ -305,13 +303,13 @@ def _main(attrs: CompareRandomizeAttributes):
    )
    
    # Evaluate policy in base environment
-   print(f"Executando política no ambiente base...")
+   print("Executando política no ambiente base...")
    base_returns = evaluate(
-      policy, base_env, attrs.n_episodes, obs_mean, obs_std, render=True
+      policy, base_env, attrs.n_episodes, obs_mean, obs_std, render=attrs.render
    )
    
    # Get randomize environment
-   print(f"\nCarregando ambiente randomizado...")
+   print("\nCarregando ambiente randomizado...")
    randomize_env = get_env(
       env_name=config.env,
       device=attrs.device, 
@@ -323,13 +321,18 @@ def _main(attrs: CompareRandomizeAttributes):
    )
    
    # Evaluate policy in randomize environment
-   print(f"Executando política no ambiente randomizado...")
+   print("Executando política no ambiente randomizado...")
    randomize_returns = evaluate(
-      policy, randomize_env, attrs.n_episodes, obs_mean, obs_std, render=True
+      policy, randomize_env, attrs.n_episodes, obs_mean, obs_std, render=attrs.render
    )
    
    # Show results
    print_results(base_returns, randomize_returns)
+   
+   # Save vídeo
+   if attrs.render and render_trajectory:
+      timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+      base_env.save_video(render_trajectory, save_path=f"{config.env}-{timestamp}.mp4")
 
 def main():
    wrapped_main = wrap()(_main)
