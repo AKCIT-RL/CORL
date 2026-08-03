@@ -20,6 +20,29 @@ except ImportError:
 from .space import NumpySpace
 
 
+def locate_command_slice(obs_example, command_example, atol=1e-4):
+    """Return ``(start, stop)`` of the contiguous command block inside a 1-D obs.
+
+    The env writes ``info["command"]`` into the observation at a fixed offset that
+    is NOT always the tail: e.g. ``H1JoystickGaitTracking`` appends gait features
+    (contact/phase/gait_freq/gait/foot_height) AFTER the command, so a blind
+    ``[..., -3:]`` slice overwrites ``foot_height`` instead of the command and
+    destabilizes the gait policy. We locate the command by matching its values in
+    the observation (last match wins). Falls back to the tail when nothing matches
+    (command-at-tail envs like the Go2 joystick). Host-side only (numpy).
+    """
+    obs = np.asarray(obs_example).ravel()
+    cmd = np.asarray(command_example).ravel()
+    cd = cmd.shape[0]
+    found = None
+    for i in range(obs.shape[0] - cd + 1):
+        if np.allclose(obs[i:i + cd], cmd, atol=atol):
+            found = i
+    if found is None:
+        return int(obs.shape[0] - cd), int(obs.shape[0])
+    return int(found), int(found + cd)
+
+
 def get_env(
     env_name: str,
     device: str,
@@ -113,6 +136,7 @@ class GymWrapper(gym.Env):
     ):
         super().__init__()
         self.command_type = command_type
+        self._cmd_slice = None
         self.env = env
         self.device = device
         self.rng = jax.random.PRNGKey(seed)
@@ -259,10 +283,22 @@ class GymWrapper(gym.Env):
             return env_state
 
         obs = self._maybe_unfreeze(env_state.obs)
+        state_obs = obs["state"] if isinstance(obs, dict) else obs
+
+        # Locate the command block once (host). It is NOT always the obs tail:
+        # slicing [-3:] blindly corrupts trailing gait features (e.g. H1
+        # foot_height), which destabilizes gait-tracking policies.
+        if self._cmd_slice is None:
+            self._cmd_slice = locate_command_slice(
+                state_obs[0] if state_obs.ndim > 1 else state_obs,
+                commands[0] if commands.ndim > 1 else commands,
+            )
+        start, stop = self._cmd_slice
+        state_obs = state_obs.at[..., start:stop].set(command)
         if isinstance(obs, dict):
-            obs["state"] = obs["state"].at[..., -3:].set(command)
+            obs["state"] = state_obs
         else:
-            obs = obs.at[..., -3:].set(command)
+            obs = state_obs
 
         info = self._maybe_unfreeze(env_state.info)
         info["command"] = command
