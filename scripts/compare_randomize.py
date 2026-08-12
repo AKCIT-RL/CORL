@@ -1,5 +1,4 @@
 from dataclasses import dataclass, fields
-from datetime import datetime
 import os
 from typing import Callable, List, Optional, Tuple, cast
 import numpy as np
@@ -307,6 +306,12 @@ def _main(attrs: CompareRandomizeAttributes):
    base_returns = evaluate(
       policy, base_env, attrs.n_episodes, obs_mean, obs_std, render=attrs.render
    )
+
+   # Save base vídeo
+   if attrs.render and render_trajectory:
+      ck = os.path.basename(os.path.normpath(attrs.checkpoint_path)).replace(".npz", "")
+      base_env.save_video(render_trajectory, save_path=f"{ck}.mp4")
+      render_trajectory.clear()
    
    # Get randomize environment
    print("\nCarregando ambiente randomizado...")
@@ -331,8 +336,9 @@ def _main(attrs: CompareRandomizeAttributes):
    
    # Save vídeo
    if attrs.render and render_trajectory:
-      timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-      base_env.save_video(render_trajectory, save_path=f"{config.env}-{timestamp}.mp4")
+      ck = os.path.basename(os.path.normpath(attrs.checkpoint_path)).replace(".npz", "")
+      randomize_env.save_video(render_trajectory, save_path=f"{ck}-randomized.mp4")
+      render_trajectory.clear()
 
 def main():
    wrapped_main = wrap()(_main)
