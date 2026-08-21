@@ -1,6 +1,8 @@
 from dataclasses import dataclass, fields
 import os
-from typing import Callable, List, Optional, Tuple, cast
+from pathlib import Path
+import time
+from typing import Callable, Dict, List, Optional, Tuple, cast
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -14,7 +16,7 @@ gl_context = mujoco.egl.GLContext(1024, 1024)
 gl_context.make_current()
 
 from algorithms.offline.bc_jax import BCActor
-from algorithms.utils.wrapper_gym import GymWrapper, get_env
+from algorithms.utils.randomize_gym import GymWrapper, get_env
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
@@ -205,28 +207,28 @@ def evaluate(
 
       return episode_returns
 
-def print_results(base_returns: List[float], randomize_returns: List[float]):
-   print(f"{'='*10} RESULTADOS {'='*10}")
+def print_results(data: Dict[str, List[float]]):
+   print(f"\n{'='*10} RESULTADOS {'='*10}")
+
+   base_returns = data.get("default", [])
+   if base_returns:
+      base_arr = np.array(base_returns, dtype=np.float64)
+      base_mean = np.mean(base_arr)
    
-   base_arr = np.array(base_returns, dtype=np.float64)
-   rand_arr = np.array(randomize_returns, dtype=np.float64)
-   
-   base_mean = np.mean(base_arr)
-   base_std = np.std(base_arr)
-   print("Baseline:")
-   print(f" - Média: {base_mean:.2f}")
-   print(f" - Std: {base_std:.2f}")
-   
-   randomize_mean = np.mean(rand_arr)
-   randomize_std = np.std(rand_arr)
-   print("Randomizado:")
-   print(f" - Média: {randomize_mean:.2f}")
-   print(f" - Std: {randomize_std:.2f}")
-   
-   envs_relation = randomize_mean / base_mean if base_mean != 0 else float('inf')
-   print(f"Relação Randomizado / Baseline: {envs_relation:.2f}")
-   
-   evaluate_robustness(base_arr, rand_arr)
+   for cfg_name, returns in data.items():
+      arr = np.array(returns, dtype=np.float64)
+      mean = np.mean(arr)
+      std = np.std(arr)
+      srr = mean / base_mean if base_mean != 0 else float('inf')
+      print(f"\nRandomização {cfg_name}:")
+      print(f" - Média: {mean:.2f}")
+      print(f" - Std: {std:.2f}")
+      print(f" - Relação Randomizado / Baseline: {srr:.2f}")
+
+      if base_returns:
+         if cfg_name != "default":
+            arr = np.array(returns, dtype=np.float64)
+            evaluate_robustness(base_arr, arr)
 
 def evaluate_robustness(base_arr: np.ndarray, rand_arr: np.ndarray):
    print("\nAnálise de Robustez (Trajetórias Pareadas)...")
@@ -282,63 +284,75 @@ def _main(attrs: CompareRandomizeAttributes):
    for field in fields(CompareRandomizeConfig):
       value = getattr(config, field.name)
       print(f" - {field.name}: {value}")
-   
-   # Get base environment
-   print("\nCarregando ambiente base...")
-   num_actors = max(1, min(attrs.n_actors, attrs.n_episodes))
-   base_env = get_env(
-      env_name=config.env,
-      device=attrs.device, 
-      render_callback=_render_callback,
-      num_actors=num_actors,
-      command_type=config.command_type,
-      randomize=False,
-      config_overrides={"impl": "jax"}
-   )
-      
-   # Get checkpoint
-   policy, obs_mean, obs_std = load_checkpoint(
-      attrs, config, base_env
-   )
-   
-   # Evaluate policy in base environment
-   print("Executando política no ambiente base...")
-   base_returns = evaluate(
-      policy, base_env, attrs.n_episodes, obs_mean, obs_std, render=attrs.render
-   )
 
-   # Save base vídeo
-   if attrs.render and render_trajectory:
-      ck = os.path.basename(os.path.normpath(attrs.checkpoint_path)).replace(".npz", "")
-      base_env.save_video(render_trajectory, save_path=f"{ck}.mp4")
-      render_trajectory.clear()
+   num_actors = max(1, min(attrs.n_actors, attrs.n_episodes))
    
-   # Get randomize environment
-   print("\nCarregando ambiente randomizado...")
-   randomize_env = get_env(
-      env_name=config.env,
-      device=attrs.device, 
-      render_callback=_render_callback,
-      num_actors=num_actors,
-      command_type=config.command_type,
-      randomize=True,
-      config_overrides={"impl": "jax"}
-   )
-   
-   # Evaluate policy in randomize environment
-   print("Executando política no ambiente randomizado...")
-   randomize_returns = evaluate(
-      policy, randomize_env, attrs.n_episodes, obs_mean, obs_std, render=attrs.render
-   )
+   randomize_configs = ["default", "full", "only_domain", "custom", "disabled"]
+   custom_configs = {
+      "example": "configs/randomize/example.yaml",
+      "humanoid_gym": "configs/randomize/humanoid_gym.yaml"
+   }
+
+   data = {}
+   policy = None
+   obs_mean = None
+   obs_std = None
+
+   def run_test(cfg_name, cfg_file=None, display_name=None):
+      nonlocal data, attrs, policy, obs_mean, obs_std
+
+      display_name = display_name or cfg_name
+
+      print(f"\n {'='*10} Randomize Config: {display_name} {'='*10}")
+      print("\nCarregando ambiente...")
+      env = get_env(
+         device=attrs.device, 
+         render_callback=_render_callback,
+         num_actors=num_actors,
+         command_type=config.command_type,
+         config_overrides={"impl": "jax"},
+         randomize_configs=cfg_name,
+         randomize_options=cfg_file
+      )
+
+      # Get checkpoint
+      if not policy:
+         print("Carregando checkpoint...")
+         policy, obs_mean, obs_std = load_checkpoint(
+            attrs, config, env
+         )
+      else:
+         print("Checkpoint já carregado, reutilizando política...")
+
+      print("Executando política...")
+      base_returns = evaluate(
+         policy, env, attrs.n_episodes, obs_mean, obs_std, render=attrs.render
+      )
+
+      data[display_name] = base_returns
+
+      if attrs.render and render_trajectory:
+         ck = os.path.basename(os.path.normpath(attrs.checkpoint_path)).replace(".npz", "")
+
+         directory = Path(f"videos/{ck}")
+         directory.mkdir(parents=True, exist_ok=True)
+
+         timestamp = time.strftime("%Y%m%d-%H%M%S")
+         filepath = f"{directory}/{display_name}-{timestamp}.mp4"
+
+         print(f"Salvando vídeo em: {filepath}")
+         env.save_video(render_trajectory, save_path=filepath)
+         render_trajectory.clear()
+
+   for cfg_name in randomize_configs:
+      if cfg_name == "custom":
+         for display_name, cfg_file in custom_configs.items():
+            run_test(cfg_name, cfg_file, display_name)
+      else:
+         run_test(cfg_name)
    
    # Show results
-   print_results(base_returns, randomize_returns)
-   
-   # Save vídeo
-   if attrs.render and render_trajectory:
-      ck = os.path.basename(os.path.normpath(attrs.checkpoint_path)).replace(".npz", "")
-      randomize_env.save_video(render_trajectory, save_path=f"{ck}-randomized.mp4")
-      render_trajectory.clear()
+   print_results(data)
 
 def main():
    wrapped_main = wrap()(_main)

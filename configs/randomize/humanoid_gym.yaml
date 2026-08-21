@@ -1,0 +1,41 @@
+noise:
+  geom_friction: 
+    dist: uniform
+    type: scale
+    min: 0.1
+    max: 2.0
+  body_mass: 
+    dist: normal
+    type: additive
+    min: -1.0
+    max: 1.0
+    indices: [1]
+  actuator_gainprm: 
+    dist: normal
+    type: scale
+    min: 0.95
+    max: 1.05
+  qpos0: 
+    dist: normal
+    type: additive
+    min: -0.03
+    max: 0.03
+  joint_angles: 
+    dist: normal
+    type: additive
+    min: -0.05
+    max: 0.05
+  joint_vel:
+    dist: normal
+    type: additive
+    min: -0.5
+    max: 0.5
+  gyro:
+    dist: normal
+    type: additive
+    min: -0.1
+    max: 0.1
+
+action_factory:
+  type: randomized_delay
+  max_delay: 1
