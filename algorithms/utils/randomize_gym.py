@@ -501,8 +501,9 @@ def get_predefined_randomize_configs(
                 buf = deque([first_action] * delay, maxlen=delay)
 
                 def act(action):
+                    out = jnp.array(buf[0], dtype=jnp.float32)
                     buf.append(np.asarray(action))
-                    return jnp.array(buf[0], dtype=jnp.float32)
+                    return out
 
                 return act
         elif type == "fixed_delay":
@@ -523,8 +524,9 @@ def get_predefined_randomize_configs(
                 buf = deque([first_action] * delay, maxlen=delay)
 
                 def act(action):
+                    out = jnp.array(buf[0], dtype=jnp.float32)
                     buf.append(np.asarray(action))
-                    return jnp.array(buf[0], dtype=jnp.float32)
+                    return out
 
                 return act
         elif type == "smoothing":
