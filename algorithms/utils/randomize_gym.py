@@ -415,7 +415,7 @@ class RandomizeConfigs:
 
 def get_predefined_randomize_configs(
     randomize_type: str,
-    options: Optional[dict[str, Any]] = None
+    options: Optional[dict[str, Any] | str] = None
 ) -> RandomizeConfigs:
     """Return a RandomizeConfigs object for the given randomization type."""
 
@@ -558,16 +558,26 @@ def get_predefined_randomize_configs(
     elif randomize_type in ["only_observation", "default"]:
         return RandomizeConfigs(type=RandomizeConfigs.RandomizeType.DEFAULT)
     elif randomize_type == "custom":
-        if options is None:
+        opt: dict[str, Any]
+
+        if isinstance(options, str):
+            if os.path.exists(options):
+                with open(options, "r") as f:
+                    opt = yaml.safe_load(f)
+            else:
+                opt = yaml.safe_load(options)
+        elif isinstance(options, dict):
+            opt = options
+        else:
             raise ValueError("options must be provided for 'custom' randomization type")
-        
+
         obs_fields = ["gyro", "gravity", "joint_angles", "joint_vel", "linvel"]
         domain_fields = ["geom_friction", "dof_frictionloss", "dof_armature", "body_ipos", "body_mass", "qpos0", "actuator_gainprm"]
         noise_fields = obs_fields + domain_fields
         functions = {}
 
-        if options.get("noise") is not None:
-            noise = options["noise"]
+        if opt.get("noise") is not None:
+            noise = opt["noise"]
 
             def get_noise_fn(component):
                 if component.get("dist") is None:
@@ -612,8 +622,8 @@ def get_predefined_randomize_configs(
                 
                 functions[key] = get_noise_fn(cfg)
         
-        if options.get("bias") is not None:
-            bias = options["bias"]
+        if opt.get("bias") is not None:
+            bias = opt["bias"]
 
             if not isinstance(bias, dict):
                 raise ValueError(f"Unknown 'bias' type: {type(bias)}")
@@ -648,8 +658,8 @@ def get_predefined_randomize_configs(
             
             functions["observation_factory"] = get_bias_fn
 
-        if options.get("quantization") is not None:
-            value = options["quantization"]
+        if opt.get("quantization") is not None:
+            value = opt["quantization"]
 
             if not isinstance(value, int):
                 raise ValueError(f"Unknown 'quantization' type: {type(value)}")
@@ -664,8 +674,8 @@ def get_predefined_randomize_configs(
                     prev_fn = functions[field]
                     functions[field] = lambda x, key, f=prev_fn, val=value: jnp.round(f(x, key) * val) / val
 
-        if options.get("action_factory") is not None:
-            value = options["action_factory"]
+        if opt.get("action_factory") is not None:
+            value = opt["action_factory"]
 
             if not isinstance(value, dict):
                 raise ValueError(f"Unknown 'action_factory' type: {type(value)}")
@@ -677,13 +687,13 @@ def get_predefined_randomize_configs(
 
             functions["action_factory"] = get_action_factory(value["type"], value)
 
-        opt = RandomizeConfigs.RandomizeOptions()
+        cfg = RandomizeConfigs.RandomizeOptions()
         for key, fn in functions.items():
-            setattr(opt, key, fn)
+            setattr(cfg, key, fn)
 
         return RandomizeConfigs(
             type=RandomizeConfigs.RandomizeType.CUSTOM,
-            configs=opt
+            configs=cfg
         )
     else:
         raise ValueError(f"Unknown randomize_type: {randomize_type}")
@@ -716,9 +726,12 @@ def get_env(
             options = yaml.safe_load(randomize_options)
 
     if randomize_configs is None:
-        randomize_configs = RandomizeConfigs(
-            type=RandomizeConfigs.RandomizeType.DEFAULT
-        )
+        if options is None:
+            randomize_configs = RandomizeConfigs(
+                type=RandomizeConfigs.RandomizeType.DEFAULT
+            )
+        else:
+            randomize_configs = get_predefined_randomize_configs("custom", options)
     elif isinstance(randomize_configs, str):
         randomize_configs = get_predefined_randomize_configs(randomize_configs, options)
 
@@ -831,9 +844,30 @@ class GymWrapper(gym.Env):
         base = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
 
         self._randomize_functions = randomize_functions
+        self._need_reset = True
         self._randomize_every_episode = randomize_functions.randomize_every_episode
         
         self._setup_randomization(num_actors)
+
+    def update_randomize_functions(self, randomize_functions: RandomizeFunctions):
+        """Update the randomization functions and re-setup the randomization."""
+        self._randomize_functions = randomize_functions
+        self._need_reset = True
+        self._randomize_every_episode = randomize_functions.randomize_every_episode
+        self._setup_randomization(self.num_envs)
+
+    def warmup_jit_reset(self):
+        """Trigger JAX JIT compilation for reset/step functions.
+        
+        Call this after update_randomize_functions() to trigger compilation
+        in a controlled context, avoiding slow first reset during evaluation.
+        This performs a dummy reset/step cycle to compile the vmapped functions.
+        """
+        try:
+            self.reset()
+        except Exception:
+            # Silently ignore any errors during warmup
+            pass
 
     def _setup_randomization(self, num_actors):
         """Build JIT-compiled vmapped reset/step functions with randomization.
@@ -847,7 +881,9 @@ class GymWrapper(gym.Env):
         self.domain_randomize_fn = self._randomize_functions.domain_randomize
         self.observation_randomize_fn = self._randomize_functions.observation_randomize
         
-        self._base_mjx_model = self.env.mjx_model
+        # Only initialize the base model on first setup to avoid unnecessary recreation
+        if not hasattr(self, '_base_mjx_model') or self._base_mjx_model is None:
+            self._base_mjx_model = self.env.mjx_model
 
         # Compute the initial randomized model batch to determine in_axes.
         init_keys = jax.random.split(self.rng, num_actors)
@@ -1011,6 +1047,7 @@ class GymWrapper(gym.Env):
             self._next_level = 0
 
     def reset(self, *, seed=None, options=None):
+        self._need_reset = False
         self.rng, reset_rng = jax.random.split(self.rng)
         reset_keys = jax.random.split(reset_rng, self.num_envs)
 
@@ -1040,6 +1077,11 @@ class GymWrapper(gym.Env):
         return obs, {}
 
     def step(self, action):
+        if self._need_reset:
+            raise RuntimeError(
+                "Environment must be reset before stepping. Call `reset()` first."
+            )
+        
         if isinstance(action, torch.Tensor):
             action = action.detach().cpu().numpy()
         action = jnp.asarray(action)
@@ -1155,7 +1197,6 @@ def record_policy_video(
         render_trajectory.append(state)
 
     env = get_env(
-        env_name,
         device,
         render_callback=render_callback,
         command_type=command_type,

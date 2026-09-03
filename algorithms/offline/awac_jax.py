@@ -2,7 +2,7 @@
 # https://arxiv.org/abs/2006.09359
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple
@@ -10,21 +10,24 @@ from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple
 import distrax
 import flax
 import flax.linen as nn
-import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import pyrallis
+from pyrallis.argparsing import wrap as pyrallis_wrap
+from pyrallis.cfgparsing import dump as pyrallis_dump
 import tqdm
 import wandb
 import yaml
+from flax import core as flax_core
+from flax import serialization as flax_serialization
 from flax.training.train_state import TrainState
 
 import minari
 
-from algorithms.utils.wrapper_gym import get_env, maybe_get_shifted_env, record_policy_video
-from algorithms.utils.dataset import qlearning_dataset
+from algorithms.utils import proxy
+from algorithms.utils.randomize_gym import GymWrapper, get_env, maybe_get_shifted_env, record_policy_video
+from algorithms.utils.dataset import Dataset, qlearning_dataset
 
 os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True"
 
@@ -40,7 +43,7 @@ class AWACConfig:
     # training dataset and evaluation environment
     env: str = "halfcheetah-medium-expert-v2"
     dataset_id: str = "halfcheetah-medium-expert-v2"
-    command_type: str = None
+    command_type: Optional[str] = None
     # Optional Tier-5 shifted evaluation: JSON string of flattened env-config
     # overrides (e.g. stronger push-recovery kicks) applied only to a second eval
     # env. Normalization reuses the in-distribution dataset refs, so the shifted
@@ -178,50 +181,53 @@ class Transition(NamedTuple):
 
 
 def get_dataset(
-    dataset: Dict, config: AWACConfig, clip_to_eps: bool = True, eps: float = 1e-5
-) -> Transition:
+    dataset: Dataset,
+    config: AWACConfig, 
+    clip_to_eps: bool = True, 
+    eps: float = 1e-5
+) -> Tuple[Transition, float, float]:
     if clip_to_eps:
         lim = 1 - eps
-        dataset["actions"] = np.clip(dataset["actions"], -lim, lim)
+        dataset.actions = np.clip(dataset.actions, -lim, lim)
 
-    imputed_next_observations = np.roll(dataset["observations"], -1, axis=0)
+    imputed_next_observations = np.roll(dataset.observations, -1, axis=0)
     same_obs = np.all(
-        np.isclose(imputed_next_observations, dataset["next_observations"], atol=1e-5),
+        np.isclose(imputed_next_observations, dataset.next_observations, atol=1e-5),
         axis=-1,
     )
     dones = 1.0 - same_obs.astype(np.float32)
     dones[-1] = 1
 
-    dataset = Transition(
-        observations=jnp.array(dataset["observations"], dtype=jnp.float32),
-        actions=jnp.array(dataset["actions"], dtype=jnp.float32),
-        rewards=jnp.array(dataset["rewards"], dtype=jnp.float32),
+    transition = Transition(
+        observations=jnp.array(dataset.observations, dtype=jnp.float32),
+        actions=jnp.array(dataset.actions, dtype=jnp.float32),
+        rewards=jnp.array(dataset.rewards, dtype=jnp.float32),
         dones=jnp.array(dones, dtype=jnp.float32),
-        next_observations=jnp.array(dataset["next_observations"], dtype=jnp.float32),
+        next_observations=jnp.array(dataset.next_observations, dtype=jnp.float32),
     )
     # shuffle data and select the first buffer_size samples
-    data_size = min(config.buffer_size, len(dataset.observations))
+    data_size = min(config.buffer_size, len(transition.observations))
     rng = jax.random.PRNGKey(config.seed)
     rng, rng_permute, rng_select = jax.random.split(rng, 3)
-    perm = jax.random.permutation(rng_permute, len(dataset.observations))
-    dataset = jax.tree_util.tree_map(lambda x: x[perm], dataset)
-    assert len(dataset.observations) >= data_size
-    dataset = jax.tree_util.tree_map(lambda x: x[:data_size], dataset)
+    perm = jax.random.permutation(rng_permute, len(transition.observations))
+    transition = jax.tree_util.tree_map(lambda x: x[perm], transition)
+    assert len(transition.observations) >= data_size
+    transition = jax.tree_util.tree_map(lambda x: x[:data_size], transition)
     # normalize states
     obs_mean, obs_std = 0, 1
     if config.normalize_state:
-        obs_mean = dataset.observations.mean(0)
-        obs_std = dataset.observations.std(0)
-        dataset = dataset._replace(
-            observations=(dataset.observations - obs_mean) / (obs_std + 1e-5),
-            next_observations=(dataset.next_observations - obs_mean) / (obs_std + 1e-5),
+        obs_mean = transition.observations.mean(0)
+        obs_std = transition.observations.std(0)
+        transition = transition._replace(
+            observations=(transition.observations - obs_mean) / (obs_std + 1e-5),
+            next_observations=(transition.next_observations - obs_mean) / (obs_std + 1e-5),
         )
-    return dataset, obs_mean, obs_std
+    return transition, obs_mean, obs_std
 
 
 def target_update(
     model: TrainState, target_model: TrainState, tau: float
-) -> Tuple[TrainState, jnp.ndarray]:
+) -> TrainState:
     new_target_params = jax.tree_util.tree_map(
         lambda p, tp: p * tau + tp * (1 - tau), model.params, target_model.params
     )
@@ -230,7 +236,7 @@ def target_update(
 
 def update_by_loss_grad(
     train_state: TrainState, loss_fn: Callable
-) -> Tuple[float, Any]:
+) -> Tuple[TrainState, Any]:
     grad_fn = jax.value_and_grad(loss_fn)
     loss, grad = grad_fn(train_state.params)
     new_train_state = train_state.apply_gradients(grads=grad)
@@ -238,23 +244,22 @@ def update_by_loss_grad(
 
 
 class AWACTrainState(NamedTuple):
-    rng: jax.random.PRNGKey
+    rng: jax.Array
     critic: TrainState
     target_critic: TrainState
     actor: TrainState
 
 
 class AWAC(object):
-
     @classmethod
     def update_actor(
-        self,
+        cls,
         train_state: AWACTrainState,
         batch: Transition,
-        rng: jax.random.PRNGKey,
+        rng: jax.Array,
         config: AWACConfig,
     ) -> Tuple["AWACTrainState", jnp.ndarray]:
-        def get_actor_loss(actor_params: flax.core.FrozenDict[str, Any]) -> jnp.ndarray:
+        def get_actor_loss(actor_params: flax_core.FrozenDict[str, Any]) -> jnp.ndarray:
             dist = train_state.actor.apply_fn(actor_params, batch.observations)
             pi_actions = dist.sample(seed=rng)
             q_1, q_2 = train_state.critic.apply_fn(
@@ -282,14 +287,14 @@ class AWAC(object):
 
     @classmethod
     def update_critic(
-        self,
+        cls,
         train_state: AWACTrainState,
         batch: Transition,
-        rng: jax.random.PRNGKey,
+        rng: jax.Array,
         config: AWACConfig,
     ) -> Tuple["AWACTrainState", jnp.ndarray]:
         def get_critic_loss(
-            critic_params: flax.core.FrozenDict[str, Any]
+            critic_params: flax_core.FrozenDict[str, Any]
         ) -> jnp.ndarray:
             dist = train_state.actor.apply_fn(
                 train_state.actor.params, batch.observations
@@ -316,10 +321,10 @@ class AWAC(object):
 
     @classmethod
     def update_n_times(
-        self,
+        cls,
         train_state: AWACTrainState,
         dataset: Transition,
-        rng: jax.random.PRNGKey,
+        rng: jax.Array,
         config: AWACConfig,
     ) -> Tuple["AWACTrainState", Dict]:
         for _ in range(config.n_jitted_updates):
@@ -329,7 +334,7 @@ class AWAC(object):
             )
             batch = jax.tree_util.tree_map(lambda x: x[batch_indices], dataset)
 
-            train_state, critic_loss = self.update_critic(
+            train_state, critic_loss = cls.update_critic(
                 train_state, batch, critic_rng, config
             )
             new_target_critic = target_update(
@@ -337,7 +342,7 @@ class AWAC(object):
                 train_state.target_critic,
                 config.tau,
             )
-            train_state, actor_loss = self.update_actor(
+            train_state, actor_loss = cls.update_actor(
                 train_state, batch, actor_rng, config
             )
         return train_state._replace(target_critic=new_target_critic), {
@@ -347,10 +352,10 @@ class AWAC(object):
 
     @classmethod
     def get_action(
-        self,
+        cls,
         train_state: AWACTrainState,
         observations: np.ndarray,
-        seed: jax.random.PRNGKey,
+        seed: jax.Array,
         temperature: float = 1.0,
         max_action: float = 1.0,  # In D4RL envs, the action space is [-1, 1]
     ) -> jnp.ndarray:
@@ -362,12 +367,12 @@ class AWAC(object):
 
 
 def create_awac_train_state(
-    rng: jax.random.PRNGKey,
+    rng: jax.Array,
     observations: jnp.ndarray,
     actions: jnp.ndarray,
     config: AWACConfig,
 ) -> AWACTrainState:
-    rng, actor_rng, critic_rng, value_rng = jax.random.split(rng, 4)
+    rng, actor_rng, critic_rng, _ = jax.random.split(rng, 4)
     # initialize actor
     action_dim = actions.shape[-1]
     actor_model = GaussianPolicy(
@@ -402,12 +407,12 @@ def create_awac_train_state(
 
 def evaluate(
     policy_fn: Callable,
-    env: gym.Env,
+    env: GymWrapper,
     num_episodes: int,
     obs_mean: float,
     obs_std: float,
     seed: int = 0,
-) -> float:
+) -> Tuple[float, float]:
     env.reset_rng(seed)
     episode_returns = []
     for _ in range(num_episodes):
@@ -420,11 +425,12 @@ def evaluate(
             observation, reward, done, truncated, info = env.step(np.array(action))
             episode_return += reward
         episode_returns.append(episode_return)
-    mean_return = np.mean(episode_returns)
+    mean_return = float(np.mean(episode_returns))
     # Normalize using the env's D4RL-style reference scores (loaded from the
     # dataset metadata). Falls back to the raw return when refs are absent.
     normalized = env.get_normalized_score(mean_return)
-    normalized_score = normalized * 100 if normalized is not None else mean_return
+    normalized_score = float(normalized * 100 if normalized is not None else mean_return)
+
     return normalized_score, mean_return
 
 
@@ -456,28 +462,30 @@ def get_actor_from_checkpoint(checkpoint_path: str, state_dim: int) -> dict:
 
     dummy_obs = jnp.zeros((1, state_dim))
     initial_vars = actor_model.init(jax.random.PRNGKey(0), dummy_obs)
-    actor_params = flax.serialization.from_state_dict(initial_vars, raw_actor_params)
+    actor_params = flax_serialization.from_state_dict(initial_vars, raw_actor_params)
+    
+    # Unfreeze to use as regular dict, extract params collection
+    from flax.core import unfreeze
+    actor_params_unfrozen = unfreeze(actor_params)
+    params_only = actor_params_unfrozen.get('params', actor_params_unfrozen)
 
-    @jax.jit
-    def actor_fn_deterministic(params, observations):
-        return actor_model.apply(params, observations, temperature=0.0).loc
-
-    @jax.jit
-    def actor_fn_stochastic(params, observations, temperature):
-        dist = actor_model.apply(params, observations, temperature=temperature)
-        return dist.sample(seed=jax.random.PRNGKey(0))
-
-    def get_action(obs: np.ndarray, temperature: float = 0.0) -> np.ndarray:
+    def get_action(obs: np.ndarray, temperature: float = 0.0, rng: Optional[jax.Array] = None) -> np.ndarray:
         norm_obs = (obs - obs_mean) / (obs_std + 1e-5)
+        
+        # Apply model and handle both (output, vars) tuple and direct output cases
+        result = actor_model.apply({'params': params_only}, norm_obs, temperature=temperature)
+        dist = result[0] if isinstance(result, tuple) else result
+        
         if temperature == 0.0:
-            action = actor_fn_deterministic(actor_params, norm_obs)
+            action = dist.loc
         else:
-            action = actor_fn_stochastic(actor_params, norm_obs, temperature)
+            if rng is None:
+                rng = jax.random.PRNGKey(np.random.randint(0, 2**31))
+            action = dist.sample(seed=rng)
+        
         return np.array(jnp.clip(action, -1.0, 1.0))
 
     return {
-        "actor_fn_deterministic": actor_fn_deterministic,
-        "actor_fn_stochastic": actor_fn_stochastic,
         "get_action": get_action,
         "actor_params": actor_params,
         "obs_mean": obs_mean,
@@ -485,13 +493,16 @@ def get_actor_from_checkpoint(checkpoint_path: str, state_dim: int) -> dict:
         "config": config_dict,
     }
 
-@pyrallis.wrap()
-def train(config: AWACConfig):
+def train():
+   wrapped_train = pyrallis_wrap()(_train)
+   wrapped_train()
+
+def _train(config: AWACConfig):
     wandb.init(
         project=config.project,
         group=config.group,
         name=config.name,
-        config=config,
+        config=asdict(config),
         id=str(uuid.uuid4()),
     )
 
@@ -499,7 +510,7 @@ def train(config: AWACConfig):
         print(f"Checkpoints path: {config.checkpoints_path}")
         os.makedirs(config.checkpoints_path, exist_ok=True)
         with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
-            pyrallis.dump(config, f)
+            pyrallis_dump(config, f)
 
     rng = jax.random.PRNGKey(config.seed)
     
@@ -558,9 +569,9 @@ def train(config: AWACConfig):
 
             if config.checkpoints_path is not None and (i // eval_interval) % config.checkpoints_every == 0:
                 checkpoint = {
-                    "actor_params": flax.serialization.to_state_dict(train_state.actor.params),
-                    "critic_params": flax.serialization.to_state_dict(train_state.critic.params),
-                    "target_critic_params": flax.serialization.to_state_dict(train_state.target_critic.params),
+                    "actor_params": flax_serialization.to_state_dict(train_state.actor.params),
+                    "critic_params": flax_serialization.to_state_dict(train_state.critic.params),
+                    "target_critic_params": flax_serialization.to_state_dict(train_state.target_critic.params),
                     "obs_mean": np.array(obs_mean),
                     "obs_std": np.array(obs_std),
                     "step": i,
@@ -596,12 +607,34 @@ def train(config: AWACConfig):
             "eval/robustness_gap": normalized_score - shifted_score,
         })
 
+    print("Running proxy evaluation of the final policy...")
+
+    policy_fn = lambda obs: algo.get_action(
+        train_state,
+        obs,
+        seed=jax.random.PRNGKey(0),
+        temperature=0.0,
+    )
+
+    proxyResult = proxy.evaluate(
+        policy_fn,
+        env,
+        config.n_eval_episodes_final, 
+        obs_mean, 
+        obs_std,
+        render=True,
+        algorithm_name=config.name
+    )
+
+    # Log proxy results
+    wandb.log({"eval/proxy_results": proxyResult})
+
     # Save final checkpoint
     if config.checkpoints_path is not None:
         checkpoint = {
-            "actor_params": flax.serialization.to_state_dict(train_state.actor.params),
-            "critic_params": flax.serialization.to_state_dict(train_state.critic.params),
-            "target_critic_params": flax.serialization.to_state_dict(train_state.target_critic.params),
+            "actor_params": flax_serialization.to_state_dict(train_state.actor.params),
+            "critic_params": flax_serialization.to_state_dict(train_state.critic.params),
+            "target_critic_params": flax_serialization.to_state_dict(train_state.target_critic.params),
             "obs_mean": np.array(obs_mean),
             "obs_std": np.array(obs_std),
             "step": num_steps,
@@ -616,7 +649,7 @@ def train(config: AWACConfig):
         video_path = os.path.join(video_dir, f"{config.name}.mp4")
         record_policy_video(
             env_name=config.env,
-            act=lambda o: policy_fn(observations=o),
+            act=lambda o: policy_fn(obs=o),
             obs_mean=obs_mean,
             obs_std=obs_std,
             device=config.device,

@@ -1,8 +1,17 @@
+from dataclasses import dataclass
+
 import minari
 import numpy as np
-from typing import Dict
 
-def qlearning_dataset(dataset: minari.MinariDataset) -> Dict[str, np.ndarray]:
+@dataclass
+class Dataset:
+    observations: np.ndarray
+    actions: np.ndarray
+    next_observations: np.ndarray
+    rewards: np.ndarray
+    terminals: np.ndarray
+
+def qlearning_dataset(dataset: minari.MinariDataset) -> Dataset:
     obs, next_obs, actions, rewards, dones = [], [], [], [], []
 
     for episode in dataset.iterate_episodes():
@@ -12,10 +21,10 @@ def qlearning_dataset(dataset: minari.MinariDataset) -> Dict[str, np.ndarray]:
         rewards.append(episode.rewards)
         dones.append(np.logical_or(episode.terminations, episode.truncations))
 
-    return {
-        "observations": np.concatenate(obs),
-        "actions": np.concatenate(actions),
-        "next_observations": np.concatenate(next_obs),
-        "rewards": np.concatenate(rewards),
-        "terminals": np.concatenate(dones),
-    }
+    return Dataset(
+        observations=np.concatenate(obs),
+        actions=np.concatenate(actions),
+        next_observations=np.concatenate(next_obs),
+        rewards=np.concatenate(rewards),
+        terminals=np.concatenate(dones),
+    )

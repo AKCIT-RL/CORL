@@ -2,7 +2,7 @@
 # https://arxiv.org/abs/2106.06860
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple
@@ -10,7 +10,8 @@ from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple
 import minari
 import flax
 import flax.linen as nn
-import gymnasium as gym
+from pyrallis.argparsing import wrap as pyrallis_wrap
+from pyrallis.cfgparsing import dump as pyrallis_dump
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -20,9 +21,12 @@ import tqdm
 import wandb
 import yaml
 from flax.training.train_state import TrainState
+from flax import serialization as flax_serialization
+from flax import core as flax_core
 
-from algorithms.utils.wrapper_gym import get_env, maybe_get_shifted_env, record_policy_video
-from algorithms.utils.dataset import qlearning_dataset
+from algorithms.utils import proxy
+from algorithms.utils.randomize_gym import GymWrapper, get_env, maybe_get_shifted_env, record_policy_video
+from algorithms.utils.dataset import Dataset, qlearning_dataset
 
 os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True"
 
@@ -38,7 +42,7 @@ class TD3BCConfig:
     # training dataset and evaluation environment
     env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
     dataset_id: str = "halfcheetah-medium-expert-v2"
-    command_type: str = None
+    command_type: Optional[str] = None
     # Optional Tier-5 shifted evaluation: JSON string of flattened env-config
     # overrides (e.g. stronger push-recovery kicks) applied only to a second eval
     # env. Normalization reuses the in-distribution dataset refs, so the shifted
@@ -103,7 +107,8 @@ class TD3BCConfig:
         return hash(self.__repr__())
 
 
-def default_init(scale: Optional[float] = jnp.sqrt(2)):
+
+def default_init(scale: Optional[float] = float(jnp.sqrt(2))):
     return nn.initializers.orthogonal(scale)
 
 
@@ -162,45 +167,45 @@ class Transition(NamedTuple):
 
 
 def get_dataset(
-    dataset, config: TD3BCConfig, clip_to_eps: bool = True, eps: float = 1e-5
-) -> Transition:
+    dataset: Dataset, config: TD3BCConfig, clip_to_eps: bool = True, eps: float = 1e-5
+) -> Tuple[Transition, float, float]:
     if clip_to_eps:
         lim = 1 - eps
-        dataset["actions"] = np.clip(dataset["actions"], -lim, lim)
+        dataset.actions = np.clip(dataset.actions, -lim, lim)
 
-    imputed_next_observations = np.roll(dataset["observations"], -1, axis=0)
+    imputed_next_observations = np.roll(dataset.observations, -1, axis=0)
     same_obs = np.all(
-        np.isclose(imputed_next_observations, dataset["next_observations"], atol=1e-5),
+        np.isclose(imputed_next_observations, dataset.next_observations, atol=1e-5),
         axis=-1,
     )
     dones = 1.0 - same_obs.astype(np.float32)
     dones[-1] = 1
 
-    dataset = Transition(
-        observations=jnp.array(dataset["observations"], dtype=jnp.float32),
-        actions=jnp.array(dataset["actions"], dtype=jnp.float32),
-        rewards=jnp.array(dataset["rewards"], dtype=jnp.float32),
+    transition = Transition(
+        observations=jnp.array(dataset.observations, dtype=jnp.float32),
+        actions=jnp.array(dataset.actions, dtype=jnp.float32),
+        rewards=jnp.array(dataset.rewards, dtype=jnp.float32),
         dones=jnp.array(dones, dtype=jnp.float32),
-        next_observations=jnp.array(dataset["next_observations"], dtype=jnp.float32),
+        next_observations=jnp.array(dataset.next_observations, dtype=jnp.float32),
     )
     # shuffle data and select the first buffer_size samples
-    data_size = min(config.buffer_size, len(dataset.observations))
+    data_size = min(config.buffer_size, len(transition.observations))
     rng = jax.random.PRNGKey(config.seed)
     rng, rng_permute, rng_select = jax.random.split(rng, 3)
-    perm = jax.random.permutation(rng_permute, len(dataset.observations))
-    dataset = jax.tree_util.tree_map(lambda x: x[perm], dataset)
-    assert len(dataset.observations) >= data_size
-    dataset = jax.tree_util.tree_map(lambda x: x[:data_size], dataset)
+    perm = jax.random.permutation(rng_permute, len(transition.observations))
+    transition = jax.tree_util.tree_map(lambda x: x[perm], transition)
+    assert len(transition.observations) >= data_size
+    transition = jax.tree_util.tree_map(lambda x: x[:data_size], transition)
     # normalize states
     obs_mean, obs_std = 0, 1
     if config.normalize:
-        obs_mean = dataset.observations.mean(0)
-        obs_std = dataset.observations.std(0)
-        dataset = dataset._replace(
-            observations=(dataset.observations - obs_mean) / (obs_std + 1e-5),
-            next_observations=(dataset.next_observations - obs_mean) / (obs_std + 1e-5),
+        obs_mean = transition.observations.mean(0)
+        obs_std = transition.observations.std(0)
+        transition = transition._replace(
+            observations=(transition.observations - obs_mean) / (obs_std + 1e-5),
+            next_observations=(transition.next_observations - obs_mean) / (obs_std + 1e-5),
         )
-    return dataset, obs_mean, obs_std
+    return transition, obs_mean, obs_std
 
 
 def target_update(
@@ -232,13 +237,13 @@ class TD3BCTrainState(NamedTuple):
 class TD3BC(object):
     @classmethod
     def update_actor(
-        self,
+        cls,
         train_state: TD3BCTrainState,
         batch: Transition,
-        rng: jax.random.PRNGKey,
+        rng: jax.Array,
         config: TD3BCConfig,
     ) -> Tuple["TD3BCTrainState", jnp.ndarray]:
-        def actor_loss_fn(actor_params: flax.core.FrozenDict[str, Any]) -> jnp.ndarray:
+        def actor_loss_fn(actor_params: flax_core.FrozenDict[str, Any]) -> jnp.ndarray:
             predicted_action = train_state.actor.apply_fn(
                 actor_params, batch.observations
             )
@@ -259,14 +264,14 @@ class TD3BC(object):
 
     @classmethod
     def update_critic(
-        self,
+        cls,
         train_state: TD3BCTrainState,
         batch: Transition,
-        rng: jax.random.PRNGKey,
+        rng: jax.Array,
         config: TD3BCConfig,
     ) -> Tuple["TD3BCTrainState", jnp.ndarray]:
         def critic_loss_fn(
-            critic_params: flax.core.FrozenDict[str, Any]
+            critic_params: flax_core.FrozenDict[str, Any]
         ) -> jnp.ndarray:
             q_pred_1, q_pred_2 = train_state.critic.apply_fn(
                 critic_params, batch.observations, batch.actions
@@ -306,10 +311,10 @@ class TD3BC(object):
 
     @classmethod
     def update_n_times(
-        self,
+        cls,
         train_state: TD3BCTrainState,
         data: Transition,
-        rng: jax.random.PRNGKey,
+        rng: jax.Array,
         config: TD3BCConfig,
     ) -> Tuple["TD3BCTrainState", Dict]:
         for _ in range(
@@ -321,11 +326,11 @@ class TD3BC(object):
             )
             batch: Transition = jax.tree_util.tree_map(lambda x: x[batch_idx], data)
             rng, critic_rng, actor_rng = jax.random.split(rng, 3)
-            train_state, critic_loss = self.update_critic(
+            train_state, critic_loss = cls.update_critic(
                 train_state, batch, critic_rng, config
             )
             if _ % config.policy_freq == 0:
-                train_state, actor_loss = self.update_actor(
+                train_state, actor_loss = cls.update_actor(
                     train_state, batch, actor_rng, config
                 )
                 new_target_critic = target_update(
@@ -345,7 +350,7 @@ class TD3BC(object):
 
     @classmethod
     def get_action(
-        self,
+        cls,
         train_state: TD3BCTrainState,
         obs: jnp.ndarray,
         max_action: float = 1.0,  # In D4RL, action is scaled to [-1, 1]
@@ -356,7 +361,7 @@ class TD3BC(object):
 
 
 def create_td3bc_train_state(
-    rng: jax.random.PRNGKey,
+    rng: jax.Array,
     observations: jnp.ndarray,
     actions: jnp.ndarray,
     config: TD3BCConfig,
@@ -401,13 +406,13 @@ def create_td3bc_train_state(
 
 
 def evaluate(
-    policy_fn: Callable[[jnp.ndarray], jnp.ndarray],
-    env: gym.Env,
+    policy_fn: Callable,
+    env: GymWrapper,
     num_episodes: int,
     obs_mean,
     obs_std,
     seed: int = 0,
-) -> float:
+) -> Tuple[float, float]:
     env.reset_rng(seed)
     episode_returns = []
     for _ in range(num_episodes):
@@ -421,7 +426,7 @@ def evaluate(
             episode_return += reward
         episode_returns.append(episode_return)
     
-    mean_return = np.mean(episode_returns)
+    mean_return = float(np.mean(episode_returns))
     # Normalize using the env's D4RL-style reference scores (loaded from the
     # dataset metadata). Falls back to the raw return when refs are absent.
     normalized = env.get_normalized_score(mean_return)
@@ -493,14 +498,15 @@ def get_actor_from_checkpoint(
         action_dim=action_dim,
         max_action=max_action,
     )
-    actor_params = flax.serialization.from_state_dict(
+    actor_params = flax_serialization.from_state_dict(
         actor_model.init(jax.random.PRNGKey(0), jnp.zeros((1, state_dim))),
         actor_params_dict,
     )
 
     @jax.jit
     def actor_fn(obs: jnp.ndarray) -> jnp.ndarray:
-        return jnp.clip(actor_model.apply(actor_params, obs), -max_action, max_action)
+        act, _ = actor_model.apply(actor_params, obs)
+        return jnp.clip(act, -max_action, max_action)
 
     def get_action(obs: np.ndarray) -> np.ndarray:
         obs_normalized = (obs - obs_mean) / (obs_std + 1e-5)
@@ -521,13 +527,16 @@ def get_actor_from_checkpoint(
     }
 
 
-@pyrallis.wrap()
-def train(config: TD3BCConfig):
+def train():
+    wrapped_train = pyrallis_wrap()(_train)
+    wrapped_train()
+
+def _train(config: TD3BCConfig):
     wandb.init(
         project=config.project,
         group=config.group,
         name=config.name,
-        config=config,
+        config=asdict(config),
         id=str(uuid.uuid4()),
     )
 
@@ -535,7 +544,7 @@ def train(config: TD3BCConfig):
         print(f"Checkpoints path: {config.checkpoints_path}")
         os.makedirs(config.checkpoints_path, exist_ok=True)
         with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
-            pyrallis.dump(config, f)
+            pyrallis_dump(config, f)
 
     minari_dataset = minari.load_dataset(config.dataset_id)
     dataset = qlearning_dataset(minari_dataset)
@@ -571,7 +580,7 @@ def train(config: TD3BCConfig):
         wandb.log(train_metrics, step=i)
 
         if i % eval_interval == 0:
-            policy_fn = partial(act_fn, train_state=train_state)
+            policy_fn = lambda obs: act_fn(train_state, obs)
             normalized_score, raw_score = evaluate(
                 policy_fn,
                 env,
@@ -588,10 +597,10 @@ def train(config: TD3BCConfig):
 
             if config.checkpoints_path is not None and (i // eval_interval) % config.checkpoints_every == 0:
                 checkpoint = {
-                    "actor_params": flax.serialization.to_state_dict(train_state.actor.params),
-                    "critic_params": flax.serialization.to_state_dict(train_state.critic.params),
-                    "target_actor_params": flax.serialization.to_state_dict(train_state.target_actor.params),
-                    "target_critic_params": flax.serialization.to_state_dict(train_state.target_critic.params),
+                    "actor_params": flax_serialization.to_state_dict(train_state.actor.params),
+                    "critic_params": flax_serialization.to_state_dict(train_state.critic.params),
+                    "target_actor_params": flax_serialization.to_state_dict(train_state.target_actor.params),
+                    "target_critic_params": flax_serialization.to_state_dict(train_state.target_critic.params),
                     "obs_mean": np.array(obs_mean),
                     "obs_std": np.array(obs_std),
                     "step": i,
@@ -601,7 +610,7 @@ def train(config: TD3BCConfig):
                 print(f"Saved checkpoint to {checkpoint_path}")
 
     # final evaluation
-    policy_fn = partial(act_fn, train_state=train_state)
+    policy_fn = lambda obs: act_fn(train_state, obs)
     normalized_score, raw_score = evaluate(
         policy_fn,
         env,
@@ -634,13 +643,27 @@ def train(config: TD3BCConfig):
             "eval/robustness_gap": normalized_score - shifted_score,
         })
 
+    print("Running proxy evaluation of the final policy...")
+    proxyResult = proxy.evaluate(
+        policy_fn,
+        env,
+        config.n_eval_episodes_final, 
+        obs_mean, 
+        obs_std,
+        render=True,
+        algorithm_name=config.name
+    )
+
+    # Log proxy results
+    wandb.log({"eval/proxy_results": proxyResult})
+
     # Save final checkpoint
     if config.checkpoints_path is not None:
         checkpoint = {
-            "actor_params": flax.serialization.to_state_dict(train_state.actor.params),
-            "critic_params": flax.serialization.to_state_dict(train_state.critic.params),
-            "target_actor_params": flax.serialization.to_state_dict(train_state.target_actor.params),
-            "target_critic_params": flax.serialization.to_state_dict(train_state.target_critic.params),
+            "actor_params": flax_serialization.to_state_dict(train_state.actor.params),
+            "critic_params": flax_serialization.to_state_dict(train_state.critic.params),
+            "target_actor_params": flax_serialization.to_state_dict(train_state.target_actor.params),
+            "target_critic_params": flax_serialization.to_state_dict(train_state.target_critic.params),
             "obs_mean": np.array(obs_mean),
             "obs_std": np.array(obs_std),
             "step": num_steps,

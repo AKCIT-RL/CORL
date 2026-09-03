@@ -2,25 +2,26 @@
 # https://arxiv.org/abs/2106.01345
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
-import flax
-import gymnasium as gym
 import jax
 import jax.numpy as jnp
+from pyrallis.argparsing import wrap as pyrallis_wrap
+from pyrallis.cfgparsing import dump as pyrallis_dump
 import numpy as np
 import optax
-import pyrallis
 import wandb
 from flax import linen as nn
 from flax.training.train_state import TrainState
+from flax import serialization as flax_serialization
 from tqdm import tqdm
 
 import minari
 
-from algorithms.utils.wrapper_gym import get_env, maybe_get_shifted_env
+from algorithms.utils import proxy
+from algorithms.utils.randomize_gym import GymWrapper, get_env, maybe_get_shifted_env
 
 os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True"
 
@@ -121,7 +122,7 @@ class DTConfig:
             self.train_seed = self.seed
 
 
-def default_init(scale: Optional[float] = jnp.sqrt(2)):
+def default_init(scale: Optional[float] = float(jnp.sqrt(2))):
     return nn.initializers.orthogonal(scale)
 
 
@@ -275,7 +276,8 @@ class DecisionTransformer(nn.Module):
         return state_preds, action_preds, return_preds
 
 
-def discount_cumsum(x: jnp.ndarray, gamma: float) -> jnp.ndarray:
+def discount_cumsum(x: np.ndarray, gamma: float) -> np.ndarray:
+    x = np.asarray(x)
     disc_cumsum = np.zeros_like(x)
     disc_cumsum[-1] = x[-1]
     for t in reversed(range(x.shape[0] - 1)):
@@ -325,7 +327,7 @@ class Trajectory(NamedTuple):
 
 
 def padd_by_zero(arr: jnp.ndarray, pad_to: int) -> jnp.ndarray:
-    return np.pad(arr, ((0, pad_to - arr.shape[0]), (0, 0)), mode="constant")
+    return jnp.pad(arr, ((0, pad_to - arr.shape[0]), (0, 0)), mode="constant")
 
 
 def make_padded_trajectories(
@@ -344,7 +346,7 @@ def make_padded_trajectories(
     # Pad trajectories
     padded_trajectories = {key: [] for key in Trajectory._fields}
     for traj in trajectories:
-        timesteps = np.arange(0, len(traj["observations"]))
+        timesteps = jnp.arange(0, len(traj["observations"]))
         padded_trajectories["timesteps"].append(
             padd_by_zero(timesteps.reshape(-1, 1), max_len).reshape(-1)
         )
@@ -357,7 +359,7 @@ def make_padded_trajectories(
         )
         padded_trajectories["masks"].append(
             padd_by_zero(
-                np.ones((len(traj["observations"]), 1)).reshape(-1, 1), max_len
+                jnp.ones((len(traj["observations"]), 1)).reshape(-1, 1), max_len
             ).reshape(-1)
         )
     return (
@@ -376,8 +378,8 @@ def make_padded_trajectories(
 
 
 def sample_start_idx(
-    rng: jax.random.PRNGKey,
-    traj_idx: int,
+    rng: jax.Array,
+    traj_idx: jax.Array,
     padded_traj_length: jnp.ndarray,
     seq_len: int,
 ) -> jnp.ndarray:
@@ -431,7 +433,7 @@ class DT(object):
 
     @classmethod
     def update(
-        self, train_state: DTTrainState, batch: Trajectory, rng: jax.random.PRNGKey
+        cls, train_state: DTTrainState, batch: Trajectory, rng: jax.Array
     ) -> Tuple[Any, jnp.ndarray]:
         timesteps, states, actions, returns_to_go, traj_mask = (
             batch.timesteps,
@@ -460,7 +462,7 @@ class DT(object):
 
     @classmethod
     def get_action(
-        self,
+        cls,
         train_state: DTTrainState,
         timesteps: jnp.ndarray,
         states: jnp.ndarray,
@@ -479,7 +481,7 @@ class DT(object):
 
 
 def create_dt_train_state(
-    rng: jax.random.PRNGKey, state_dim: int, act_dim: int, config: DTConfig
+    rng: jax.Array, state_dim: int, act_dim: int, config: DTConfig
 ) -> DTTrainState:
     model = DecisionTransformer(
         state_dim=state_dim,
@@ -616,7 +618,7 @@ def get_dt_from_checkpoint(
     )
     
     # Convert params back to FrozenDict
-    transformer_params = flax.serialization.from_state_dict(
+    transformer_params = flax_serialization.from_state_dict(
         dt_model.init(
             jax.random.PRNGKey(0),
             timesteps=jnp.zeros((1, seq_len), jnp.int32),
@@ -636,7 +638,7 @@ def get_dt_from_checkpoint(
         actions: jnp.ndarray,
         returns_to_go: jnp.ndarray,
     ) -> jnp.ndarray:
-        state_preds, action_preds, return_preds = dt_model.apply(
+        predictions, _ = dt_model.apply(
             transformer_params,
             timesteps,
             states,
@@ -644,6 +646,7 @@ def get_dt_from_checkpoint(
             returns_to_go,
             training=False,
         )
+        state_preds, action_preds, return_preds = predictions
         return action_preds
     
     # Create a get_action function for easier inference
@@ -673,21 +676,25 @@ def get_dt_from_checkpoint(
 def evaluate(
     policy_fn: Callable,
     train_state: DTTrainState,
-    env: gym.Env,
+    env: GymWrapper,
     config: DTConfig,
     target_return: float,
-    state_mean=0,
-    state_std=1,
+    state_mean: Any = 0,
+    state_std: Any = 1,
     seed: int = 0,
     num_episodes: Optional[int] = None,
-) -> float:
+) -> Tuple[float, float]:
     env.reset_rng(seed)
     n_eps = num_episodes if num_episodes is not None else config.eval_episodes
     eval_batch_size = 1  # required for forward pass
     total_reward = 0
     total_timesteps = 0
-    state_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
+
+    state_shape = env.observation_space.shape if env.observation_space.shape is not None else (1,)
+    act_shape = env.action_space.shape if env.action_space.shape is not None else (1,)
+
+    state_dim = state_shape[0]
+    act_dim = act_shape[0]
     # Convert state_mean and state_std to JAX arrays and ensure correct shape
     state_mean = jnp.array(state_mean).reshape(-1) if not isinstance(state_mean, (int, float)) else jnp.array([state_mean] * state_dim)
     state_std = jnp.array(state_std).reshape(-1) if not isinstance(state_std, (int, float)) else jnp.array([state_std] * state_dim)
@@ -739,14 +746,19 @@ def evaluate(
                 )
                 act = act_preds[0, -1]
             running_state, running_reward, done, truncated, _ = env.step(np.array(act))
-            # Ensure running_state is 1D
             running_state = np.array(running_state).flatten()
-            # add action in placeholder
             actions = actions.at[0, t].set(act)
-            total_reward += running_reward
+            
+            if hasattr(running_reward, "item"):
+                reward_scalar = float(running_reward.item())
+            else:
+                reward_scalar = float(np.squeeze(running_reward))
+                
+            total_reward += reward_scalar
+            
             if done or truncated:
                 break
-    mean_reward = total_reward / n_eps
+    mean_reward = float(total_reward / n_eps)
     # Normalize using the env's D4RL-style reference scores (loaded from the
     # dataset metadata). Falls back to the raw return when refs are absent.
     normalized = env.get_normalized_score(mean_reward)
@@ -760,8 +772,8 @@ def record_dt_video(
     config: DTConfig,
     target_return: float,
     save_path: str,
-    state_mean=0,
-    state_std=1,
+    state_mean: Any = 0,
+    state_std: Any = 1,
 ):
     """Roll out the DT policy for a single episode and save an mp4 of it."""
     # Headless rendering backend (matches algorithms/utils/save_video.py).
@@ -773,14 +785,16 @@ def record_dt_video(
         render_trajectory.append(state)
 
     env = get_env(
-        config.env_name,
         config.device,
         render_callback=render_callback,
         command_type=config.command_type,
     )
 
-    state_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
+    state_shape = env.observation_space.shape if env.observation_space.shape is not None else (1,)
+    act_shape = env.action_space.shape if env.action_space.shape is not None else (1,)
+
+    state_dim = state_shape[0]
+    act_dim = act_shape[0]
     state_mean = (
         jnp.array(state_mean).reshape(-1)
         if not isinstance(state_mean, (int, float))
@@ -847,13 +861,16 @@ def record_dt_video(
     env.save_video(render_trajectory, save_path=save_path)
 
 
-@pyrallis.wrap()
-def train(config: DTConfig):
+def train():
+   wrapped_train = pyrallis_wrap()(_train)
+   wrapped_train()
+
+def _train(config: DTConfig):
     wandb.init(
         project=config.project,
         group=config.group,
         name=config.name,
-        config=config,
+        config=asdict(config),
         id=str(uuid.uuid4()),
     )
 
@@ -861,7 +878,7 @@ def train(config: DTConfig):
         print(f"Checkpoints path: {config.checkpoints_path}")
         os.makedirs(config.checkpoints_path, exist_ok=True)
         with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
-            pyrallis.dump(config, f)
+            pyrallis_dump(config, f)
 
     env = get_env(config.env_name, config.device, command_type=config.command_type, dataset=minari.load_dataset(config.dataset_id))
     shifted_env = maybe_get_shifted_env(
@@ -869,8 +886,10 @@ def train(config: DTConfig):
         dataset=minari.load_dataset(config.dataset_id), eval_shift=config.eval_shift,
     )
     rng = jax.random.PRNGKey(config.seed)
-    state_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
+    state_shape = env.observation_space.shape if env.observation_space.shape is not None else (1,)
+    act_shape = env.action_space.shape if env.action_space.shape is not None else (1,)
+    state_dim = state_shape[0]
+    act_dim = act_shape[0]
     trajectories, episode_num, traj_lengths, state_mean, state_std = (
         make_padded_trajectories(config)
     )
@@ -911,7 +930,7 @@ def train(config: DTConfig):
 
             if config.checkpoints_path is not None and (i // config.eval_every) % config.checkpoints_every == 0:
                 checkpoint = {
-                    "transformer_params": flax.serialization.to_state_dict(train_state.transformer.params),
+                    "transformer_params": flax_serialization.to_state_dict(train_state.transformer.params),
                     "state_mean": np.array(state_mean),
                     "state_std": np.array(state_std),
                     "step": i,
@@ -947,10 +966,69 @@ def train(config: DTConfig):
             })
             print(f"Final Shifted Score for Target Return {target_return}: {shifted_score}")
 
+    print("Running proxy evaluation of the final policy...")
+
+    t_step = 0
+    states = jnp.zeros((1, config.episode_len, state_dim), dtype=jnp.float32)
+    actions = jnp.zeros((1, config.episode_len, act_dim), dtype=jnp.float32)
+    timesteps = jnp.repeat(jnp.arange(0, config.episode_len, 1, jnp.int32)[None, :], 1, axis=0)
+    rewards_to_go = jnp.zeros((1, config.episode_len, 1), dtype=jnp.float32)
+    running_rtg = target_return * config.reward_scale
+
+    def policy_fn(obs: jnp.ndarray) -> jnp.ndarray:
+        nonlocal t_step, states, actions, rewards_to_go, running_rtg
+        
+        if t_step >= config.episode_len:
+            t_step = 0
+            running_rtg = target_return * config.reward_scale
+
+        normalized_state = (obs.flatten() - state_mean) / state_std
+        states = states.at[0, t_step].set(normalized_state)
+        rewards_to_go = rewards_to_go.at[0, t_step].set(running_rtg)
+
+        if t_step < config.seq_len:
+            act_preds = algo.get_action(
+                train_state,
+                timesteps[:, : t_step + 1],
+                states[:, : t_step + 1],
+                actions[:, : t_step + 1],
+                rewards_to_go[:, : t_step + 1],
+            )
+        else:
+            act_preds = algo.get_action(
+                train_state,
+                timesteps[:, t_step - config.seq_len + 1 : t_step + 1],
+                states[:, t_step - config.seq_len + 1 : t_step + 1],
+                actions[:, t_step - config.seq_len + 1 : t_step + 1],
+                rewards_to_go[:, t_step - config.seq_len + 1 : t_step + 1],
+            )
+
+        act = act_preds[0] if act_preds.ndim > 1 else act_preds
+        if act.ndim > 1:
+            act = act[0]
+            
+        actions = actions.at[0, t_step].set(act)
+        t_step += 1
+        return jnp.array(act)
+
+
+    proxyResult = proxy.evaluate(
+        policy_fn,
+        env,
+        config.n_eval_episodes_final, 
+        state_mean, 
+        state_std, 
+        render=True,
+        algorithm_name=config.name
+    )
+
+    # Log proxy results
+    wandb.log({"eval/proxy_results": proxyResult})
+
     # Save final checkpoint
     if config.checkpoints_path is not None:
         checkpoint = {
-            "transformer_params": flax.serialization.to_state_dict(train_state.transformer.params),
+            "transformer_params": flax_serialization.to_state_dict(train_state.transformer.params),
             "state_mean": np.array(state_mean),
             "state_std": np.array(state_std),
             "step": config.update_steps,

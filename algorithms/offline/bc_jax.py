@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import pyrallis
+from pyrallis.argparsing import wrap as pyrallis_wrap
 import tqdm
 import wandb
 import yaml
@@ -22,15 +22,16 @@ from flax.training.train_state import TrainState
 import flax.serialization
 from flax.core import FrozenDict
 
-from algorithms.utils.wrapper_gym import GymWrapper, get_env, maybe_get_shifted_env, record_policy_video
-from algorithms.utils.dataset import qlearning_dataset
+from algorithms.utils import proxy
+from algorithms.utils.randomize_gym import GymWrapper, get_env, maybe_get_shifted_env, record_policy_video
+from algorithms.utils.dataset import Dataset, qlearning_dataset
 
 os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True"
 
 @dataclass
 class BCConfig:
     # wandb project name
-    project: str = "train-TD3-BC"
+    project: str = "CORL"
     # wandb group name
     group: str = "BC"
     # wandb run name
@@ -64,6 +65,7 @@ class BCConfig:
     n_episodes: int = 10
     # number of episodes for the final evaluation (larger -> lower variance)
     n_eval_episodes_final: int = 50
+    n_eval_actors: int = 10
     # fixed seed for evaluation rollouts (reproducible / comparable)
     eval_seed: int = 0
     # path for checkpoints saving, optional
@@ -138,47 +140,47 @@ class Transition(NamedTuple):
 
 
 def get_dataset(
-    dataset, config: BCConfig, clip_to_eps: bool = True, eps: float = 1e-5
-) -> Tuple:
+    dataset: Dataset, config: BCConfig, clip_to_eps: bool = True, eps: float = 1e-5
+) -> Tuple[Transition, float, float]:
     # dataset = d4rl.qlearning_dataset(env)
 
     if clip_to_eps:
         lim = 1 - eps
-        dataset["actions"] = np.clip(dataset["actions"], -lim, lim)
+        dataset.actions = np.clip(dataset.actions, -lim, lim)
 
-    imputed_next_observations = np.roll(dataset["observations"], -1, axis=0)
+    imputed_next_observations = np.roll(dataset.observations, -1, axis=0)
     same_obs = np.all(
-        np.isclose(imputed_next_observations, dataset["next_observations"], atol=1e-5),
+        np.isclose(imputed_next_observations, dataset.next_observations, atol=1e-5),
         axis=-1,
     )
     dones = 1.0 - same_obs.astype(np.float32)
     dones[-1] = 1
 
-    dataset = Transition(
-        observations=jnp.array(dataset["observations"], dtype=jnp.float32),
-        actions=jnp.array(dataset["actions"], dtype=jnp.float32),
-        rewards=jnp.array(dataset["rewards"], dtype=jnp.float32),
+    transition = Transition(
+        observations=jnp.array(dataset.observations, dtype=jnp.float32),
+        actions=jnp.array(dataset.actions, dtype=jnp.float32),
+        rewards=jnp.array(dataset.rewards, dtype=jnp.float32),
         dones=jnp.array(dones, dtype=jnp.float32),
-        next_observations=jnp.array(dataset["next_observations"], dtype=jnp.float32),
+        next_observations=jnp.array(dataset.next_observations, dtype=jnp.float32),
     )
     # shuffle data and select the first buffer_size samples
-    data_size = min(config.buffer_size, len(dataset.observations))
+    data_size = min(config.buffer_size, len(transition.observations))
     rng = jax.random.PRNGKey(config.seed)
     rng, rng_permute = jax.random.split(rng, 2)
-    perm = jax.random.permutation(rng_permute, len(dataset.observations))
-    dataset = jax.tree_util.tree_map(lambda x: x[perm], dataset)
-    assert len(dataset.observations) >= data_size
-    dataset = jax.tree_util.tree_map(lambda x: x[:data_size], dataset)
+    perm = jax.random.permutation(rng_permute, len(transition.observations))
+    transition = jax.tree_util.tree_map(lambda x: x[perm], transition)
+    assert len(transition.observations) >= data_size
+    transition = jax.tree_util.tree_map(lambda x: x[:data_size], transition)
     # normalize states
     obs_mean, obs_std = 0, 1
     if config.normalize:
-        obs_mean = dataset.observations.mean(0)
-        obs_std = dataset.observations.std(0)
-        dataset = dataset._replace(
-            observations=(dataset.observations - obs_mean) / (obs_std + 1e-5),
-            next_observations=(dataset.next_observations - obs_mean) / (obs_std + 1e-5),
+        obs_mean = transition.observations.mean(0)
+        obs_std = transition.observations.std(0)
+        transition = transition._replace(
+            observations=(transition.observations - obs_mean) / (obs_std + 1e-5),
+            next_observations=(transition.next_observations - obs_mean) / (obs_std + 1e-5),
         )
-    return dataset, obs_mean, obs_std
+    return transition, obs_mean, obs_std
 
 
 def update_by_loss_grad(
@@ -198,7 +200,7 @@ class BCTrainState(NamedTuple):
 class BC(object):
     @classmethod
     def update_actor(
-        self,
+        cls,
         train_state: BCTrainState,
         batch: Transition,
         rng: jax.Array,
@@ -217,7 +219,7 @@ class BC(object):
 
     @classmethod
     def update_n_times(
-        self,
+        cls,
         train_state: BCTrainState,
         data: Transition,
         rng: jax.Array,
@@ -233,7 +235,7 @@ class BC(object):
             )
             batch: Transition = jax.tree_util.tree_map(lambda x: x[batch_idx], data)
             rng, actor_rng = jax.random.split(rng, 2)
-            train_state, actor_loss = self.update_actor(
+            train_state, actor_loss = cls.update_actor(
                 train_state, batch, actor_rng, config
             )
         return train_state, {
@@ -242,7 +244,7 @@ class BC(object):
 
     @classmethod
     def get_action(
-        self,
+        cls,
         train_state: BCTrainState,
         obs: jnp.ndarray,
         max_action: float = 1.0,  # In D4RL, action is scaled to [-1, 1]
@@ -401,37 +403,55 @@ def get_actor_from_checkpoint(
         "config": config,
     }
 
-
 def evaluate(
-    policy_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    policy_fn: Callable,
     env: GymWrapper,
     num_episodes: int,
-    obs_mean,
-    obs_std,
+    obs_mean: float,
+    obs_std: float,
     seed: int = 0,
-) -> float:
+) -> Tuple[float, float]:
     env.reset_rng(seed)
+    num_envs = getattr(env, "num_envs", 1)
+    max_steps = 2000
     episode_returns = []
-    for _ in range(num_episodes):
-        episode_return = 0
+
+    while len(episode_returns) < num_episodes:
+        episode_return = np.zeros(num_envs, dtype=np.float32)
+        finished = np.zeros(num_envs, dtype=bool)
         observation, _ = env.reset()
-        done = truncated = False
-        while not done and not truncated:
+        steps = 0
+
+        while not np.all(finished):
+            steps += 1
+            
+            if steps >= max_steps:
+                finished[:] = True
+                break
+            
             observation = (observation - obs_mean) / (obs_std + 1e-5)
             action = policy_fn(observation)
             observation, reward, done, truncated, _ = env.step(action)
-            episode_return += reward
-        episode_returns.append(episode_return)
+
+            done = np.asarray(done, dtype=bool)
+            truncated = np.asarray(truncated, dtype=bool)
+            active_mask = ~finished
+            episode_return += np.asarray(reward, dtype=np.float32) * active_mask
+            finished |= done | truncated
+
+        completed = min(num_envs, num_episodes - len(episode_returns))
+        episode_returns.extend(episode_return[:completed].tolist())
     
     mean_return = np.mean(episode_returns)
-    # Normalize using the env's D4RL-style reference scores (loaded from the
-    # dataset metadata). Falls back to the raw return when refs are absent.
     normalized = env.get_normalized_score(mean_return)
     normalized_score = normalized * 100 if normalized is not None else mean_return.item()
     return normalized_score, mean_return.item()
 
-@pyrallis.wrap()  # type: ignore
-def train(config: BCConfig):
+def train():
+    wrapped_train = pyrallis_wrap()(_train)
+    wrapped_train()
+
+def _train(config: BCConfig):
     wandb.init(
         project=config.project,
         group=config.group,
@@ -448,7 +468,13 @@ def train(config: BCConfig):
 
     minari_dataset = minari.load_dataset(config.dataset_id)
     dataset = qlearning_dataset(minari_dataset)
-    env = get_env(config.env, config.device, command_type=config.command_type, dataset=minari_dataset)
+    env = get_env(
+        config.env, 
+        config.device, 
+        command_type=config.command_type, 
+        dataset=minari_dataset,
+        num_actors=config.n_eval_actors,
+    )
     shifted_env = maybe_get_shifted_env(
         config.env, config.device, command_type=config.command_type,
         dataset=minari_dataset, eval_shift=config.eval_shift,
@@ -543,6 +569,20 @@ def train(config: BCConfig):
             "eval/shifted_final_raw_score": shifted_raw,
             "eval/robustness_gap": normalized_score - shifted_score,
         })
+        
+    print("Running proxy evaluation of the final policy...")
+    proxyResult = proxy.evaluate(
+        policy_fn,
+        env,
+        config.n_eval_episodes_final, 
+        obs_mean, 
+        obs_std,
+        render=True,
+        algorithm_name=config.name
+    )
+
+    # Log proxy results
+    wandb.log({"eval/proxy_results": proxyResult})
 
     # Save final checkpoint
     if config.checkpoints_path is not None:
@@ -577,5 +617,5 @@ def train(config: BCConfig):
     wandb.finish()
 
 if __name__ == "__main__":
-    train() # type: ignore
+    train()
 

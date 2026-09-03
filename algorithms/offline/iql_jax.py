@@ -2,27 +2,29 @@
 # https://arxiv.org/abs/2110.06169
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple
 
 import distrax
-import flax
 import flax.linen as nn
-import gymnasium as gym
+from pyrallis.argparsing import wrap as pyrallis_wrap
+from pyrallis.cfgparsing import dump as pyrallis_dump
 import jax
 import jax.numpy as jnp
 import minari
 import numpy as np
 import optax
-import pyrallis
 import tqdm
 import wandb
 import yaml
+from flax import serialization as flax_serialization
+from flax import core as flax_core
 from flax.training.train_state import TrainState
 
-from algorithms.utils.wrapper_gym import get_env, maybe_get_shifted_env, record_policy_video
+from algorithms.utils import proxy
+from algorithms.utils.randomize_gym import GymWrapper, get_env, maybe_get_shifted_env, record_policy_video
 from algorithms.utils.dataset import qlearning_dataset
 
 os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True"
@@ -109,7 +111,7 @@ class IQLConfig:
         return hash(self.__repr__())
 
 
-def default_init(scale: Optional[float] = jnp.sqrt(2)):
+def default_init(scale: Optional[float] = float(jnp.sqrt(2))):
     return nn.initializers.orthogonal(scale)
 
 
@@ -148,7 +150,7 @@ def ensemblize(cls, num_qs, out_axes=0, **kwargs):
         cls,
         variable_axes={"params": 0},
         split_rngs={**split_rngs, "params": True},
-        in_axes=None,
+        in_axes=None, # type: ignore
         out_axes=out_axes,
         axis_size=num_qs,
         **kwargs,
@@ -216,60 +218,59 @@ def get_normalization(dataset: Transition) -> float:
 
 def get_dataset(
     config: IQLConfig, clip_to_eps: bool = True, eps: float = 1e-5
-) -> Transition:
+) -> Tuple[Transition, Any, Any]:
     dataset = minari.load_dataset(config.dataset_id)
     dataset = qlearning_dataset(dataset)
 
     if clip_to_eps:
         lim = 1 - eps
-        dataset["actions"] = np.clip(dataset["actions"], -lim, lim)
+        dataset.actions = np.clip(dataset.actions, -lim, lim)
 
-    dones_float = np.zeros_like(dataset['rewards'])
+    dones_float = np.zeros_like(dataset.rewards)
 
     for i in range(len(dones_float) - 1):
-        if np.linalg.norm(dataset['observations'][i + 1] -
-                            dataset['next_observations'][i]
-                            ) > 1e-6 or dataset['terminals'][i] == 1.0:
+        if np.linalg.norm(dataset.observations[i + 1] -
+                            dataset.next_observations[i]
+                            ) > 1e-6 or dataset.terminals[i] == 1.0:
             dones_float[i] = 1
         else:
             dones_float[i] = 0
     dones_float[-1] = 1
 
-    dataset = Transition(
-        observations=jnp.array(dataset["observations"], dtype=jnp.float32),
-        actions=jnp.array(dataset["actions"], dtype=jnp.float32),
-        rewards=jnp.array(dataset["rewards"], dtype=jnp.float32),
-        next_observations=jnp.array(dataset["next_observations"], dtype=jnp.float32),
-        dones=jnp.array(dataset["terminals"], dtype=jnp.float32),
+    transition = Transition(
+        observations=jnp.array(dataset.observations, dtype=jnp.float32),
+        actions=jnp.array(dataset.actions, dtype=jnp.float32),
+        rewards=jnp.array(dataset.rewards, dtype=jnp.float32),
+        next_observations=jnp.array(dataset.next_observations, dtype=jnp.float32),
+        dones=jnp.array(dataset.terminals, dtype=jnp.float32),
         dones_float=jnp.array(dones_float, dtype=jnp.float32),
     )
     if "antmaze" in config.env:
-        dataset = dataset._replace(
-            rewards=dataset.rewards - 1.0
+        transition = transition._replace(
+            rewards=transition.rewards - 1.0
         )
-    # normalize states
     obs_mean, obs_std = 0, 1
     if config.normalize:
-        obs_mean = dataset.observations.mean(0)
-        obs_std = dataset.observations.std(0)
-        dataset = dataset._replace(
-            observations=(dataset.observations - obs_mean) / (obs_std + 1e-5),
-            next_observations=(dataset.next_observations - obs_mean) / (obs_std + 1e-5),
+        obs_mean = transition.observations.mean(0)
+        obs_std = transition.observations.std(0)
+        transition = transition._replace(
+            observations=(transition.observations - obs_mean) / (obs_std + 1e-5),
+            next_observations=(transition.next_observations - obs_mean) / (obs_std + 1e-5),
         )
     # normalize rewards
     if config.normalize_reward:    
-        normalizing_factor = get_normalization(dataset)
-        dataset = dataset._replace(rewards=dataset.rewards / normalizing_factor)
+        normalizing_factor = get_normalization(transition)
+        transition = transition._replace(rewards=transition.rewards / normalizing_factor)
     
     # shuffle data and select the first buffer_size samples
-    data_size = min(config.buffer_size, len(dataset.observations))
+    data_size = min(config.buffer_size, len(transition.observations))
     rng = jax.random.PRNGKey(config.seed)
     rng, rng_permute, rng_select = jax.random.split(rng, 3)
-    perm = jax.random.permutation(rng_permute, len(dataset.observations))
-    dataset = jax.tree_util.tree_map(lambda x: x[perm], dataset)
-    assert len(dataset.observations) >= data_size
-    dataset = jax.tree_util.tree_map(lambda x: x[:data_size], dataset)
-    return dataset, obs_mean, obs_std
+    perm = jax.random.permutation(rng_permute, len(transition.observations))
+    transition = jax.tree_util.tree_map(lambda x: x[perm], transition)
+    assert len(transition.observations) >= data_size
+    transition = jax.tree_util.tree_map(lambda x: x[:data_size], transition)
+    return transition, obs_mean, obs_std
 
 
 def expectile_loss(diff, expectile=0.8) -> jnp.ndarray:
@@ -296,7 +297,7 @@ def update_by_loss_grad(
 
 
 class IQLTrainState(NamedTuple):
-    rng: jax.random.PRNGKey
+    rng: jax.Array
     critic: TrainState
     target_critic: TrainState
     value: TrainState
@@ -307,15 +308,15 @@ class IQL(object):
 
     @classmethod
     def update_critic(
-        self, train_state: IQLTrainState, batch: Transition, config: IQLConfig
-    ) -> Tuple["IQLTrainState", Dict]:
+        cls, train_state: IQLTrainState, batch: Transition, config: IQLConfig
+    ) -> Tuple["IQLTrainState", jnp.ndarray]:
         next_v = train_state.value.apply_fn(
             train_state.value.params, batch.next_observations
         )
         target_q = batch.rewards + config.discount * (1 - batch.dones) * next_v
         
         def critic_loss_fn(
-            critic_params: flax.core.FrozenDict[str, Any]
+            critic_params: flax_core.FrozenDict[str, Any]
         ) -> jnp.ndarray:
             q1, q2 = train_state.critic.apply_fn(
                 critic_params, batch.observations, batch.actions
@@ -330,13 +331,13 @@ class IQL(object):
 
     @classmethod
     def update_value(
-        self, train_state: IQLTrainState, batch: Transition, config: IQLConfig
-    ) -> Tuple["IQLTrainState", Dict]:
+        cls, train_state: IQLTrainState, batch: Transition, config: IQLConfig
+    ) -> Tuple["IQLTrainState", jnp.ndarray]:
         q1, q2 = train_state.target_critic.apply_fn(
             train_state.target_critic.params, batch.observations, batch.actions
         )
         q = jax.lax.stop_gradient(jnp.minimum(q1, q2))
-        def value_loss_fn(value_params: flax.core.FrozenDict[str, Any]) -> jnp.ndarray:
+        def value_loss_fn(value_params: flax_core.FrozenDict[str, Any]) -> jnp.ndarray:
             v = train_state.value.apply_fn(value_params, batch.observations)
             value_loss = expectile_loss(q - v, config.iql_tau).mean()
             return value_loss
@@ -346,8 +347,8 @@ class IQL(object):
 
     @classmethod
     def update_actor(
-        self, train_state: IQLTrainState, batch: Transition, config: IQLConfig
-    ) -> Tuple["IQLTrainState", Dict]:
+        cls, train_state: IQLTrainState, batch: Transition, config: IQLConfig
+    ) -> Tuple["IQLTrainState", jnp.ndarray]:
         v = train_state.value.apply_fn(train_state.value.params, batch.observations)
         q1, q2 = train_state.critic.apply_fn(
             train_state.target_critic.params, batch.observations, batch.actions
@@ -355,7 +356,7 @@ class IQL(object):
         q = jnp.minimum(q1, q2)
         exp_a = jnp.exp((q - v) * config.beta)
         exp_a = jnp.minimum(exp_a, 100.0)
-        def actor_loss_fn(actor_params: flax.core.FrozenDict[str, Any]) -> jnp.ndarray:
+        def actor_loss_fn(actor_params: flax_core.FrozenDict[str, Any]) -> jnp.ndarray:
             dist = train_state.actor.apply_fn(actor_params, batch.observations)
             log_probs = dist.log_prob(batch.actions)
             actor_loss = -(exp_a * log_probs).mean()
@@ -366,10 +367,10 @@ class IQL(object):
 
     @classmethod
     def update_n_times(
-        self,
+        cls,
         train_state: IQLTrainState,
         dataset: Transition,
-        rng: jax.random.PRNGKey,
+        rng: jax.Array,
         config: IQLConfig,
     ) -> Tuple["IQLTrainState", Dict]:
         for _ in range(config.n_jitted_updates):
@@ -379,9 +380,9 @@ class IQL(object):
             )
             batch = jax.tree_util.tree_map(lambda x: x[batch_indices], dataset)
 
-            train_state, value_loss = self.update_value(train_state, batch, config)
-            train_state, actor_loss = self.update_actor(train_state, batch, config)
-            train_state, critic_loss = self.update_critic(train_state, batch, config)
+            train_state, value_loss = cls.update_value(train_state, batch, config)
+            train_state, actor_loss = cls.update_actor(train_state, batch, config)
+            train_state, critic_loss = cls.update_critic(train_state, batch, config)
             new_target_critic = target_update(
                 train_state.critic, train_state.target_critic, config.tau
             )
@@ -394,10 +395,10 @@ class IQL(object):
 
     @classmethod
     def get_action(
-        self,
+        cls,
         train_state: IQLTrainState,
         observations: np.ndarray,
-        seed: jax.random.PRNGKey,
+        seed: jax.Array,
         temperature: float = 1.0,
         max_action: float = 1.0,  # In D4RL, the action space is [-1, 1]
     ) -> jnp.ndarray:
@@ -409,7 +410,7 @@ class IQL(object):
 
 
 def create_iql_train_state(
-    rng: jax.random.PRNGKey,
+    rng: jax.Array,
     observations: jnp.ndarray,
     actions: jnp.ndarray,
     config: IQLConfig,
@@ -461,8 +462,13 @@ def create_iql_train_state(
 
 
 def evaluate(
-    policy_fn, env: gym.Env, num_episodes: int, obs_mean: float, obs_std: float, seed: int = 0
-) -> float:
+    policy_fn: Callable, 
+    env: GymWrapper, 
+    num_episodes: int, 
+    obs_mean: float, 
+    obs_std: float, 
+    seed: int = 0
+) -> Tuple[float, float]:
     env.reset_rng(seed)
     episode_returns = []
     for _ in range(num_episodes):
@@ -476,7 +482,7 @@ def evaluate(
             episode_return += reward
         episode_returns.append(episode_return)
 
-    mean_return = np.mean(episode_returns)
+    mean_return = float(np.mean(episode_returns))
     # Normalize using the env's D4RL-style reference scores (loaded from the
     # dataset metadata). Falls back to the raw return when refs are absent.
     normalized = env.get_normalized_score(mean_return)
@@ -552,7 +558,7 @@ def get_actor_from_checkpoint(
 
     # Restore params into a proper FrozenDict
     dummy_obs = jnp.zeros((1, state_dim))
-    actor_params = flax.serialization.from_state_dict(
+    actor_params = flax_serialization.from_state_dict(
         actor_model.init(jax.random.PRNGKey(0), dummy_obs),
         actor_params_dict,
     )
@@ -561,17 +567,17 @@ def get_actor_from_checkpoint(
     @jax.jit
     def actor_fn(
         obs: jnp.ndarray,
-        seed: jax.random.PRNGKey,
+        seed: jax.Array,
         temperature: float = 1.0,
     ) -> jnp.ndarray:
-        dist = actor_model.apply(actor_params, obs, temperature=temperature)
+        dist, _ = actor_model.apply(actor_params, obs, temperature=temperature)
         actions = dist.sample(seed=seed)
         return jnp.clip(actions, -max_action, max_action)
 
     # Convenience wrapper: normalises obs, uses temperature=0.0 for deterministic actions
     def get_action(
         obs: np.ndarray,
-        seed: Optional[jax.random.PRNGKey] = None,
+        seed: Optional[jax.Array] = None,
         temperature: float = 0.0,
     ) -> np.ndarray:
         if seed is None:
@@ -595,10 +601,13 @@ def get_actor_from_checkpoint(
     }
 
 
-@pyrallis.wrap()
-def train(config: IQLConfig):
+def train():
+   wrapped_train = pyrallis_wrap()(_train)
+   wrapped_train()
+
+def _train(config: IQLConfig):
     wandb.init(
-        config=config,
+        config=asdict(config),
         project=config.project,
         group=config.group,
         name=config.name,
@@ -610,7 +619,7 @@ def train(config: IQLConfig):
         print(f"Checkpoints path: {config.checkpoints_path}")
         os.makedirs(config.checkpoints_path, exist_ok=True)
         with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
-            pyrallis.dump(config, f)
+            pyrallis_dump(config, f)
 
     rng = jax.random.PRNGKey(config.seed)
     minari_dataset = minari.load_dataset(config.dataset_id)
@@ -670,10 +679,10 @@ def train(config: IQLConfig):
             # Save checkpoint
             if config.checkpoints_path is not None and (i // eval_interval) % config.checkpoints_every == 0:
                 checkpoint = {
-                    "actor_params": flax.serialization.to_state_dict(train_state.actor.params),
-                    "critic_params": flax.serialization.to_state_dict(train_state.critic.params),
-                    "target_critic_params": flax.serialization.to_state_dict(train_state.target_critic.params),
-                    "value_params": flax.serialization.to_state_dict(train_state.value.params),
+                    "actor_params": flax_serialization.to_state_dict(train_state.actor.params),
+                    "critic_params": flax_serialization.to_state_dict(train_state.critic.params),
+                    "target_critic_params": flax_serialization.to_state_dict(train_state.target_critic.params),
+                    "value_params": flax_serialization.to_state_dict(train_state.value.params),
                     "obs_mean": np.array(obs_mean),
                     "obs_std": np.array(obs_std),
                     "step": current_step,
@@ -721,13 +730,29 @@ def train(config: IQLConfig):
             "eval/robustness_gap": normalized_score - shifted_score,
         })
 
+    print("Running proxy evaluation of the final policy...")
+    fn = policy_fn
+    policy_fn = lambda obs: fn(observations=obs)
+    proxyResult = proxy.evaluate(
+        policy_fn,
+        env,
+        config.n_eval_episodes_final, 
+        obs_mean, 
+        obs_std,
+        render=True,
+        algorithm_name=config.name
+    )
+
+    # Log proxy results
+    wandb.log({"eval/proxy_results": proxyResult})
+
     # Save final checkpoint
     if config.checkpoints_path is not None:
         checkpoint = {
-            "actor_params": flax.serialization.to_state_dict(train_state.actor.params),
-            "critic_params": flax.serialization.to_state_dict(train_state.critic.params),
-            "target_critic_params": flax.serialization.to_state_dict(train_state.target_critic.params),
-            "value_params": flax.serialization.to_state_dict(train_state.value.params),
+            "actor_params": flax_serialization.to_state_dict(train_state.actor.params),
+            "critic_params": flax_serialization.to_state_dict(train_state.critic.params),
+            "target_critic_params": flax_serialization.to_state_dict(train_state.target_critic.params),
+            "value_params": flax_serialization.to_state_dict(train_state.value.params),
             "obs_mean": np.array(obs_mean),
             "obs_std": np.array(obs_std),
             "step": config.max_timesteps,
@@ -742,7 +767,7 @@ def train(config: IQLConfig):
         video_path = os.path.join(video_dir, f"{config.name}.mp4")
         record_policy_video(
             env_name=config.env,
-            act=lambda o: policy_fn(observations=o),
+            act=policy_fn,
             obs_mean=obs_mean,
             obs_std=obs_std,
             device=config.device,

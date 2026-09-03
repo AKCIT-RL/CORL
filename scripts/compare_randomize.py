@@ -10,6 +10,7 @@ from pyrallis.argparsing import wrap
 import mujoco.egl
 import tqdm
 import yaml
+import minari
 
 os.environ["MUJOCO_GL"] = "egl"
 gl_context = mujoco.egl.GLContext(1024, 1024)
@@ -28,6 +29,7 @@ class CompareRandomizeAttributes:
    n_episodes: int = 20
    seed: int = 0
    render: bool = False
+   dataset_id: Optional[str] = None
    device: str = "cuda"
    
 @dataclass
@@ -156,7 +158,7 @@ def evaluate(
    obs_mean,
    obs_std,
    render=False
-) -> List[float]:
+) -> np.ndarray:
    episode_returns = []
    num_envs = getattr(env, "num_envs", 1)
    max_steps = 2000
@@ -191,44 +193,43 @@ def evaluate(
          completed = min(num_envs, num_episodes - len(episode_returns))
          episode_returns.extend(episode_return[:completed].tolist())
          pbar.update(completed)
+
+      episode_returns = np.array(episode_returns, dtype=np.float32)
       
       if hasattr(env, 'get_normalized_score'):
          normalized_returns = []
 
          for ret in episode_returns:
             normalized = env.get_normalized_score(ret)
-
             if normalized is not None:
-               normalized_returns.append(float(normalized))
+               normalized_returns.append(100 * float(normalized))
             else:
                normalized_returns.append(ret)
+         return np.array(normalized_returns, dtype=np.float32)
 
-         return normalized_returns
+      return np.array(episode_returns, dtype=np.float32)
 
-      return episode_returns
-
-def print_results(data: Dict[str, List[float]]):
+def print_results(data: Dict[str, np.ndarray]):
    print(f"\n{'='*10} RESULTADOS {'='*10}")
 
-   base_returns = data.get("default", [])
-   if base_returns:
-      base_arr = np.array(base_returns, dtype=np.float64)
-      base_mean = np.mean(base_arr)
+   base_returns = data.get("default", np.array([], dtype=np.float32))
+   base_mean = 0.0
+
+   if len(base_returns) > 0:
+      base_mean = np.mean(base_returns)
    
    for cfg_name, returns in data.items():
-      arr = np.array(returns, dtype=np.float64)
-      mean = np.mean(arr)
-      std = np.std(arr)
+      mean = np.mean(returns)
+      std = np.std(returns)
       srr = mean / base_mean if base_mean != 0 else float('inf')
       print(f"\nRandomização {cfg_name}:")
       print(f" - Média: {mean:.2f}")
       print(f" - Std: {std:.2f}")
       print(f" - Relação Randomizado / Baseline: {srr:.2f}")
 
-      if base_returns:
+      if len(base_returns) > 0:
          if cfg_name != "default":
-            arr = np.array(returns, dtype=np.float64)
-            evaluate_robustness(base_arr, arr)
+            evaluate_robustness(base_returns, returns)
 
 def evaluate_robustness(base_arr: np.ndarray, rand_arr: np.ndarray):
    print("\nAnálise de Robustez (Trajetórias Pareadas)...")
@@ -305,6 +306,9 @@ def _main(attrs: CompareRandomizeAttributes):
 
       print(f"\n {'='*10} Randomize Config: {display_name} {'='*10}")
       print("\nCarregando ambiente...")
+
+      minari_dataset = minari.load_dataset(attrs.dataset_id) if attrs.dataset_id else None
+
       env = get_env(
          device=attrs.device, 
          render_callback=_render_callback,
@@ -312,7 +316,8 @@ def _main(attrs: CompareRandomizeAttributes):
          command_type=config.command_type,
          config_overrides={"impl": "jax"},
          randomize_configs=cfg_name,
-         randomize_options=cfg_file
+         randomize_options=cfg_file,
+         dataset=minari_dataset
       )
 
       # Get checkpoint

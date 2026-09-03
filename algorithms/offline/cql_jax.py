@@ -3,27 +3,28 @@
 import os
 import uuid
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
 import distrax
-import flax
 import flax.linen as nn
-import gymnasium as gym
+from pyrallis.argparsing import wrap as pyrallis_wrap
+from pyrallis.cfgparsing import dump as pyrallis_dump
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import pyrallis
 import tqdm
 import wandb
+from flax import serialization as flax_serialization
 from flax.training.train_state import TrainState
 
 import minari
 
-from algorithms.utils.wrapper_gym import get_env, maybe_get_shifted_env, record_policy_video
-from algorithms.utils.dataset import qlearning_dataset
+from algorithms.utils import proxy
+from algorithms.utils.randomize_gym import GymWrapper, get_env, maybe_get_shifted_env, record_policy_video
+from algorithms.utils.dataset import qlearning_dataset, Dataset
 
 os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True"
 
@@ -216,7 +217,7 @@ class Scalar(nn.Module):
     def setup(self) -> None:
         self.value = self.param("value", lambda x: self.init_value)
 
-    def __call__(self) -> jnp.ndarray:
+    def __call__(self) -> float:
         return self.value
 
 
@@ -291,7 +292,7 @@ class TanhGaussianPolicy(nn.Module):
         self.log_std_multiplier_module = Scalar(self.log_std_multiplier)
         self.log_std_offset_module = Scalar(self.log_std_offset)
 
-    def log_prob(self, observations: jnp.ndarray, actions: jnp.ndarray) -> jnp.ndarray:
+    def log_prob(self, observations: jnp.ndarray, actions: jnp.ndarray) -> jax.Array:
         if actions.ndim == 3:
             observations = extend_and_repeat(observations, 1, actions.shape[1])
         base_network_output = self.base_network(observations)
@@ -304,12 +305,12 @@ class TanhGaussianPolicy(nn.Module):
             distrax.MultivariateNormalDiag(mean, jnp.exp(log_std)),
             distrax.Block(distrax.Tanh(), ndims=1),
         )
-        return action_distribution.log_prob(actions)
+        return action_distribution.log_prob(actions) # type: ignore
 
     def __call__(
         self,
         observations: jnp.ndarray,
-        rng: jax.random.PRNGKey,
+        rng: jax.Array,
         deterministic=False,
         repeat=None,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -331,49 +332,49 @@ class TanhGaussianPolicy(nn.Module):
         else:
             samples, log_prob = action_distribution.sample_and_log_prob(seed=rng)
 
-        return samples, log_prob
+        return samples, log_prob # type: ignore
 
 
 class Transition(NamedTuple):
-    observations: np.ndarray
-    actions: np.ndarray
-    rewards: np.ndarray
-    next_observations: np.ndarray
-    dones: np.ndarray
+    observations: jnp.ndarray
+    actions: jnp.ndarray
+    rewards: jnp.ndarray
+    next_observations: jnp.ndarray
+    dones: jnp.ndarray
 
 
 def get_dataset(
-    dataset: Dict, config: CQLConfig, clip_to_eps: bool = True, eps: float = 1e-5
-) -> Transition:
+    dataset: Dataset, config: CQLConfig, clip_to_eps: bool = True, eps: float = 1e-5
+) -> Tuple[Transition, float, float]:
     if clip_to_eps:
         lim = 1 - eps
-        dataset["actions"] = np.clip(dataset["actions"], -lim, lim)
+        dataset.actions = np.clip(dataset.actions, -lim, lim)
 
-    dataset = Transition(
-        observations=jnp.array(dataset["observations"], dtype=jnp.float32),
-        actions=jnp.array(dataset["actions"], dtype=jnp.float32),
-        rewards=jnp.array(dataset["rewards"], dtype=jnp.float32),
-        next_observations=jnp.array(dataset["next_observations"], dtype=jnp.float32),
-        dones=jnp.array(dataset["terminals"], dtype=jnp.float32),
+    transition = Transition(
+        observations=jnp.array(dataset.observations, dtype=jnp.float32),
+        actions=jnp.array(dataset.actions, dtype=jnp.float32),
+        rewards=jnp.array(dataset.rewards, dtype=jnp.float32),
+        next_observations=jnp.array(dataset.next_observations, dtype=jnp.float32),
+        dones=jnp.array(dataset.terminals, dtype=jnp.float32),
     )
     # shuffle data and select the first buffer_size samples
-    data_size = min(config.buffer_size, len(dataset.observations))
+    data_size = min(config.buffer_size, len(transition.observations))
     rng = jax.random.PRNGKey(config.seed)
     rng, rng_permute, rng_select = jax.random.split(rng, 3)
-    perm = jax.random.permutation(rng_permute, len(dataset.observations))
-    dataset = jax.tree_util.tree_map(lambda x: x[perm], dataset)
-    assert len(dataset.observations) >= data_size
-    dataset = jax.tree_util.tree_map(lambda x: x[:data_size], dataset)
+    perm = jax.random.permutation(rng_permute, len(transition.observations))
+    transition = jax.tree_util.tree_map(lambda x: x[perm], transition)
+    assert len(transition.observations) >= data_size
+    transition = jax.tree_util.tree_map(lambda x: x[:data_size], transition)
     # normalize states
     obs_mean, obs_std = 0, 1
     if config.normalize:
-        obs_mean = dataset.observations.mean(0)
-        obs_std = dataset.observations.std(0)
-        dataset = dataset._replace(
-            observations=(dataset.observations - obs_mean) / (obs_std + 1e-5),
-            next_observations=(dataset.next_observations - obs_mean) / (obs_std + 1e-5),
+        obs_mean = transition.observations.mean(0)
+        obs_std = transition.observations.std(0)
+        transition = transition._replace(
+            observations=(transition.observations - obs_mean) / (obs_std + 1e-5),
+            next_observations=(transition.next_observations - obs_mean) / (obs_std + 1e-5),
         )
-    return dataset, obs_mean, obs_std
+    return transition, obs_mean, obs_std
 
 
 def collect_metrics(metrics, names, prefix=None):
@@ -440,22 +441,23 @@ class CQLTrainState(NamedTuple):
 
 
 class CQL(object):
-
+    policy: TanhGaussianPolicy
+    
     @classmethod
-    def update_n_times(self, train_state: CQLTrainState, dataset, rng, config, bc=False):
+    def update_n_times(cls, train_state: CQLTrainState, dataset, rng, config, bc=False):
         for _ in range(config.n_jitted_updates):
             rng, batch_rng, update_rng = jax.random.split(rng, 3)
             batch_indices = jax.random.randint(
                 batch_rng, (config.batch_size,), 0, len(dataset.observations)
             )
             batch = jax.tree_util.tree_map(lambda x: x[batch_indices], dataset)
-            train_state, metrics = self._train_step(
+            train_state, metrics = cls._train_step(
                 train_state, update_rng, batch, config, bc
             )
         return train_state, metrics
 
     @classmethod
-    def _train_step(self, train_state: CQLTrainState, _rng, batch, config, bc=False):
+    def _train_step(cls, train_state: CQLTrainState, _rng, batch, config, bc=False):
         policy_fn = train_state.policy.apply_fn
         qf_fn = train_state.qf1.apply_fn
         log_alpha_fn = train_state.log_alpha.apply_fn
@@ -498,7 +500,7 @@ class CQL(object):
                     observations,
                     actions,
                     bc_rng,
-                    method=self.policy.log_prob,
+                    method=cls.policy.log_prob,
                 )
                 policy_loss = (alpha * log_pi - log_probs).mean()
             else:
@@ -751,7 +753,7 @@ class CQL(object):
         return train_state, metrics
 
     @classmethod
-    def get_action(self, train_state, obs):
+    def get_action(cls, train_state, obs):
         action, _ = train_state.policy.apply_fn(
             train_state.policy.params,
             obs.reshape(1, -1),
@@ -762,7 +764,7 @@ class CQL(object):
 
 
 def create_cql_train_state(
-    rng: jax.random.PRNGKey,
+    rng: jax.Array,
     observations: jnp.ndarray,
     actions: jnp.ndarray,
     config: CQLConfig,
@@ -847,11 +849,11 @@ def create_cql_train_state(
 
 
 def evaluate(
-    policy_fn: Callable[[jnp.ndarray], jnp.ndarray],
-    env: gym.Env,
+    policy_fn: Callable,
+    env: GymWrapper,
     num_episodes: int,
-    obs_mean=0,
-    obs_std=1,
+    obs_mean: float = 0,
+    obs_std: float = 1,
     seed: int = 0,
 ):
     env.reset_rng(seed)
@@ -874,13 +876,16 @@ def evaluate(
     return normalized_score, mean_return
 
 
-@pyrallis.wrap()
-def train(config: CQLConfig):
+def train():
+   wrapped_train = pyrallis_wrap()(_train)
+   wrapped_train()
+
+def _train(config: CQLConfig):
     wandb.init(
         project=config.project,
         group=config.group,
         name=config.name,
-        config=config,
+        config=asdict(config),
         id=str(uuid.uuid4()),
     )
 
@@ -888,7 +893,7 @@ def train(config: CQLConfig):
         print(f"Checkpoints path: {config.checkpoints_path}")
         os.makedirs(config.checkpoints_path, exist_ok=True)
         with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
-            pyrallis.dump(config, f)
+            pyrallis_dump(config, f)
 
     rng = jax.random.PRNGKey(config.seed)
     
@@ -899,17 +904,20 @@ def train(config: CQLConfig):
         config.env, config.device, command_type=config.command_type,
         dataset=minari_dataset, eval_shift=config.eval_shift,
     )
-    
-    action_dim = env.action_space.shape[0]
+
+    action_shape = env.action_space.shape
+    if action_shape is None:
+        action_shape = (1,)
+    action_dim = action_shape[0]
     config.action_dim = action_dim
     
     # Set target entropy if not specified
     if config.target_entropy >= 0.0:
-        config.target_entropy = -np.prod(env.action_space.shape).item()
+        config.target_entropy = -np.prod(action_shape).item()
     
     # rescale reward if needed
     if config.normalize_reward:
-        qdataset["rewards"] = qdataset["rewards"] * config.reward_scale + config.reward_bias
+        qdataset.rewards = qdataset.rewards * config.reward_scale + config.reward_bias
     
     dataset, obs_mean, obs_std = get_dataset(qdataset, config)
 
@@ -937,7 +945,7 @@ def train(config: CQLConfig):
         wandb.log(train_metrics, step=i)
 
         if i % eval_interval == 0:
-            policy_fn = partial(act_fn, train_state=train_state)
+            policy_fn = lambda obs: act_fn(train_state, obs)
             normalized_score, raw_score = evaluate(
                 policy_fn, env, config.n_episodes, obs_mean=obs_mean, obs_std=obs_std, seed=config.eval_seed
             )
@@ -950,11 +958,11 @@ def train(config: CQLConfig):
 
             if config.checkpoints_path is not None and (i // eval_interval) % config.checkpoints_every == 0:
                 checkpoint = {
-                    "policy_params": flax.serialization.to_state_dict(train_state.policy.params),
-                    "qf1_params": flax.serialization.to_state_dict(train_state.qf1.params),
-                    "qf2_params": flax.serialization.to_state_dict(train_state.qf2.params),
-                    "target_qf1_params": flax.serialization.to_state_dict(train_state.target_qf1_params),
-                    "target_qf2_params": flax.serialization.to_state_dict(train_state.target_qf2_params),
+                    "policy_params": flax_serialization.to_state_dict(train_state.policy.params),
+                    "qf1_params": flax_serialization.to_state_dict(train_state.qf1.params),
+                    "qf2_params": flax_serialization.to_state_dict(train_state.qf2.params),
+                    "target_qf1_params": flax_serialization.to_state_dict(train_state.target_qf1_params),
+                    "target_qf2_params": flax_serialization.to_state_dict(train_state.target_qf2_params),
                     "obs_mean": np.array(obs_mean),
                     "obs_std": np.array(obs_std),
                     "step": i,
@@ -964,7 +972,7 @@ def train(config: CQLConfig):
                 print(f"Saved checkpoint to {checkpoint_path}")
 
     # final evaluation
-    policy_fn = partial(act_fn, train_state=train_state)
+    policy_fn = lambda obs: act_fn(train_state, obs)
     normalized_score, raw_score = evaluate(
         policy_fn, env, config.n_eval_episodes_final, obs_mean=obs_mean, obs_std=obs_std, seed=config.eval_seed
     )
@@ -987,14 +995,28 @@ def train(config: CQLConfig):
             "eval/robustness_gap": normalized_score - shifted_score,
         })
 
+    print("Running proxy evaluation of the final policy...")
+    proxyResult = proxy.evaluate(
+        policy_fn,
+        env,
+        config.n_eval_episodes_final, 
+        obs_mean, 
+        obs_std,
+        render=True,
+        algorithm_name=config.name
+    )
+
+    # Log proxy results
+    wandb.log({"eval/proxy_results": proxyResult})
+
     # Save final checkpoint
     if config.checkpoints_path is not None:
         checkpoint = {
-            "policy_params": flax.serialization.to_state_dict(train_state.policy.params),
-            "qf1_params": flax.serialization.to_state_dict(train_state.qf1.params),
-            "qf2_params": flax.serialization.to_state_dict(train_state.qf2.params),
-            "target_qf1_params": flax.serialization.to_state_dict(train_state.target_qf1_params),
-            "target_qf2_params": flax.serialization.to_state_dict(train_state.target_qf2_params),
+            "policy_params": flax_serialization.to_state_dict(train_state.policy.params),
+            "qf1_params": flax_serialization.to_state_dict(train_state.qf1.params),
+            "qf2_params": flax_serialization.to_state_dict(train_state.qf2.params),
+            "target_qf1_params": flax_serialization.to_state_dict(train_state.target_qf1_params),
+            "target_qf2_params": flax_serialization.to_state_dict(train_state.target_qf2_params),
             "obs_mean": np.array(obs_mean),
             "obs_std": np.array(obs_std),
             "step": num_steps,
