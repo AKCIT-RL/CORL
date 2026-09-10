@@ -4,7 +4,6 @@ import os
 import uuid
 from copy import deepcopy
 from dataclasses import asdict, dataclass
-from functools import partial
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
 import distrax
@@ -50,6 +49,7 @@ class CQLConfig:
     n_episodes: int = 10
     # number of episodes for the final evaluation (larger -> lower variance)
     n_eval_episodes_final: int = 50
+    n_eval_actors: int = 10
     # fixed seed for evaluation rollouts (reproducible / comparable)
     eval_seed: int = 0
     # total gradient updates during training
@@ -754,13 +754,15 @@ class CQL(object):
 
     @classmethod
     def get_action(cls, train_state, obs):
+        is_single_observation = obs.ndim == 1
+        batched_obs = obs[None, :] if is_single_observation else obs
         action, _ = train_state.policy.apply_fn(
             train_state.policy.params,
-            obs.reshape(1, -1),
+            batched_obs,
             jax.random.PRNGKey(0),
             deterministic=True,
         )
-        return action.squeeze(0)
+        return action.squeeze(0) if is_single_observation else action
 
 
 def create_cql_train_state(
@@ -857,17 +859,21 @@ def evaluate(
     seed: int = 0,
 ):
     env.reset_rng(seed)
+    num_envs = getattr(env, "num_envs", 1)
     episode_returns = []
-    for _ in range(num_episodes):
+    while len(episode_returns) < num_episodes:
+        episode_return = np.zeros(num_envs, dtype=np.float32)
+        finished = np.zeros(num_envs, dtype=bool)
         obs, _ = env.reset()
-        done = truncated = False
-        total_reward = 0
-        while not done and not truncated:
+        while not np.all(finished):
             obs = (obs - obs_mean) / (obs_std + 1e-5)
             action = policy_fn(obs=obs)
             obs, reward, done, truncated, _ = env.step(np.array(action))
-            total_reward += reward
-        episode_returns.append(total_reward)
+            active_mask = ~finished
+            episode_return += np.asarray(reward, dtype=np.float32) * active_mask
+            finished |= np.asarray(done, dtype=bool) | np.asarray(truncated, dtype=bool)
+        completed = min(num_envs, num_episodes - len(episode_returns))
+        episode_returns.extend(episode_return[:completed].tolist())
     mean_return = np.mean(episode_returns)
     # Normalize using the env's D4RL-style reference scores (loaded from the
     # dataset metadata). Falls back to the raw return when refs are absent.
@@ -899,10 +905,11 @@ def _train(config: CQLConfig):
     
     minari_dataset = minari.load_dataset(config.dataset_id)
     qdataset = qlearning_dataset(minari_dataset)
-    env = get_env(config.env, config.device, command_type=config.command_type, dataset=minari_dataset)
+    env = get_env(config.device, command_type=config.command_type, dataset=minari_dataset, num_actors=config.n_eval_actors)
     shifted_env = maybe_get_shifted_env(
-        config.env, config.device, command_type=config.command_type,
+        config.device, command_type=config.command_type,
         dataset=minari_dataset, eval_shift=config.eval_shift,
+        num_actors=config.n_eval_actors
     )
 
     action_shape = env.action_space.shape
@@ -1003,11 +1010,12 @@ def _train(config: CQLConfig):
         obs_mean, 
         obs_std,
         render=True,
-        algorithm_name=config.name
+        algorithm_name=config.name,
+        dict_prefix="eval/proxy_results"
     )
 
     # Log proxy results
-    wandb.log({"eval/proxy_results": proxyResult})
+    wandb.log(proxyResult)
 
     # Save final checkpoint
     if config.checkpoints_path is not None:

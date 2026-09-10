@@ -69,6 +69,7 @@ class IQLConfig:
     eval_freq: int = int(5e3)
     # number of episodes to run during evaluation
     n_episodes: int = 10
+    n_eval_actors: int = 10
     # number of episodes for the final evaluation (larger -> lower variance)
     n_eval_episodes_final: int = 50
     # fixed seed for evaluation rollouts (reproducible / comparable)
@@ -470,17 +471,22 @@ def evaluate(
     seed: int = 0
 ) -> Tuple[float, float]:
     env.reset_rng(seed)
+    num_envs = getattr(env, "num_envs", 1)
     episode_returns = []
-    for _ in range(num_episodes):
-        episode_return = 0
+
+    while len(episode_returns) < num_episodes:
+        episode_return = np.zeros(num_envs, dtype=np.float32)
+        finished = np.zeros(num_envs, dtype=bool)
         observation, _ = env.reset()
-        done = truncated = False
-        while not done and not truncated:
+        while not np.all(finished):
             observation = (observation - obs_mean) / (obs_std + 1e-5)
             action = policy_fn(observations=observation)
-            observation, reward, done, truncated, info = env.step(np.array(action))
-            episode_return += reward
-        episode_returns.append(episode_return)
+            observation, reward, done, truncated, _ = env.step(np.array(action))
+            active_mask = ~finished
+            episode_return += np.asarray(reward, dtype=np.float32) * active_mask
+            finished |= np.asarray(done, dtype=bool) | np.asarray(truncated, dtype=bool)
+        completed = min(num_envs, num_episodes - len(episode_returns))
+        episode_returns.extend(episode_return[:completed].tolist())
 
     mean_return = float(np.mean(episode_returns))
     # Normalize using the env's D4RL-style reference scores (loaded from the
@@ -623,10 +629,16 @@ def _train(config: IQLConfig):
 
     rng = jax.random.PRNGKey(config.seed)
     minari_dataset = minari.load_dataset(config.dataset_id)
-    env = get_env(config.env, config.device, command_type=config.command_type, dataset=minari_dataset)
+    env = get_env(
+        config.device, 
+        command_type=config.command_type, 
+        dataset=minari_dataset,
+        num_actors=config.n_eval_actors
+    )
     shifted_env = maybe_get_shifted_env(
-        config.env, config.device, command_type=config.command_type,
+        config.device, command_type=config.command_type,
         dataset=minari_dataset, eval_shift=config.eval_shift,
+        num_actors=config.n_eval_actors
     )
     dataset, obs_mean, obs_std = get_dataset(config)
     
@@ -740,11 +752,12 @@ def _train(config: IQLConfig):
         obs_mean, 
         obs_std,
         render=True,
-        algorithm_name=config.name
+        algorithm_name=config.name,
+        dict_prefix="eval/proxy_results"
     )
 
     # Log proxy results
-    wandb.log({"eval/proxy_results": proxyResult})
+    wandb.log(proxyResult)
 
     # Save final checkpoint
     if config.checkpoints_path is not None:

@@ -80,6 +80,7 @@ class DTConfig:
     target_returns: Tuple[float, ...] = (12000.0, 6000.0)
     # number of episodes to run during evaluation
     eval_episodes: int = 10
+    n_eval_actors: int = 10
     # number of episodes for the final evaluation (larger -> lower variance)
     n_eval_episodes_final: int = 50
     # fixed seed for evaluation rollouts (reproducible / comparable)
@@ -686,9 +687,8 @@ def evaluate(
 ) -> Tuple[float, float]:
     env.reset_rng(seed)
     n_eps = num_episodes if num_episodes is not None else config.eval_episodes
-    eval_batch_size = 1  # required for forward pass
-    total_reward = 0
-    total_timesteps = 0
+    eval_batch_size = getattr(env, "num_envs", 1)
+    episode_returns = []
 
     state_shape = env.observation_space.shape if env.observation_space.shape is not None else (1,)
     act_shape = env.action_space.shape if env.action_space.shape is not None else (1,)
@@ -700,9 +700,8 @@ def evaluate(
     state_std = jnp.array(state_std).reshape(-1) if not isinstance(state_std, (int, float)) else jnp.array([state_std] * state_dim)
     # same as timesteps used for training the transformer
     timesteps = jnp.arange(0, config.episode_len, 1, jnp.int32)
-    # repeat
     timesteps = jnp.repeat(timesteps[None, :], eval_batch_size, axis=0)
-    for _ in range(n_eps):
+    while len(episode_returns) < n_eps:
         # zeros place holders
         actions = jnp.zeros(
             (eval_batch_size, config.episode_len, act_dim), dtype=jnp.float32
@@ -715,18 +714,20 @@ def evaluate(
         )
         # init episode
         running_state, _ = env.reset()
-        # Ensure running_state is 1D
-        running_state = np.array(running_state).flatten()
-        running_reward = 0
-        running_rtg = target_return * config.reward_scale
+        running_state = np.asarray(running_state).reshape(eval_batch_size, state_dim)
+        running_reward = np.zeros(eval_batch_size, dtype=np.float32)
+        running_rtg = np.full(
+            eval_batch_size, target_return * config.reward_scale, dtype=np.float32
+        )
+        episode_return = np.zeros(eval_batch_size, dtype=np.float32)
+        finished = np.zeros(eval_batch_size, dtype=bool)
         for t in range(config.episode_len):
-            total_timesteps += 1
             # add state in placeholder and normalize
             normalized_state = (jnp.array(running_state) - state_mean) / state_std
-            states = states.at[0, t].set(normalized_state)
+            states = states.at[:, t].set(normalized_state)
             # calculate running rtg and add in placeholder
             running_rtg = running_rtg - (running_reward * config.reward_scale)
-            rewards_to_go = rewards_to_go.at[0, t].set(running_rtg)
+            rewards_to_go = rewards_to_go.at[:, t, 0].set(jnp.array(running_rtg))
             if t < config.seq_len:
                 act_preds = policy_fn(
                     train_state,
@@ -735,7 +736,7 @@ def evaluate(
                     actions[:, : t + 1],
                     rewards_to_go[:, : t + 1],
                 )
-                act = act_preds[0, -1]
+                act = act_preds[:, -1]
             else:
                 act_preds = policy_fn(
                     train_state,
@@ -744,21 +745,20 @@ def evaluate(
                     actions[:, t - config.seq_len + 1 : t + 1],
                     rewards_to_go[:, t - config.seq_len + 1 : t + 1],
                 )
-                act = act_preds[0, -1]
+                act = act_preds[:, -1]
             running_state, running_reward, done, truncated, _ = env.step(np.array(act))
-            running_state = np.array(running_state).flatten()
-            actions = actions.at[0, t].set(act)
-            
-            if hasattr(running_reward, "item"):
-                reward_scalar = float(running_reward.item())
-            else:
-                reward_scalar = float(np.squeeze(running_reward))
-                
-            total_reward += reward_scalar
-            
-            if done or truncated:
+            running_state = np.asarray(running_state).reshape(eval_batch_size, state_dim)
+            actions = actions.at[:, t].set(act)
+
+            active_mask = ~finished
+            episode_return += np.asarray(running_reward, dtype=np.float32) * active_mask
+            finished |= np.asarray(done, dtype=bool) | np.asarray(truncated, dtype=bool)
+            if np.all(finished):
                 break
-    mean_reward = float(total_reward / n_eps)
+        completed = min(eval_batch_size, n_eps - len(episode_returns))
+        episode_returns.extend(episode_return[:completed].tolist())
+
+    mean_reward = float(np.mean(episode_returns))
     # Normalize using the env's D4RL-style reference scores (loaded from the
     # dataset metadata). Falls back to the raw return when refs are absent.
     normalized = env.get_normalized_score(mean_reward)
@@ -880,10 +880,17 @@ def _train(config: DTConfig):
         with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
             pyrallis_dump(config, f)
 
-    env = get_env(config.env_name, config.device, command_type=config.command_type, dataset=minari.load_dataset(config.dataset_id))
+    minari_dataset = minari.load_dataset(config.dataset_id)
+    env = get_env(
+        config.device, 
+        command_type=config.command_type, 
+        dataset=minari_dataset,
+        num_actors=config.n_eval_actors
+    )
     shifted_env = maybe_get_shifted_env(
-        config.env_name, config.device, command_type=config.command_type,
-        dataset=minari.load_dataset(config.dataset_id), eval_shift=config.eval_shift,
+        config.device, command_type=config.command_type,
+        dataset=minari_dataset, eval_shift=config.eval_shift,
+        num_actors=config.n_eval_actors 
     )
     rng = jax.random.PRNGKey(config.seed)
     state_shape = env.observation_space.shape if env.observation_space.shape is not None else (1,)
@@ -968,23 +975,45 @@ def _train(config: DTConfig):
 
     print("Running proxy evaluation of the final policy...")
 
+    # ``proxy.evaluate`` uses the same vectorized environment as the regular
+    # evaluator.  Keep a DT context per actor instead of flattening the actor
+    # axis into the state features.
+    proxy_batch_size = getattr(env, "num_envs", 1)
     t_step = 0
-    states = jnp.zeros((1, config.episode_len, state_dim), dtype=jnp.float32)
-    actions = jnp.zeros((1, config.episode_len, act_dim), dtype=jnp.float32)
-    timesteps = jnp.repeat(jnp.arange(0, config.episode_len, 1, jnp.int32)[None, :], 1, axis=0)
-    rewards_to_go = jnp.zeros((1, config.episode_len, 1), dtype=jnp.float32)
-    running_rtg = target_return * config.reward_scale
+    states = jnp.zeros(
+        (proxy_batch_size, config.episode_len, state_dim), dtype=jnp.float32
+    )
+    actions = jnp.zeros(
+        (proxy_batch_size, config.episode_len, act_dim), dtype=jnp.float32
+    )
+    timesteps = jnp.repeat(
+        jnp.arange(0, config.episode_len, 1, jnp.int32)[None, :],
+        proxy_batch_size,
+        axis=0,
+    )
+    rewards_to_go = jnp.zeros(
+        (proxy_batch_size, config.episode_len, 1), dtype=jnp.float32
+    )
+    running_rtg = jnp.full(
+        (proxy_batch_size,), target_return * config.reward_scale, dtype=jnp.float32
+    )
 
     def policy_fn(obs: jnp.ndarray) -> jnp.ndarray:
         nonlocal t_step, states, actions, rewards_to_go, running_rtg
         
         if t_step >= config.episode_len:
             t_step = 0
-            running_rtg = target_return * config.reward_scale
+            running_rtg = jnp.full(
+                (proxy_batch_size,),
+                target_return * config.reward_scale,
+                dtype=jnp.float32,
+            )
 
-        normalized_state = (obs.flatten() - state_mean) / state_std
-        states = states.at[0, t_step].set(normalized_state)
-        rewards_to_go = rewards_to_go.at[0, t_step].set(running_rtg)
+        # The proxy normalizes observations before calling its policy.  Do not
+        # normalize again here; reshape only to retain the batch dimension.
+        normalized_state = jnp.asarray(obs).reshape(proxy_batch_size, state_dim)
+        states = states.at[:, t_step].set(normalized_state)
+        rewards_to_go = rewards_to_go.at[:, t_step, 0].set(running_rtg)
 
         if t_step < config.seq_len:
             act_preds = algo.get_action(
@@ -1003,13 +1032,11 @@ def _train(config: DTConfig):
                 rewards_to_go[:, t_step - config.seq_len + 1 : t_step + 1],
             )
 
-        act = act_preds[0] if act_preds.ndim > 1 else act_preds
-        if act.ndim > 1:
-            act = act[0]
+        act = act_preds[:, -1]
             
-        actions = actions.at[0, t_step].set(act)
+        actions = actions.at[:, t_step].set(act)
         t_step += 1
-        return jnp.array(act)
+        return jnp.asarray(act)
 
 
     proxyResult = proxy.evaluate(
@@ -1019,11 +1046,12 @@ def _train(config: DTConfig):
         state_mean, 
         state_std, 
         render=True,
-        algorithm_name=config.name
+        algorithm_name=config.name,
+        dict_prefix="eval/proxy_results"
     )
 
     # Log proxy results
-    wandb.log({"eval/proxy_results": proxyResult})
+    wandb.log(proxyResult)
 
     # Save final checkpoint
     if config.checkpoints_path is not None:

@@ -752,7 +752,7 @@ def get_env(
     return env
 
 
-def maybe_get_shifted_env(env_name, device, command_type=None, dataset=None, eval_shift=None):
+def maybe_get_shifted_env(device, command_type=None, dataset=None, eval_shift=None, num_actors=1):
     """Build a Tier-5 shifted-evaluation env, or return None when not requested.
 
     ``eval_shift`` is the per-task ``eval_shift`` block from _datasets.yaml, passed
@@ -774,11 +774,11 @@ def maybe_get_shifted_env(env_name, device, command_type=None, dataset=None, eva
     else:
         overrides = dict(eval_shift)
     return get_env(
-        env_name,
         device,
         command_type=command_type,
         dataset=dataset,
         config_overrides=overrides,
+        num_actors=num_actors
     )
 
 

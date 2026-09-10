@@ -55,6 +55,22 @@ class ConfigResult:
 
 ProxyResult = Dict[str, ConfigResult]
 
+def _flatten_proxy_results(proxy_result: Dict, prefix: str) -> Dict:
+   """Convert proxy metrics to top-level W&B keys with slash separators."""
+   flattened = {}
+
+   def visit(value, path):
+      if isinstance(value, dict):
+         for key, nested_value in value.items():
+               visit(nested_value, f"{path}/{key}")
+      else:
+         flattened[path] = value
+
+   for config_name, config_result in proxy_result.items():
+      visit(config_result, f"{prefix}/{config_name}")
+
+   return flattened
+
 def evaluate(
    policy_fn: Callable[[jnp.ndarray], jnp.ndarray],
    env: GymWrapper,
@@ -62,7 +78,8 @@ def evaluate(
    obs_mean,
    obs_std,
    render: bool = False,
-   algorithm_name: Optional[str] = None
+   algorithm_name: Optional[str] = None,
+   dict_prefix: Optional[str] = None
 ) -> Dict:
    default_render_callback = env.render_callback
    if render:
@@ -117,7 +134,8 @@ def evaluate(
    results = _calculate_results(data)
    env.render_callback = default_render_callback
 
-   return {k: clean_dict(asdict(v)) for k, v in results.items()}
+   results_dict = {k: clean_dict(asdict(v)) for k, v in results.items()}
+   return results_dict if dict_prefix is None else _flatten_proxy_results(results_dict, prefix=dict_prefix)
    
 def _evaluate_individual(
    policy_fn: Callable[[jnp.ndarray], jnp.ndarray],

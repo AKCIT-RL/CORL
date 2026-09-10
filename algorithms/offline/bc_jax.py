@@ -469,15 +469,15 @@ def _train(config: BCConfig):
     minari_dataset = minari.load_dataset(config.dataset_id)
     dataset = qlearning_dataset(minari_dataset)
     env = get_env(
-        config.env, 
         config.device, 
         command_type=config.command_type, 
         dataset=minari_dataset,
         num_actors=config.n_eval_actors,
     )
     shifted_env = maybe_get_shifted_env(
-        config.env, config.device, command_type=config.command_type,
+        config.device, command_type=config.command_type,
         dataset=minari_dataset, eval_shift=config.eval_shift,
+        num_actors=config.n_eval_actors
     )
 
     rng = jax.random.PRNGKey(config.seed)
@@ -578,11 +578,12 @@ def _train(config: BCConfig):
         obs_mean, 
         obs_std,
         render=True,
-        algorithm_name=config.name
+        algorithm_name=config.name,
+        dict_prefix="eval/proxy_results"
     )
 
     # Log proxy results
-    wandb.log({"eval/proxy_results": proxyResult})
+    wandb.log(proxyResult)
 
     # Save final checkpoint
     if config.checkpoints_path is not None:
@@ -618,4 +619,3 @@ def _train(config: BCConfig):
 
 if __name__ == "__main__":
     train()
-
