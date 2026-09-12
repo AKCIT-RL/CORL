@@ -420,7 +420,7 @@ def evaluate(
         finished = np.zeros(num_envs, dtype=bool)
         observation, _ = env.reset()
         while not np.all(finished):
-            observation = (observation - obs_mean) / obs_std
+            observation = (observation - obs_mean) / (obs_std + 1e-5)
             action = policy_fn(obs=observation)
             observation, reward, done, truncated, _ = env.step(np.array(action))
             active_mask = ~finished
