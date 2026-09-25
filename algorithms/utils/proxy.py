@@ -14,7 +14,12 @@ os.environ["MUJOCO_GL"] = "egl"
 gl_context = mujoco.egl.GLContext(1024, 1024)
 gl_context.make_current()
 
-from algorithms.utils.randomize_gym import GymWrapper, get_predefined_randomize_configs
+from algorithms.utils.randomize_gym import (
+   ENV_NAME,
+   GymWrapper,
+   _assert_supported_obs_layout,
+   get_predefined_randomize_configs,
+)
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
@@ -79,7 +84,8 @@ def evaluate(
    obs_std,
    render: bool = False,
    algorithm_name: Optional[str] = None,
-   dict_prefix: Optional[str] = None
+   dict_prefix: Optional[str] = None,
+   env_name: str = ENV_NAME
 ) -> Dict:
    default_render_callback = env.render_callback
    if render:
@@ -100,7 +106,15 @@ def evaluate(
       print(f"\n {'='*10} Random config: {display_name} {'='*10}")
 
       print("\nLoading environment...")
-      configs = get_predefined_randomize_configs(cfg_name, cfg_file)
+      configs = get_predefined_randomize_configs(cfg_name, cfg_file, env_name)
+      # update_randomize_functions bypasses get_env, so the layout guard runs here.
+      # Skipping beats raising: a training run should not die at final evaluation
+      # just because this env has no component map, and `default` still works.
+      try:
+         _assert_supported_obs_layout(env.env, configs, env_name)
+      except ValueError as exc:
+         print(f"Skipping suite '{display_name}': {exc}")
+         return
       env.update_randomize_functions(configs.get_functions())
       env.warmup_jit_reset()
 

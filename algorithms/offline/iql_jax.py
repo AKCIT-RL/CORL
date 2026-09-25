@@ -633,12 +633,13 @@ def _train(config: IQLConfig):
         config.device, 
         command_type=config.command_type, 
         dataset=minari_dataset,
-        num_actors=config.n_eval_actors
+        num_actors=config.n_eval_actors,
+        env_name=config.env
     )
     shifted_env = maybe_get_shifted_env(
         config.device, command_type=config.command_type,
         dataset=minari_dataset, eval_shift=config.eval_shift,
-        num_actors=config.n_eval_actors
+        num_actors=config.n_eval_actors, env_name=config.env
     )
     dataset, obs_mean, obs_std = get_dataset(config)
     
@@ -753,7 +754,8 @@ def _train(config: IQLConfig):
         obs_std,
         render=True,
         algorithm_name=config.name,
-        dict_prefix="eval/proxy_results"
+        dict_prefix="eval/proxy_results",
+        env_name=config.env
     )
 
     # Log proxy results

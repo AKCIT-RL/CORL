@@ -905,11 +905,11 @@ def _train(config: CQLConfig):
     
     minari_dataset = minari.load_dataset(config.dataset_id)
     qdataset = qlearning_dataset(minari_dataset)
-    env = get_env(config.device, command_type=config.command_type, dataset=minari_dataset, num_actors=config.n_eval_actors)
+    env = get_env(config.device, command_type=config.command_type, dataset=minari_dataset, num_actors=config.n_eval_actors, env_name=config.env)
     shifted_env = maybe_get_shifted_env(
         config.device, command_type=config.command_type,
         dataset=minari_dataset, eval_shift=config.eval_shift,
-        num_actors=config.n_eval_actors
+        num_actors=config.n_eval_actors, env_name=config.env
     )
 
     action_shape = env.action_space.shape
@@ -1011,7 +1011,8 @@ def _train(config: CQLConfig):
         obs_std,
         render=True,
         algorithm_name=config.name,
-        dict_prefix="eval/proxy_results"
+        dict_prefix="eval/proxy_results",
+        env_name=config.env
     )
 
     # Log proxy results
