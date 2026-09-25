@@ -2,7 +2,9 @@ from dataclasses import dataclass, fields
 import os
 from pathlib import Path
 import time
-from typing import Callable, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple
+import json
+import minari
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -10,13 +12,11 @@ from pyrallis.argparsing import wrap
 import mujoco.egl
 import tqdm
 import yaml
-import minari
 
 os.environ["MUJOCO_GL"] = "egl"
 gl_context = mujoco.egl.GLContext(1024, 1024)
 gl_context.make_current()
 
-from algorithms.offline.bc_jax import BCActor
 from algorithms.utils.randomize_gym import GymWrapper, get_env
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -31,12 +31,19 @@ class CompareRandomizeAttributes:
    render: bool = False
    dataset_id: Optional[str] = None
    device: str = "cuda"
+   # Comma-separated suite names to run; "default" is always included as the SRR baseline.
+   configs: Optional[str] = None
+   metrics_dir: str = "logs/compare/metrics"
    
 @dataclass
 class CompareRandomizeConfig:
    env: str
-   hidden_dims: list[int]
-   command_type: str
+   # The actor architecture is read from the checkpoint weights, so no layer sizes
+   # are needed here -- AWAC configs do not even carry `hidden_dims`.
+   command_type: Optional[str] = None
+   # Needed for D4RL normalization: carries return_min/return_expert in its metadata.
+   dataset_id: Optional[str] = None
+   seed: Optional[int] = None
 
 def _first_env_state(state):
    def _select_first(x):
@@ -124,32 +131,72 @@ def parse_checkpoint_path(checkpoint_path: str) -> str:
       f"Checkpoint path does not exist: {checkpoint_path}"
    )
    
+_MAX_ACTION = 1.0
+
+def _ordered_dense(tree: Dict[str, Any], prefix: str = "Dense") -> List[Dict[str, Any]]:
+   keys = [k for k in tree if k.startswith(prefix + "_")]
+   return [tree[k] for k in sorted(keys, key=lambda k: int(k.split("_")[-1]))]
+
+def _mlp(layers: List[Dict[str, Any]], x: jnp.ndarray, activate_final: bool) -> jnp.ndarray:
+   for i, layer in enumerate(layers):
+      x = x @ layer["kernel"] + layer["bias"]
+      if activate_final or i + 1 < len(layers):
+         x = jax.nn.relu(x)
+   return x
+
+def build_policy(checkpoint) -> Callable[[jnp.ndarray], jnp.ndarray]:
+   """Rebuild a deterministic actor from the weight tree alone.
+
+   The five algorithms ship three different actor shapes, and three of them store
+   the weights under the same `actor_params` key, so loading blindly yields a
+   silently wrong policy instead of an error. Dispatch on structure, not on name:
+     * `policy_params`      -> CQL TanhGaussian, base_network emits [mean, log_std]
+     * `log_stds` present   -> IQL / AWAC Gaussian, MLP(activate_final) + mean head
+     * otherwise            -> BC / TD3+BC, MLP straight to max_action * tanh
+   """
+   if "policy_params" in checkpoint.files:
+      params = checkpoint["policy_params"].item()["params"]
+      layers = _ordered_dense(params["base_network"])
+
+      def policy_fn(obs):
+         out = _mlp(layers, obs, activate_final=False)
+         mean, _ = jnp.split(out, 2, axis=-1)
+         return jnp.tanh(mean)
+
+      return policy_fn
+
+   params = checkpoint["actor_params"].item()["params"]
+
+   if "log_stds" in params:
+      hidden = _ordered_dense(params["MLP_0"])
+      head = params["Dense_0"]
+
+      def policy_fn(obs):
+         h = _mlp(hidden, obs, activate_final=True)
+         mean = h @ head["kernel"] + head["bias"]
+         return jnp.clip(mean, -_MAX_ACTION, _MAX_ACTION)
+
+      return policy_fn
+
+   layers = _ordered_dense(params["MLP_0"])
+
+   def policy_fn(obs):
+      out = _mlp(layers, obs, activate_final=False)
+      return jnp.clip(_MAX_ACTION * jnp.tanh(out), -_MAX_ACTION, _MAX_ACTION)
+
+   return policy_fn
+
 def load_checkpoint(
    attrs: CompareRandomizeAttributes,
    config: CompareRandomizeConfig,
    env: GymWrapper
 ) -> Tuple[Callable[[jnp.ndarray], jnp.ndarray], np.ndarray, np.ndarray]:
-   # Parse checkpoint path
    checkpoint_path = parse_checkpoint_path(attrs.checkpoint_path)
    print("Carregando checkpoint de:", checkpoint_path)
-   
-   # Get action shape
-   action_shape = get_action_shape(env)
-   
-   # Load model and params
+
    checkpoint = np.load(checkpoint_path, allow_pickle=True)
-   model = BCActor(
-      hidden_dims=config.hidden_dims, 
-      action_dim=action_shape[0]
-   )
-   params = checkpoint["actor_params"].item()
-   obs_mean = checkpoint["obs_mean"]
-   obs_std = checkpoint["obs_std"]
-   
-   # Create partial actor function
-   def policy_fn(obs: jnp.ndarray) -> jnp.ndarray:
-      return cast(jnp.ndarray, model.apply(params, obs))
-   return policy_fn, obs_mean, obs_std
+   policy_fn = build_policy(checkpoint)
+   return policy_fn, checkpoint["obs_mean"], checkpoint["obs_std"]
    
 def evaluate(
    policy_fn: Callable[[jnp.ndarray], jnp.ndarray],
@@ -202,44 +249,72 @@ def evaluate(
          for ret in episode_returns:
             normalized = env.get_normalized_score(ret)
             if normalized is not None:
-               normalized_returns.append(100 * float(normalized))
+               # 0-1 scale, NOT the x100 used in the training logs: the published
+               # table merges these JSONs with older .txt logs and publish_metrics
+               # calibrates DEGENERATE_NOMINAL against this scale.
+               normalized_returns.append(float(normalized))
             else:
                normalized_returns.append(ret)
          return np.array(normalized_returns, dtype=np.float32)
 
       return np.array(episode_returns, dtype=np.float32)
 
-def print_results(data: Dict[str, np.ndarray]):
+# `only_domain` swaps the env's sensor noise for the clean signal, so dividing it by
+# `default` folds that swap into the ratio; its baseline is the clean-obs run.
+_BASELINE_OVERRIDE = {"only_domain": "disabled"}
+
+def print_results(data: Dict[str, np.ndarray]) -> Dict[str, Dict[str, float]]:
    print(f"\n{'='*10} RESULTADOS {'='*10}")
 
-   base_returns = data.get("default", np.array([], dtype=np.float32))
-   base_mean = 0.0
-
-   if len(base_returns) > 0:
-      base_mean = np.mean(base_returns)
-   
+   metrics: Dict[str, Dict[str, float]] = {}
    for cfg_name, returns in data.items():
-      mean = np.mean(returns)
-      std = np.std(returns)
-      srr = mean / base_mean if base_mean != 0 else float('inf')
+      arr = np.asarray(returns, dtype=np.float64)
+
+      base_name = _BASELINE_OVERRIDE.get(cfg_name, "default")
+      if base_name not in data:
+         base_name = "default"
+      base_arr = np.asarray(data.get(base_name, []), dtype=np.float64)
+
+      stats: Dict[str, float] = {
+         "score": float(np.mean(arr)),
+         "score_std": float(np.std(arr)),
+         "score_median": float(np.median(arr)),
+         "n_episodes": float(arr.size),
+      }
+      metrics[cfg_name] = stats
+
       print(f"\nRandomização {cfg_name}:")
-      print(f" - Média: {mean:.2f}")
-      print(f" - Std: {std:.2f}")
+      print(f" - Média: {stats['score']:.2f}")
+      print(f" - Std: {stats['score_std']:.2f}")
+
+      if base_arr.size == 0:
+         continue
+
+      base_mean = float(np.mean(base_arr))
+      srr = stats["score"] / base_mean if base_mean != 0 else float('inf')
+      stats["srr"] = srr
+      stats["gap"] = base_mean - stats["score"]
+      print(f" - Baseline: {base_name}")
       print(f" - Relação Randomizado / Baseline: {srr:.2f}")
 
-      if len(base_returns) > 0:
-         if cfg_name != "default":
-            evaluate_robustness(base_returns, returns)
+      if cfg_name != base_name:
+         stats.update(evaluate_robustness(base_arr, arr))
+         if base_mean != 0:
+            stats["p5_retention"] = (base_mean + stats["p5_delta"]) / base_mean
 
-def evaluate_robustness(base_arr: np.ndarray, rand_arr: np.ndarray):
+   return metrics
+
+def evaluate_robustness(base_arr: np.ndarray, rand_arr: np.ndarray) -> Dict[str, float]:
    print("\nAnálise de Robustez (Trajetórias Pareadas)...")
    
    deltas = rand_arr - base_arr
-   mean_delta = np.mean(deltas)
-   p5_delta = np.percentile(deltas, 5)  # 5% piores quedas de desempenho
+   mean_delta = float(np.mean(deltas))
+   p5_delta = float(np.percentile(deltas, 5))  # 5% piores quedas de desempenho
    
    print(f" - Variação Média (Delta): {mean_delta:+.2f}")
    print(f" - Pior Caso (5º Percentil): {p5_delta:+.2f}")
+
+   metrics: Dict[str, float] = {"delta_mean": mean_delta, "p5_delta": p5_delta}
    
    with np.errstate(divide='ignore', invalid='ignore'):
       rel_drops = np.where(
@@ -248,12 +323,17 @@ def evaluate_robustness(base_arr: np.ndarray, rand_arr: np.ndarray):
          0.0
       )
    
-   critical_rate = np.mean(rel_drops > 0.10) * 100
-   print(f" - Taxa de Queda Crítica (>10% perda): {critical_rate:.1f}%")
+   # >10% catches any noticeable degradation; >50% is the one that tracks actual failure.
+   for threshold in (0.10, 0.50):
+      rate = float(np.mean(rel_drops > threshold) * 100)
+      metrics[f"critical_rate_{int(threshold * 100)}"] = rate
+      print(f" - Taxa de Queda Crítica (>{threshold:.0%} perda): {rate:.1f}%")
    
    if np.allclose(base_arr, rand_arr):
       print(" - IC 95% (Relação): [1.00, 1.00] (Trajetórias idênticas)")
-      return
+      metrics["srr_ci_low"] = 1.0
+      metrics["srr_ci_high"] = 1.0
+      return metrics
 
    try:
       from scipy.stats import bootstrap
@@ -270,12 +350,28 @@ def evaluate_robustness(base_arr: np.ndarray, rand_arr: np.ndarray):
          n_resamples=1000,
          method='basic',
       )
-      ci_low = res.confidence_interval.low
-      ci_high = res.confidence_interval.high
+      ci_low = float(res.confidence_interval.low)
+      ci_high = float(res.confidence_interval.high)
+      metrics["srr_ci_low"] = ci_low
+      metrics["srr_ci_high"] = ci_high
       print(f" - IC 95% (Relação): [{ci_low:.2f}, {ci_high:.2f}]")
    except (ImportError, ValueError):
       pass
+
+   return metrics
    
+def _run_identity(checkpoint_path: str) -> Tuple[str, Optional[int]]:
+   """Run name and training step for a checkpoint that may be a dir or a single .npz."""
+   step = None
+   if os.path.isfile(checkpoint_path) and checkpoint_path.endswith(".npz"):
+      stem = os.path.basename(checkpoint_path)[: -len(".npz")]
+      tail = stem.split("_")[-1]
+      step = int(tail) if tail.isdigit() else None
+      name = os.path.basename(os.path.dirname(os.path.normpath(checkpoint_path)))
+   else:
+      name = os.path.basename(os.path.normpath(checkpoint_path))
+   return (f"{name}@{step}" if step is not None else name), step
+
 def _main(attrs: CompareRandomizeAttributes):
    # Get config
    print("Carregando configuração do checkpoint...")
@@ -287,12 +383,29 @@ def _main(attrs: CompareRandomizeAttributes):
       print(f" - {field.name}: {value}")
 
    num_actors = max(1, min(attrs.n_actors, attrs.n_episodes))
-   
+
+   # The checkpoint config carries the dataset it was trained on; --dataset_id
+   # overrides it to score against a different reference.
+   dataset_id = attrs.dataset_id or config.dataset_id
+   dataset = minari.load_dataset(dataset_id) if dataset_id else None
+   if dataset is None:
+      print("AVISO: sem dataset_id, os scores serão retornos brutos (não normalizados).")
+
+   run_name, ckpt_step = _run_identity(attrs.checkpoint_path)
+
    randomize_configs = ["default", "full", "only_domain", "custom", "disabled"]
    custom_configs = {
       "example": "configs/randomize/example.yaml",
-      "humanoid_gym": "configs/randomize/humanoid_gym.yaml"
+      "humanoid_gym": "configs/randomize/humanoid_gym.yaml",
+      "humanoid_gym_medium": "configs/randomize/humanoid_gym_medium.yaml"
    }
+
+   selected = None
+   if attrs.configs:
+      selected = {name.strip() for name in attrs.configs.split(",")} | {"default"}
+      unknown = selected - set(randomize_configs) - set(custom_configs)
+      if unknown:
+         raise ValueError(f"Unknown configs: {sorted(unknown)}")
 
    data = {}
    policy = None
@@ -307,8 +420,6 @@ def _main(attrs: CompareRandomizeAttributes):
       print(f"\n {'='*10} Randomize Config: {display_name} {'='*10}")
       print("\nCarregando ambiente...")
 
-      minari_dataset = minari.load_dataset(attrs.dataset_id) if attrs.dataset_id else None
-
       env = get_env(
          device=attrs.device, 
          render_callback=_render_callback,
@@ -317,7 +428,8 @@ def _main(attrs: CompareRandomizeAttributes):
          config_overrides={"impl": "jax"},
          randomize_configs=cfg_name,
          randomize_options=cfg_file,
-         dataset=minari_dataset
+         dataset=dataset,
+         env_name=config.env
       )
 
       # Get checkpoint
@@ -352,12 +464,36 @@ def _main(attrs: CompareRandomizeAttributes):
    for cfg_name in randomize_configs:
       if cfg_name == "custom":
          for display_name, cfg_file in custom_configs.items():
-            run_test(cfg_name, cfg_file, display_name)
-      else:
+            if selected is None or display_name in selected:
+               run_test(cfg_name, cfg_file, display_name)
+      elif selected is None or cfg_name in selected:
          run_test(cfg_name)
    
    # Show results
-   print_results(data)
+   metrics = print_results(data)
+
+   record = {
+      "run": run_name,
+      "checkpoint": os.path.basename(os.path.normpath(attrs.checkpoint_path)),
+      "checkpoint_path": attrs.checkpoint_path,
+      "checkpoint_step": ckpt_step,
+      "env": config.env,
+      "dataset_id": dataset_id,
+      "command_type": config.command_type,
+      "train_seed": config.seed,
+      "n_episodes": attrs.n_episodes,
+      "n_actors": num_actors,
+      "normalized": dataset is not None,
+      "metrics": metrics,
+      # kept so the published table can be recomputed without re-simulating
+      "episode_returns": {k: np.asarray(v).tolist() for k, v in data.items()},
+   }
+
+   out_dir = Path(attrs.metrics_dir)
+   out_dir.mkdir(parents=True, exist_ok=True)
+   out_path = out_dir / f"{run_name}.json"
+   out_path.write_text(json.dumps(record, indent=2))
+   print(f"\nMétricas salvas em: {out_path}")
 
 def main():
    wrapped_main = wrap()(_main)

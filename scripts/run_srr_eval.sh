@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Sim2Real proxy evaluation across algorithms.
+#
+# Only Go2JoystickFlatTerrain, Go2PushRecovery and Go2RoughCurriculum share the
+# observation layout that the perturbation suites assume; the layout guard in
+# randomize_gym.py rejects the rest, so they are not enumerated here.
+#
+# Resume is keyed on the metrics JSON, which compare_randomize.py writes only after
+# a run finishes, so an interrupted run is retried rather than silently skipped.
+#
+#   ALGOS="IQL CQL" EPISODES=50 ./scripts/run_srr_eval.sh
+set -uo pipefail
+
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+cd "$REPO_ROOT"
+export MINARI_DATASETS_PATH="${MINARI_DATASETS_PATH:-$REPO_ROOT/datasets}"
+
+ALGOS="${ALGOS:-AWAC CQL IQL TD3-BC}"
+ENVS="${ENVS:-Go2JoystickFlatTerrain Go2PushRecovery Go2RoughCurriculum}"
+SUITE="${SUITE:-humanoid_gym_medium}"
+EPISODES="${EPISODES:-100}"
+ACTORS="${ACTORS:-50}"
+
+METRICS_DIR="logs/compare/metrics"
+LOG_DIR="logs/compare/algorithms"
+mkdir -p "$METRICS_DIR" "$LOG_DIR"
+
+todo=()
+for algo in $ALGOS; do
+  for env in $ENVS; do
+    for d in "checkpoints/$algo/$algo-$env-"*/; do
+      [[ -d "$d" ]] && todo+=("$d")
+    done
+  done
+done
+
+total=${#todo[@]}
+echo "fila: $total checkpoints | suites: default + $SUITE | $EPISODES episodios"
+started=$(date +%s)
+failed=0
+
+for i in "${!todo[@]}"; do
+  d="${todo[$i]}"
+  name="$(basename "${d%/}")"
+  pos="[$((i + 1))/$total]"
+
+  if [[ -s "$METRICS_DIR/$name.json" ]]; then
+    echo "$pos skip  $name"
+    continue
+  fi
+
+  echo "$pos run   $name"
+  if ! .venv/bin/python -m scripts.compare_randomize \
+      --checkpoint_path "$d" --device cuda \
+      --n_actors "$ACTORS" --n_episodes "$EPISODES" \
+      --configs "$SUITE" > "$LOG_DIR/$name.txt" 2>&1; then
+    failed=$((failed + 1))
+    echo "         FALHOU: $(tail -3 "$LOG_DIR/$name.txt" | tr '\n' ' ' | cut -c1-150)"
+  fi
+done
+
+echo "TERMINOU em $(((($(date +%s) - started)) / 60)) min | falhas: $failed"

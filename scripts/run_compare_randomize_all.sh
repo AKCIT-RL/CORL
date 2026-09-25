@@ -5,6 +5,9 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$REPO_ROOT"
 
+# minari resolves "playground/..." dataset ids from this path
+export MINARI_DATASETS_PATH="${MINARI_DATASETS_PATH:-$REPO_ROOT/datasets}"
+
 OUTPUT_DIR="logs/compare"
 mkdir -p ${OUTPUT_DIR}
 

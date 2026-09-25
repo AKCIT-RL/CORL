@@ -155,4 +155,6 @@ dmypy.json
 wandb
 videos
 logs
+.done_runs/
+*.zip
 #assets/
