@@ -1,20 +1,22 @@
-# Domain randomization from Humanoid-Gym (Gu et al., ICRA 2024 Workshop), Table III,
-# transposed from XBot (Isaac Gym) to the Go2 (MuJoCo Playground).
+# Calibrated "medium" rung of the sim2real evaluation ladder.
 #
-# The paper's ranges are TRAINING ranges: an infeasible draw is harmless there
-# because PPO just learns from the feasible ones. Used as an evaluation stress
-# test with a frozen policy, an infeasible draw scores as a failure. Treat this
-# file as the "strong" rung of the ladder, not as a plausible reality gap.
+# Identical to humanoid_gym.yaml except for the friction range. The paper's
+# Friction ~ U(0.1, 2.0) is a TRAINING range: ~21% of draws land below mu = 0.5,
+# where no policy can walk, so those episodes score a frozen policy as a failure
+# regardless of its quality. Measured on humanoid_gym.yaml: 53-78% critical drop
+# rate and worst-5% retention below return_min on all 8 checkpoints.
+#
+# mu in [0.3, 1.0] spans dry concrete down to a smooth waxed floor, which is the
+# plausible reality gap for an indoor/outdoor quadruped. Target for this rung:
+# critical drop rate ~20-30% and positive worst-5% retention.
 
 noise:
-  # Friction | - | [0.1, 2.0] | uniform.
-  # Absolute coefficient, not a multiplier: the Go2 floor default is 0.6, so
-  # `scale` here would give [0.06, 1.2] and put most draws on ice.
+  # Friction | - | narrowed from the paper's [0.1, 2.0] to a walkable range.
   geom_friction:
     dist: uniform
     type: absolute
-    min: 0.1
-    max: 2.0
+    min: 0.3
+    max: 1.0
 
   # Payload | kg | [-5, 5] | additive | Gaussian.
   # XBot-L is ~60 kg against the Go2's 14.8 kg; +-1.0 kg keeps a comparable
@@ -64,8 +66,6 @@ noise:
     max: 0.03
 
 # System Delay | ms | [0, 10] | uniform.
-# ctrl_dt is 20 ms, so one step is the smallest representable delay and already
-# overshoots the paper's range; 0 or 1 step is the closest achievable match.
 action_factory:
   type: randomized_delay
   max_delay: 1

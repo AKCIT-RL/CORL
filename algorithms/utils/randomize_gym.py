@@ -144,6 +144,7 @@ class RandomizeConfigs:
         body_mass: Optional[Callable[[Any, Any], jax.Array]] = None
         qpos0: Optional[Callable[[Any, Any], jax.Array]] = None
         actuator_gainprm: Optional[Callable[[Any, Any], jax.Array]] = None
+        motor_strength: Optional[Callable[[Any, Any], jax.Array]] = None
         
         # Observation
         gyro: Optional[Callable[[Any, Any], jax.Array]] = None
@@ -160,6 +161,7 @@ class RandomizeConfigs:
         action_factory: Optional[Callable[[Any, Any], Callable[[Any], jax.Array]]] = None
     
     configs: Optional[RandomizeOptions] = None
+    env_name: str = ENV_NAME
     
     def __post_init__(self):
         if self.type != self.RandomizeType.CUSTOM and self.configs is not None:
@@ -172,7 +174,7 @@ class RandomizeConfigs:
         self, enabled=True
     ) -> Callable[[Any, Any], Tuple[Any, Any]]:
         if enabled:
-            return registry.get_domain_randomizer(ENV_NAME) # type: ignore
+            return registry.get_domain_randomizer(self.env_name) # type: ignore
         
         def disabled_domain_randomizer(model, _):
             return model, None
@@ -253,7 +255,7 @@ class RandomizeConfigs:
     
     def _get_custom_functions(self) -> RandomizeFunctions:
         domain_randomize = self._get_domain_randomize(enabled=False)
-        observation_randomize = self._get_observation_randomize(enabled=False)
+        observation_randomize = self._get_observation_randomize(enabled=True)
         action_step = self._get_action_function()
         
         def custom_domain_randomize(model, rng):
@@ -277,6 +279,8 @@ class RandomizeConfigs:
                 model_replace_keys.append("qpos0")
             if self.configs.actuator_gainprm is not None:
                 model_replace_keys.append("actuator_gainprm")
+            if self.configs.motor_strength is not None:
+                model_replace_keys.extend(["actuator_gainprm", "actuator_biasprm"])
 
             def rand_dynamics_single(single_rng):
                 assert self.configs is not None
@@ -328,6 +332,16 @@ class RandomizeConfigs:
                     res["actuator_gainprm"] = self.configs.actuator_gainprm(
                         model.actuator_gainprm, key
                     )
+                if self.configs.motor_strength is not None:
+                    rng_key, key = jax.random.split(rng_key)
+                    # PD torque is gainprm[:,0]*ctrl + biasprm[:,1]*qpos with
+                    # biasprm[:,1] == -gainprm[:,0]; scaling only the gain shifts the
+                    # setpoint instead of scaling torque, so both move together.
+                    kp = self.configs.motor_strength(
+                        model.actuator_gainprm[:, 0], key
+                    )
+                    res["actuator_gainprm"] = model.actuator_gainprm.at[:, 0].set(kp)
+                    res["actuator_biasprm"] = model.actuator_biasprm.at[:, 1].set(-kp)
                 return res
 
             if getattr(rng, "ndim", 0) == 1:
@@ -351,15 +365,18 @@ class RandomizeConfigs:
                 return observation_randomize(obs, rng)
 
             def randomize_single(single_obs, single_rng):
-                clean_dict, _ = _extract_observation_components(single_obs)
-                comp_dict = dict(clean_dict)
+                # Compose on the env's own noisy observation so a custom suite is a
+                # strict superset of `default`; starting from the clean state would
+                # make weak YAML noise act as a de-noising instead of a perturbation.
+                _, noisy_dict = _extract_observation_components(single_obs)
+                comp_dict = dict(noisy_dict)
                 
                 rng_key = single_rng
                 for k in ["linvel", "gyro", "gravity", "joint_angles", "joint_vel"]:
                     fn = getattr(self.configs, k, None)
                     if fn is not None:
                         rng_key, key = jax.random.split(rng_key)
-                        comp_dict[k] = fn(clean_dict[k], key)
+                        comp_dict[k] = fn(noisy_dict[k], key)
                 return _concat_observation_dict(comp_dict)
 
             if getattr(rng, "ndim", 0) == 1:
@@ -415,65 +432,44 @@ class RandomizeConfigs:
 
 def get_predefined_randomize_configs(
     randomize_type: str,
-    options: Optional[dict[str, Any] | str] = None
+    options: Optional[dict[str, Any] | str] = None,
+    env_name: str = ENV_NAME
 ) -> RandomizeConfigs:
     """Return a RandomizeConfigs object for the given randomization type."""
 
     def get_fn(
         dist: Literal["uniform", "normal"],
-        type: Literal["additive", "scale"],
+        type: Literal["additive", "scale", "absolute"],
         range: Tuple[float, float],
         indices: Optional[np.ndarray] = None
     ) -> Callable[[jax.Array, jax.Array], jax.Array]:
+        low, high = range
+
         if dist == "uniform":
-            if type == "additive":
-                def fn(current, key):
-                    noise = jax.random.uniform(
-                        key, 
-                        shape=current.shape, 
-                        minval=range[0], 
-                        maxval=range[1]
-                    )
-                    if indices is not None:
-                        mask = jnp.zeros_like(noise).at[indices].set(1.0)
-                        noise = noise * mask
-                    return current + noise
-            else:
-                def fn(current, key):
-                    scale = jax.random.uniform(
-                        key, 
-                        shape=current.shape, 
-                        minval=range[0], 
-                        maxval=range[1]
-                    )
-                    if indices is not None:
-                        mask = jnp.zeros_like(scale).at[indices].set(1.0)
-                        scale = scale * mask + (1.0 - mask)
-                    return current * scale
+            def sample(current, key):
+                return jax.random.uniform(
+                    key, shape=jnp.shape(current), minval=low, maxval=high
+                )
         else:
-            mean = (range[0] + range[1]) / 2.0
-            std = (range[1] - range[0]) / 2.0
+            mean = (low + high) / 2.0
+            std = (high - low) / 2.0
+            def sample(current, key):
+                value = jax.random.normal(key, shape=jnp.shape(current)) * std + mean
+                return jnp.clip(value, low, high)
+
+        def fn(current, key):
+            value = sample(current, key)
             if type == "additive":
-                def fn(current, key):
-                    noise = jax.random.normal(
-                        key, shape=current.shape
-                    ) * std + mean
-                    noise = jnp.clip(noise, range[0], range[1])
-                    if indices is not None:
-                        mask = jnp.zeros_like(noise).at[indices].set(1.0)
-                        noise = noise * mask
-                    return current + noise
+                out = current + value
+            elif type == "scale":
+                out = current * value
             else:
-                def fn(current, key):
-                    scale = jax.random.normal(
-                        key, 
-                        shape=current.shape
-                    ) * std + mean
-                    scale = jnp.clip(scale, range[0], range[1])
-                    if indices is not None:
-                        mask = jnp.zeros_like(scale).at[indices].set(1.0)
-                        scale = scale * mask + (1.0 - mask)
-                    return current * scale
+                out = value
+            if indices is not None:
+                mask = jnp.zeros_like(current).at[indices].set(1.0)
+                out = jnp.where(mask > 0, out, current)
+            return out
+
         return fn
 
     def get_action_factory(
@@ -550,13 +546,13 @@ def get_predefined_randomize_configs(
         return action_factory_fn
 
     if randomize_type == "disabled":
-        return RandomizeConfigs(type=RandomizeConfigs.RandomizeType.DISABLED)
+        return RandomizeConfigs(type=RandomizeConfigs.RandomizeType.DISABLED, env_name=env_name)
     elif randomize_type == "full":
-        return RandomizeConfigs(type=RandomizeConfigs.RandomizeType.FULL)
+        return RandomizeConfigs(type=RandomizeConfigs.RandomizeType.FULL, env_name=env_name)
     elif randomize_type == "only_domain":
-        return RandomizeConfigs(type=RandomizeConfigs.RandomizeType.ONLY_DOMAIN)
+        return RandomizeConfigs(type=RandomizeConfigs.RandomizeType.ONLY_DOMAIN, env_name=env_name)
     elif randomize_type in ["only_observation", "default"]:
-        return RandomizeConfigs(type=RandomizeConfigs.RandomizeType.DEFAULT)
+        return RandomizeConfigs(type=RandomizeConfigs.RandomizeType.DEFAULT, env_name=env_name)
     elif randomize_type == "custom":
         opt: dict[str, Any]
 
@@ -572,7 +568,7 @@ def get_predefined_randomize_configs(
             raise ValueError("options must be provided for 'custom' randomization type")
 
         obs_fields = ["gyro", "gravity", "joint_angles", "joint_vel", "linvel"]
-        domain_fields = ["geom_friction", "dof_frictionloss", "dof_armature", "body_ipos", "body_mass", "qpos0", "actuator_gainprm"]
+        domain_fields = ["geom_friction", "dof_frictionloss", "dof_armature", "body_ipos", "body_mass", "qpos0", "actuator_gainprm", "motor_strength"]
         noise_fields = obs_fields + domain_fields
         functions = {}
 
@@ -587,7 +583,7 @@ def get_predefined_randomize_configs(
                 
                 if component.get("type") is None:
                     raise ValueError(f"Missing 'type' for component {component}")
-                elif component["type"] not in ["additive", "scale"]:
+                elif component["type"] not in ["additive", "scale", "absolute"]:
                     raise ValueError(f"Unknown 'type' for component {component}: {component['type']}")
                 
                 if component.get("min") is None:
@@ -621,6 +617,11 @@ def get_predefined_randomize_configs(
                     raise ValueError(f"Unknown component for noise randomization: {key}")
                 
                 functions[key] = get_noise_fn(cfg)
+
+            if "motor_strength" in functions and "actuator_gainprm" in functions:
+                raise ValueError(
+                    "'motor_strength' and 'actuator_gainprm' both write actuator_gainprm; use only one"
+                )
         
         if opt.get("bias") is not None:
             bias = opt["bias"]
@@ -693,10 +694,45 @@ def get_predefined_randomize_configs(
 
         return RandomizeConfigs(
             type=RandomizeConfigs.RandomizeType.CUSTOM,
-            configs=cfg
+            configs=cfg,
+            env_name=env_name
         )
     else:
         raise ValueError(f"Unknown randomize_type: {randomize_type}")
+
+# `_extract_observation_components` hardcodes the Go2 joystick layout. Getup (42/91),
+# Handstand/Footstand (45/94) and GetupWalk (48/97) reorder it -- and GetupWalk keeps
+# state at 48, so a mismatch there would silently perturb the wrong channels instead of
+# raising. Identify the supported layout by both sizes.
+_SUPPORTED_OBS_LAYOUT = {"state": 48, "privileged_state": 123}
+
+
+def _assert_supported_obs_layout(env, randomize_configs, env_name):
+    """Raise unless ``env`` uses the observation layout the component split assumes.
+
+    Only the modes that decompose the observation into named components need this;
+    ``default``/``full`` forward ``obs["state"]`` untouched and work on any env.
+    """
+    split_types = {
+        RandomizeConfigs.RandomizeType.DISABLED,
+        RandomizeConfigs.RandomizeType.ONLY_DOMAIN,
+        RandomizeConfigs.RandomizeType.CUSTOM,
+    }
+    if randomize_configs.type not in split_types:
+        return
+
+    sizes = env.observation_size
+    if isinstance(sizes, dict):
+        sizes = {
+            k: (v[0] if isinstance(v, tuple) else v) for k, v in sizes.items()
+        }
+    if sizes != _SUPPORTED_OBS_LAYOUT:
+        raise ValueError(
+            f"{env_name} has observation layout {sizes}, but randomize type "
+            f"'{randomize_configs.type.value}' assumes the Go2 joystick layout "
+            f"{_SUPPORTED_OBS_LAYOUT}. Add a per-env component map before using it."
+        )
+
 
 def get_env(
     device: str,
@@ -706,14 +742,15 @@ def get_env(
     dataset=None,
     config_overrides: Optional[Dict[str, str | int | list[Any]]] = None,
     randomize_configs: Optional[RandomizeConfigs | str] = None,
-    randomize_options: Optional[dict[str, Any] | str] = None
+    randomize_options: Optional[dict[str, Any] | str] = None,
+    env_name: str = ENV_NAME
 ):
     config_overrides = {
         "impl": "jax", 
         **config_overrides
     } if config_overrides is not None else {"impl": "jax"}
-    env = registry.load(ENV_NAME, config_overrides=config_overrides)
-    env_cfg = registry.get_default_config(ENV_NAME)
+    env = registry.load(env_name, config_overrides=config_overrides)
+    env_cfg = registry.get_default_config(env_name)
 
     options = None
     if randomize_options is not None and isinstance(randomize_options, dict):
@@ -728,14 +765,21 @@ def get_env(
     if randomize_configs is None:
         if options is None:
             randomize_configs = RandomizeConfigs(
-                type=RandomizeConfigs.RandomizeType.DEFAULT
+                type=RandomizeConfigs.RandomizeType.DEFAULT,
+                env_name=env_name
             )
         else:
-            randomize_configs = get_predefined_randomize_configs("custom", options)
+            randomize_configs = get_predefined_randomize_configs(
+                "custom", options, env_name
+            )
     elif isinstance(randomize_configs, str):
-        randomize_configs = get_predefined_randomize_configs(randomize_configs, options)
+        randomize_configs = get_predefined_randomize_configs(
+            randomize_configs, options, env_name
+        )
 
     randomize_functions = randomize_configs.get_functions()
+
+    _assert_supported_obs_layout(env, randomize_configs, env_name)
 
     env = GymWrapper(
         env,
@@ -752,7 +796,14 @@ def get_env(
     return env
 
 
-def maybe_get_shifted_env(device, command_type=None, dataset=None, eval_shift=None, num_actors=1):
+def maybe_get_shifted_env(
+    device,
+    command_type=None,
+    dataset=None,
+    eval_shift=None,
+    num_actors=1,
+    env_name: str = ENV_NAME
+):
     """Build a Tier-5 shifted-evaluation env, or return None when not requested.
 
     ``eval_shift`` is the per-task ``eval_shift`` block from _datasets.yaml, passed
@@ -778,7 +829,8 @@ def maybe_get_shifted_env(device, command_type=None, dataset=None, eval_shift=No
         command_type=command_type,
         dataset=dataset,
         config_overrides=overrides,
-        num_actors=num_actors
+        num_actors=num_actors,
+        env_name=env_name
     )
 
 
@@ -1200,6 +1252,7 @@ def record_policy_video(
         device,
         render_callback=render_callback,
         command_type=command_type,
+        env_name=env_name,
     )
 
     observation, _ = env.reset()

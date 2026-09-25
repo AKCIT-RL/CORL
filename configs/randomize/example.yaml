@@ -30,11 +30,17 @@ bias:
   min: -0.1
   max: 0.1
 
-quantization: 3
+# Levels per unit, i.e. the quantization step is 1/quantization. 1000 gives a
+# 0.001 rad step, roughly a 12-bit encoder over the Go2 joint range. The previous
+# value of 3 meant a 0.333 step: a 9.5 deg error on joint angles, 5x the env's
+# own sensor noise, which dominated every other term in this file.
+quantization: 1000
 
+# a_t <- alpha * a_t + (1 - alpha) * a_{t-1}. alpha -> 1 is a no-op, so the
+# previous 0.9 barely filtered anything; 0.2 models a visibly slow actuator.
 action_factory:
   type: smoothing
-  alpha: 0.9
+  alpha: 0.2
 
 # action_factory:
 #  type: randomized_delay
