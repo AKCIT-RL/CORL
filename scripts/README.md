@@ -58,9 +58,14 @@ export MINARI_DATASETS_PATH="$PWD/datasets"
 | `--device` | `cuda` | — |
 | `--configs` | `None` (todas) | Lista separada por vírgula de suítes. `default` entra **sempre** como baseline. |
 | `--metrics_dir` | `logs/compare/metrics` | Destino do JSON. |
+| `--dt_target_return` | `None` | Só DT: sobrepõe `target_returns[0]` do config do run. |
 
-Do `config.yaml` do checkpoint são lidos apenas `env`, `command_type`, `dataset_id` e
-`seed`. A arquitetura do ator **não** é lida do config — vem dos próprios pesos.
+Do `config.yaml` do checkpoint são lidos `env`, `command_type`, `dataset_id` e `seed`
+(o DT chama o primeiro de `env_name`; os dois nomes são aceitos). A arquitetura do ator
+**não** é lida do config — vem dos próprios pesos. A única exceção é o DT, cujo
+transformer não é reconstruível a partir da árvore de pesos: dele também são lidos
+`seq_len`, `episode_len`, `reward_scale`, `target_returns`, `embedding_dim`,
+`num_layers`, `num_heads` e os três dropouts.
 
 ### Suítes disponíveis
 
@@ -104,6 +109,27 @@ por estrutura e não por nome de diretório:
 > produz resultados silenciosamente errados. Qualquer refactor aqui precisa ser
 > revalidado contra `sim2real/checkpoint_{bc,td3_bc,iql,awac}.py`.
 
+### Decision Transformer
+
+A chave `transformer_params` no `.npz` desvia para `build_dt_policy`, que remonta o
+`DecisionTransformer` do `dt_jax` com os hiperparâmetros do `config.yaml` do run e
+normaliza com `state_mean`/`state_std` (não `obs_mean`/`obs_std`).
+
+O rollout (`_rollout_dt`) é autoregressivo e espelha o de `dt_jax.evaluate`: janela
+deslizante de `seq_len` sobre (timesteps, estados, ações, *returns-to-go*), RTG
+inicializado em `target_return * reward_scale` e **decrementado pela recompensa
+observada a cada passo**, normalização de estado **sem epsilon**. Os três detalhes
+precisam bater com o treino.
+
+> O adaptador de DT dentro de `dt_jax._train` (o que alimenta `proxy.evaluate`) mantém
+> o RTG **constante** e só o reseta quando `t_step` estoura `episode_len`, ignorando o
+> fim real do episódio. Os números de DT logados no wandb pelo proxy vêm desse caminho;
+> os do `compare_randomize` vêm do rollout correto e não são comparáveis com eles.
+
+Validação (2026-09-26, 4 episódios): `DT-Go2JoystickFlatTerrain-87131cbc` (expert) dá
+1.01 ± 0.03 no `default`, e o `medium-replay` do mesmo env dá -0.02 — ou seja, o
+rollout discrimina política boa de política que não aprendeu.
+
 ---
 
 ## `run_srr_eval.sh`
@@ -117,15 +143,15 @@ ALGOS="IQL CQL" EPISODES=50 ./scripts/run_srr_eval.sh
 
 | Variável | Padrão |
 | --- | --- |
-| `ALGOS` | `AWAC CQL IQL TD3-BC` |
+| `ALGOS` | `AWAC CQL IQL TD3-BC DT` |
 | `ENVS` | `Go2JoystickFlatTerrain Go2PushRecovery Go2RoughCurriculum` |
 | `SUITE` | `humanoid_gym_medium` |
 | `EPISODES` | `100` |
 | `ACTORS` | `50` |
 
 Só esses três envs compartilham o layout de observação assumido pelas suítes; os demais
-são rejeitados pela trava em `algorithms/utils/randomize_gym.py`. DT fica de fora (nomes de
-diretório fora do padrão e inferência com *return-to-go*).
+são rejeitados pela trava em `algorithms/utils/randomize_gym.py`. BC fica fora do padrão
+por ter sido avaliado em rodada própria (89 runs); para incluí-lo, `ALGOS="BC"`.
 
 Saídas: `logs/compare/metrics/*.json` e logs de texto em `logs/compare/algorithms/`.
 

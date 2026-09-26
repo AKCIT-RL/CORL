@@ -15,7 +15,7 @@ REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$REPO_ROOT"
 export MINARI_DATASETS_PATH="${MINARI_DATASETS_PATH:-$REPO_ROOT/datasets}"
 
-ALGOS="${ALGOS:-AWAC CQL IQL TD3-BC}"
+ALGOS="${ALGOS:-AWAC CQL IQL TD3-BC DT}"
 ENVS="${ENVS:-Go2JoystickFlatTerrain Go2PushRecovery Go2RoughCurriculum}"
 SUITE="${SUITE:-humanoid_gym_medium}"
 EPISODES="${EPISODES:-100}"

@@ -34,6 +34,8 @@ class CompareRandomizeAttributes:
    # Comma-separated suite names to run; "default" is always included as the SRR baseline.
    configs: Optional[str] = None
    metrics_dir: str = "logs/compare/metrics"
+   # Decision Transformer only: overrides target_returns[0] from the run config.
+   dt_target_return: Optional[float] = None
    
 @dataclass
 class CompareRandomizeConfig:
@@ -44,6 +46,19 @@ class CompareRandomizeConfig:
    # Needed for D4RL normalization: carries return_min/return_expert in its metadata.
    dataset_id: Optional[str] = None
    seed: Optional[int] = None
+   # Decision Transformer only. A transformer cannot be reconstructed from the
+   # weight tree the way the five MLP actors can, so its architecture and rollout
+   # parameters are read from the run's own config.yaml.
+   seq_len: Optional[int] = None
+   episode_len: Optional[int] = None
+   reward_scale: float = 1.0
+   target_returns: Optional[List[float]] = None
+   embedding_dim: int = 128
+   num_layers: int = 3
+   num_heads: int = 1
+   attention_dropout: float = 0.1
+   residual_dropout: float = 0.1
+   embedding_dropout: float = 0.1
 
 def _first_env_state(state):
    def _select_first(x):
@@ -58,21 +73,21 @@ render_trajectory = []
 def _render_callback(_, state):
    render_trajectory.append(_first_env_state(state))
       
+def _config_from_yaml(data: Dict[str, Any]) -> CompareRandomizeConfig:
+   valid_fields = {field.name for field in fields(CompareRandomizeConfig)}
+   # DT names this field `env_name`; the other five algorithms call it `env`.
+   data = {**data, "env": data.get("env") or data.get("env_name")}
+   return CompareRandomizeConfig(
+      **{k: v for k, v in data.items() if k in valid_fields}
+   )
+
 def load_config(config: CompareRandomizeAttributes) -> CompareRandomizeConfig:
-   valid_fields = {
-      field.name for field in fields(CompareRandomizeConfig)
-   }
-   
    if config.checkpoint_config is not None:
       if os.path.isfile(config.checkpoint_config):
          with open(config.checkpoint_config, "r") as f:
             data = yaml.safe_load(f)
-            
-         filtered_data = {
-            k: v for k, v in data.items() 
-            if k in valid_fields
-         }
-         return CompareRandomizeConfig(**filtered_data)
+
+         return _config_from_yaml(data)
    
    checkpoint_dir = config.checkpoint_path
    if os.path.isfile(checkpoint_dir):
@@ -85,12 +100,8 @@ def load_config(config: CompareRandomizeAttributes) -> CompareRandomizeConfig:
       
       with open(config_path, "r") as f:
          data = yaml.safe_load(f)
-      
-      filtered_data = {
-         k: v for k, v in data.items() 
-         if k in valid_fields
-      }
-      return CompareRandomizeConfig(**filtered_data)
+
+      return _config_from_yaml(data)
    
    raise FileNotFoundError("Could not find config.yaml")
 
@@ -147,12 +158,14 @@ def _mlp(layers: List[Dict[str, Any]], x: jnp.ndarray, activate_final: bool) -> 
 def build_policy(checkpoint) -> Callable[[jnp.ndarray], jnp.ndarray]:
    """Rebuild a deterministic actor from the weight tree alone.
 
-   The five algorithms ship three different actor shapes, and three of them store
-   the weights under the same `actor_params` key, so loading blindly yields a
-   silently wrong policy instead of an error. Dispatch on structure, not on name:
+   The five MLP algorithms ship three different actor shapes, and three of them
+   store the weights under the same `actor_params` key, so loading blindly
+   yields a silently wrong policy instead of an error. Dispatch on structure,
+   not on name:
      * `policy_params`      -> CQL TanhGaussian, base_network emits [mean, log_std]
      * `log_stds` present   -> IQL / AWAC Gaussian, MLP(activate_final) + mean head
      * otherwise            -> BC / TD3+BC, MLP straight to max_action * tanh
+   DT does not fit here at all and is handled by `build_dt_policy`.
    """
    if "policy_params" in checkpoint.files:
       params = checkpoint["policy_params"].item()["params"]
@@ -186,26 +199,148 @@ def build_policy(checkpoint) -> Callable[[jnp.ndarray], jnp.ndarray]:
 
    return policy_fn
 
+@dataclass
+class _DTPolicy:
+   """A Decision Transformer plus the state its rollout needs.
+
+   The DT conditions on a sliding window of (timesteps, states, actions,
+   returns-to-go), so it cannot be expressed as the obs -> action callable the
+   other five algorithms share; `evaluate` dispatches on this type.
+   """
+   transformer_fn: Callable
+   state_dim: int
+   act_dim: int
+   seq_len: int
+   episode_len: int
+   reward_scale: float
+   target_return: float
+
+def build_dt_policy(
+   checkpoint,
+   config: CompareRandomizeConfig,
+   env: GymWrapper,
+   target_return: Optional[float] = None
+) -> _DTPolicy:
+   """Rebuild a Decision Transformer from its weights and its training config.
+
+   The five MLP actors are reconstructed from the weight tree alone, but a
+   transformer's shape is not recoverable that way, so the architecture comes
+   from the run's config.yaml and the module definition from the training code.
+   """
+   # Imported lazily: dt_jax drags in wandb and the whole training stack, and
+   # only this branch needs it.
+   import flax.serialization as flax_serialization
+   from algorithms.offline.dt_jax import DecisionTransformer
+
+   if config.seq_len is None or config.episode_len is None:
+      raise ValueError(
+         "DT checkpoint needs `seq_len` and `episode_len` in its config.yaml"
+      )
+
+   if target_return is None:
+      if not config.target_returns:
+         raise ValueError(
+            "DT checkpoint needs `target_returns` in its config.yaml, or "
+            "--dt_target_return on the command line"
+         )
+      # Matches the proxy evaluation in dt_jax, which conditions on the first.
+      target_return = float(config.target_returns[0])
+
+   state_shape = env.observation_space.shape
+   if state_shape is None:
+      raise ValueError("Observation space must have a defined shape.")
+   state_dim = state_shape[0]
+   act_dim = get_action_shape(env)[0]
+
+   model = DecisionTransformer(
+      state_dim=state_dim,
+      act_dim=act_dim,
+      num_layers=config.num_layers,
+      h_dim=config.embedding_dim,
+      seq_len=config.seq_len,
+      n_heads=config.num_heads,
+      attention_dropout=config.attention_dropout,
+      residual_dropout=config.residual_dropout,
+      embedding_dropout=config.embedding_dropout,
+   )
+
+   template = model.init(
+      jax.random.PRNGKey(0),
+      timesteps=jnp.zeros((1, config.seq_len), jnp.int32),
+      states=jnp.zeros((1, config.seq_len, state_dim), jnp.float32),
+      actions=jnp.zeros((1, config.seq_len, act_dim), jnp.float32),
+      returns_to_go=jnp.zeros((1, config.seq_len, 1), jnp.float32),
+      training=False,
+   )
+   params = flax_serialization.from_state_dict(
+      template, checkpoint["transformer_params"].item()
+   )
+
+   @jax.jit
+   def transformer_fn(timesteps, states, actions, returns_to_go):
+      _, action_preds, _ = model.apply(
+         params, timesteps, states, actions, returns_to_go, training=False
+      )
+      return action_preds
+
+   print(
+      f"DT: seq_len={config.seq_len} episode_len={config.episode_len} "
+      f"reward_scale={config.reward_scale} target_return={target_return}"
+   )
+
+   return _DTPolicy(
+      transformer_fn=transformer_fn,
+      state_dim=state_dim,
+      act_dim=act_dim,
+      seq_len=config.seq_len,
+      episode_len=config.episode_len,
+      reward_scale=config.reward_scale,
+      target_return=target_return,
+   )
+
 def load_checkpoint(
    attrs: CompareRandomizeAttributes,
    config: CompareRandomizeConfig,
    env: GymWrapper
-) -> Tuple[Callable[[jnp.ndarray], jnp.ndarray], np.ndarray, np.ndarray]:
+) -> Tuple[Callable[[jnp.ndarray], jnp.ndarray] | _DTPolicy, np.ndarray, np.ndarray]:
    checkpoint_path = parse_checkpoint_path(attrs.checkpoint_path)
    print("Carregando checkpoint de:", checkpoint_path)
 
    checkpoint = np.load(checkpoint_path, allow_pickle=True)
+
+   if "transformer_params" in checkpoint.files:
+      policy = build_dt_policy(checkpoint, config, env, attrs.dt_target_return)
+      return policy, checkpoint["state_mean"], checkpoint["state_std"]
+
    policy_fn = build_policy(checkpoint)
    return policy_fn, checkpoint["obs_mean"], checkpoint["obs_std"]
    
 def evaluate(
-   policy_fn: Callable[[jnp.ndarray], jnp.ndarray],
+   policy_fn: Callable[[jnp.ndarray], jnp.ndarray] | _DTPolicy,
    env: GymWrapper,
    num_episodes: int,
    obs_mean,
    obs_std,
    render=False
 ) -> np.ndarray:
+   if isinstance(policy_fn, _DTPolicy):
+      episode_returns = _rollout_dt(
+         policy_fn, env, num_episodes, obs_mean, obs_std, render
+      )
+   else:
+      episode_returns = _rollout_actor(
+         policy_fn, env, num_episodes, obs_mean, obs_std, render
+      )
+   return _normalize_returns(env, episode_returns)
+
+def _rollout_actor(
+   policy_fn: Callable[[jnp.ndarray], jnp.ndarray],
+   env: GymWrapper,
+   num_episodes: int,
+   obs_mean,
+   obs_std,
+   render=False
+) -> List[float]:
    episode_returns = []
    num_envs = getattr(env, "num_envs", 1)
    max_steps = 2000
@@ -241,23 +376,102 @@ def evaluate(
          episode_returns.extend(episode_return[:completed].tolist())
          pbar.update(completed)
 
-      episode_returns = np.array(episode_returns, dtype=np.float32)
-      
-      if hasattr(env, 'get_normalized_score'):
-         normalized_returns = []
+   return episode_returns
 
-         for ret in episode_returns:
-            normalized = env.get_normalized_score(ret)
-            if normalized is not None:
-               # 0-1 scale, NOT the x100 used in the training logs: the published
-               # table merges these JSONs with older .txt logs and publish_metrics
-               # calibrates DEGENERATE_NOMINAL against this scale.
-               normalized_returns.append(float(normalized))
-            else:
-               normalized_returns.append(ret)
-         return np.array(normalized_returns, dtype=np.float32)
+def _rollout_dt(
+   policy: _DTPolicy,
+   env: GymWrapper,
+   num_episodes: int,
+   state_mean,
+   state_std,
+   render=False
+) -> List[float]:
+   """Autoregressive DT rollout, mirroring the eval loop in dt_jax.
 
-      return np.array(episode_returns, dtype=np.float32)
+   Note the normalization has no epsilon and the return-to-go is decremented by
+   the observed reward every step: both must match training exactly.
+   """
+   num_envs = getattr(env, "num_envs", 1)
+   state_mean = jnp.asarray(state_mean).reshape(-1)
+   state_std = jnp.asarray(state_std).reshape(-1)
+   timesteps = jnp.repeat(
+      jnp.arange(0, policy.episode_len, 1, jnp.int32)[None, :], num_envs, axis=0
+   )
+   episode_returns = []
+
+   with tqdm.tqdm(total=num_episodes, desc="Evaluating") as pbar:
+      while len(episode_returns) < num_episodes:
+         states = jnp.zeros(
+            (num_envs, policy.episode_len, policy.state_dim), dtype=jnp.float32
+         )
+         actions = jnp.zeros(
+            (num_envs, policy.episode_len, policy.act_dim), dtype=jnp.float32
+         )
+         rewards_to_go = jnp.zeros(
+            (num_envs, policy.episode_len, 1), dtype=jnp.float32
+         )
+
+         running_state, _ = env.reset()
+         running_state = np.asarray(running_state).reshape(num_envs, policy.state_dim)
+         running_reward = np.zeros(num_envs, dtype=np.float32)
+         running_rtg = np.full(
+            num_envs, policy.target_return * policy.reward_scale, dtype=np.float32
+         )
+         episode_return = np.zeros(num_envs, dtype=np.float32)
+         finished = np.zeros(num_envs, dtype=bool)
+
+         for t in range(policy.episode_len):
+            states = states.at[:, t].set(
+               (jnp.asarray(running_state) - state_mean) / state_std
+            )
+            running_rtg = running_rtg - running_reward * policy.reward_scale
+            rewards_to_go = rewards_to_go.at[:, t, 0].set(jnp.asarray(running_rtg))
+
+            lo = max(0, t - policy.seq_len + 1)
+            act = policy.transformer_fn(
+               timesteps[:, lo : t + 1],
+               states[:, lo : t + 1],
+               actions[:, lo : t + 1],
+               rewards_to_go[:, lo : t + 1],
+            )[:, -1]
+            actions = actions.at[:, t].set(act)
+
+            running_state, reward, done, truncated, _ = env.step(np.asarray(act))
+            running_state = np.asarray(running_state).reshape(num_envs, policy.state_dim)
+            running_reward = np.asarray(reward, dtype=np.float32)
+
+            episode_return += running_reward * ~finished
+            finished |= np.asarray(done, dtype=bool) | np.asarray(truncated, dtype=bool)
+
+            if render:
+               env.render()
+
+            if np.all(finished):
+               break
+
+         completed = min(num_envs, num_episodes - len(episode_returns))
+         episode_returns.extend(episode_return[:completed].tolist())
+         pbar.update(completed)
+
+   return episode_returns
+
+def _normalize_returns(env: GymWrapper, episode_returns: List[float]) -> np.ndarray:
+   returns = np.array(episode_returns, dtype=np.float32)
+
+   if not hasattr(env, 'get_normalized_score'):
+      return returns
+
+   normalized_returns = []
+   for ret in returns:
+      normalized = env.get_normalized_score(ret)
+      if normalized is not None:
+         # 0-1 scale, NOT the x100 used in the training logs: the published
+         # table merges these JSONs with older .txt logs and publish_metrics
+         # calibrates DEGENERATE_NOMINAL against this scale.
+         normalized_returns.append(float(normalized))
+      else:
+         normalized_returns.append(ret)
+   return np.array(normalized_returns, dtype=np.float32)
 
 # `only_domain` swaps the env's sensor noise for the clean signal, so dividing it by
 # `default` folds that swap into the ratio; its baseline is the clean-obs run.
