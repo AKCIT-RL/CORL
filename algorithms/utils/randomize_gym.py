@@ -188,6 +188,11 @@ class RandomizeConfigs:
             def observation_randomize(obs, _): # type: ignore
                 if isinstance(obs, dict) and "state" in obs:
                     return np.asarray(obs["state"])
+                # A flat observation has no component layout to decompose, and the
+                # split below would reassemble it as the 48-dim Go2 vector: H1's 113
+                # dims would be silently truncated instead of forwarded untouched.
+                if not isinstance(obs, dict):
+                    return np.asarray(obs)
                 _, noisy_dict = _extract_observation_components(obs)
                 return _concat_observation_dict(noisy_dict)
         else:
