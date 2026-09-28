@@ -21,6 +21,7 @@ import collections
 import json
 import os
 import pathlib
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -54,6 +55,15 @@ def fetch_runs(project: str) -> list[dict]:
         meta = run.metadata or {}
         rec["program"] = meta.get("program")
         args = meta.get("args") or []
+        # scripts.recover_proxy resumes a finished run and overwrites its metadata
+        # with its own command, whose only argument is <algo>-<task>-<diff>-seed<N>.log.
+        if rec["program"] == "-m scripts.recover_proxy" and args:
+            m = re.search(r"/([a-z0-9_]+)-[^/]*-seed(\d+)\.log$", args[0])
+            if m:
+                rec["program"] = f"-m algorithms.offline.{m.group(1)}_jax"
+                rec["seed"] = m.group(2)
+                rec["dataset_id"] = run.config.get("dataset_id")
+            return rec
         for i, arg in enumerate(args[:-1]):
             if arg == "--seed":
                 rec["seed"] = args[i + 1]
@@ -61,8 +71,16 @@ def fetch_runs(project: str) -> list[dict]:
                 rec["dataset_id"] = args[i + 1]
         return rec
 
+    def grab_seed(run):
+        rec = grab(run)
+        # DT's seed-10 runs (trained before --seed reached dt_jax) are relabeled
+        # as matrix seed 0 through config.matrix_seed; their metadata still says 1/2.
+        if "matrix_seed" in run.config:
+            rec["seed"] = str(run.config["matrix_seed"])
+        return rec
+
     with ThreadPoolExecutor(max_workers=16) as pool:
-        return list(pool.map(grab, runs))
+        return list(pool.map(grab_seed, runs))
 
 
 def main() -> int:

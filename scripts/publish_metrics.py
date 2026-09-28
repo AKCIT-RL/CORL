@@ -37,6 +37,17 @@ METRIC_COLS = [
 DEGENERATE_NOMINAL = 0.05
 
 
+def matrix_seed(algorithm, train_seed):
+    """Seed as labeled in the benchmark.
+
+    dt_jax ignored --seed until 2026-09-28 and trained every run with train_seed 10;
+    those runs are the benchmark's DT seed 0 (wandb config.matrix_seed = 0).
+    """
+    if algorithm.split("-")[0] == "DT" and train_seed == 10:
+        return 0
+    return train_seed
+
+
 def task_and_split(dataset_id):
     """'playground/go2-flat-forward/expert-v0' -> ('go2-flat-forward', 'expert')."""
     if not dataset_id:
@@ -55,7 +66,7 @@ def rows_from_json(path):
             "env": rec.get("env"),
             "task": task,
             "dataset": split,
-            "train_seed": rec.get("train_seed"),
+            "train_seed": matrix_seed(rec["checkpoint"].split("-Go2")[0], rec.get("train_seed")),
             "checkpoint": rec["checkpoint"],
             "checkpoint_step": rec.get("checkpoint_step"),
             "suite": suite,
@@ -139,7 +150,7 @@ def rows_from_legacy(source, path):
             "env": cfg["env"],
             "task": task,
             "dataset": split,
-            "train_seed": cfg["train_seed"],
+            "train_seed": matrix_seed(ckpt_dir.split("-Go2")[0], cfg["train_seed"]),
             "checkpoint": ckpt_dir,
             "checkpoint_step": step,
             "suite": suite,
