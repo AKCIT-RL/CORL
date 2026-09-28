@@ -27,6 +27,7 @@ dependencies = [
     # numpy 2.5 made npt.NDArray a non-subclassable TypeAliasType, which breaks
     # mediapy's `class _VideoArray(npt.NDArray)`. Cap below 2.5 until mediapy fixes it.
     "numpy<2.5",
+    "imageio-ffmpeg>=0.6.0",
 ]
 
 [tool.uv]
