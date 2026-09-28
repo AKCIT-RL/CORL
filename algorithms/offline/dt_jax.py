@@ -115,12 +115,12 @@ class DTConfig:
         self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
         if self.checkpoints_path is not None:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
-        # Use train_seed if provided, otherwise use seed
-        # If train_seed was explicitly set (not default 0), use it; otherwise use seed
-        if self.train_seed != 0:
+        # `seed` is the source of truth: the runners pass --seed. `train_seed` is a
+        # legacy alias, honored only when `seed` is unset; it used to win, which made
+        # every matrix seed train with the base config's train_seed.
+        if self.seed == 0 and self.train_seed != 0:
             self.seed = self.train_seed
-        elif self.seed != 0:
-            self.train_seed = self.seed
+        self.train_seed = self.seed
 
 
 def default_init(scale: Optional[float] = float(jnp.sqrt(2))):

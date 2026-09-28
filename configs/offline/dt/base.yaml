@@ -6,7 +6,7 @@ project: Offline-Benchmark
 name: DT
 checkpoints_path: checkpoints/DT
 device: cuda
-train_seed: 10
+seed: 10
 eval_seed: 42
 deterministic_torch: false
 
