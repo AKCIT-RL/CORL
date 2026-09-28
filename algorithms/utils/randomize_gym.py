@@ -14,6 +14,17 @@ import jax
 import jax.numpy as jnp
 import torch
 import mediapy as media
+import shutil
+
+# Compute nodes have no system ffmpeg; fall back to the binary bundled with
+# imageio-ffmpeg so mediapy can still encode videos.
+if shutil.which("ffmpeg") is None:
+    try:
+        import imageio_ffmpeg
+
+        media.set_ffmpeg(imageio_ffmpeg.get_ffmpeg_exe())
+    except (ImportError, RuntimeError):
+        pass
 
 from collections.abc import Mapping
 from collections import deque
