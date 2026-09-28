@@ -1,27 +1,31 @@
-from dataclasses import asdict, dataclass
-import os
-from pathlib import Path
-import time
-from typing import Callable, Dict, List, Optional
-import numpy as np
-import jax
-import jax.numpy as jnp
-import mujoco.egl
-import tqdm
+"""Sim2real proxy evaluation of a finished training run.
+
+Runs exactly the evaluation of scripts/run_srr_eval.sh / run_srr_matrix.sh
+(scripts/compare_randomize.py: same suite, rollout budget, normalization and
+metrics) on the run's final checkpoint, so the numbers logged to W&B at the end
+of training are the same ones the SRR table is built from.
+"""
 import math
+from pathlib import Path
+from typing import Dict, Optional
 
-os.environ["MUJOCO_GL"] = "egl"
-gl_context = mujoco.egl.GLContext(1024, 1024)
-gl_context.make_current()
+import numpy as np
+from mujoco_playground import registry
 
+# Imported first: it builds the EGL context before jax is initialized.
+from scripts.compare_randomize import CompareRandomizeAttributes, _main as compare_main
 from algorithms.utils.randomize_gym import (
-   ENV_NAME,
-   GymWrapper,
    _assert_supported_obs_layout,
    get_predefined_randomize_configs,
 )
 
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Same defaults as scripts/run_srr_eval.sh and scripts/run_srr_matrix.sh.
+SRR_SUITE = "humanoid_gym_medium"
+SRR_EPISODES = 100
+SRR_ACTORS = 50
+METRICS_DIR = REPO_ROOT / "logs/compare/metrics"
 
 
 def clean_dict(d):
@@ -37,28 +41,6 @@ def clean_dict(d):
       return d
    else:
       return d
-
-def _first_env_state(state):
-   def _select_first(x):
-      shape = getattr(x, "shape", None)
-      if shape is not None and len(shape) > 0:
-         return x[0]
-      return x
-
-   return jax.tree_util.tree_map(_select_first, state)
-
-render_trajectory = []
-def _render_callback(_, state):
-   render_trajectory.append(_first_env_state(state))
-
-@dataclass
-class ConfigResult:
-   mean: float
-   std: float
-   ratio_randomized_baseline: float
-   robustness_analysis: Dict[str, float]
-
-ProxyResult = Dict[str, ConfigResult]
 
 def _flatten_proxy_results(proxy_result: Dict, prefix: str) -> Dict:
    """Convert proxy metrics to top-level W&B keys with slash separators."""
@@ -76,228 +58,44 @@ def _flatten_proxy_results(proxy_result: Dict, prefix: str) -> Dict:
 
    return flattened
 
-def evaluate(
-   policy_fn: Callable[[jnp.ndarray], jnp.ndarray],
-   env: GymWrapper,
-   num_episodes: int,
-   obs_mean,
-   obs_std,
-   render: bool = False,
-   algorithm_name: Optional[str] = None,
-   dict_prefix: Optional[str] = None,
-   env_name: str = ENV_NAME
-) -> Dict:
-   default_render_callback = env.render_callback
-   if render:
-      env.render_callback = _render_callback
-
-   randomize_configs = ["default", "custom"]
-   custom_configs = {
-      "humanoid_gym": "configs/randomize/humanoid_gym.yaml"
-   }
-
-   data = {}
-
-   def run_test(cfg_name, cfg_file=None, display_name=None):
-      nonlocal data, policy_fn, obs_mean, obs_std
-
-      display_name = display_name or cfg_name
-
-      print(f"\n {'='*10} Random config: {display_name} {'='*10}")
-
-      print("\nLoading environment...")
-      configs = get_predefined_randomize_configs(cfg_name, cfg_file, env_name)
-      # update_randomize_functions bypasses get_env, so the layout guard runs here.
-      # Skipping beats raising: a training run should not die at final evaluation
-      # just because this env has no component map, and `default` still works.
-      try:
-         _assert_supported_obs_layout(env.env, configs, env_name)
-      except ValueError as exc:
-         print(f"Skipping suite '{display_name}': {exc}")
-         return
-      env.update_randomize_functions(configs.get_functions())
-      env.warmup_jit_reset()
-
-      print("Evaluating policy...")
-      base_returns = _evaluate_individual(
-         policy_fn, env, num_episodes, obs_mean, obs_std, render=render
-      )
-
-      data[display_name] = base_returns
-
-      if render and render_trajectory:
-         timestamp = time.strftime("%Y%m%d-%H%M%S")
-
-         directory = Path(f"videos/{algorithm_name}") if algorithm_name else Path(f"videos/{display_name}")
-         directory.mkdir(parents=True, exist_ok=True)
-
-         filepath = f"{directory}/{display_name}-{timestamp}.mp4" if algorithm_name else f"{directory}/{timestamp}.mp4"
-
-         print(f"Saving video to: {filepath}")
-         env.save_video(render_trajectory, save_path=filepath)
-         render_trajectory.clear()
-
-   for cfg_name in randomize_configs:
-      if cfg_name == "custom":
-         for display_name, cfg_file in custom_configs.items():
-            run_test(cfg_name, cfg_file, display_name)
-      else:
-         run_test(cfg_name)
-   
-   # Show results
-   results = _calculate_results(data)
-   env.render_callback = default_render_callback
-
-   results_dict = {k: clean_dict(asdict(v)) for k, v in results.items()}
-   return results_dict if dict_prefix is None else _flatten_proxy_results(results_dict, prefix=dict_prefix)
-   
-def _evaluate_individual(
-   policy_fn: Callable[[jnp.ndarray], jnp.ndarray],
-   env: GymWrapper,
-   num_episodes: int,
-   obs_mean,
-   obs_std,
-   render=False
-) -> np.ndarray:
-   episode_returns = []
-   num_envs = getattr(env, "num_envs", 1)
-   max_steps = 2000
-
-   with tqdm.tqdm(total=num_episodes, desc="Evaluating") as pbar:
-      while len(episode_returns) < num_episodes:
-         episode_return = np.zeros(num_envs, dtype=np.float32)
-         finished = np.zeros(num_envs, dtype=bool)
-         observation, _ = env.reset()
-         steps = 0
-
-         while not np.all(finished):
-            steps += 1
-            
-            if steps >= max_steps:
-               finished[:] = True
-               break
-            
-            observation = (observation - obs_mean) / (obs_std + 1e-5)
-            action = policy_fn(observation)
-            observation, reward, done, truncated, _ = env.step(action)
-
-            done = np.asarray(done, dtype=bool)
-            truncated = np.asarray(truncated, dtype=bool)
-            active_mask = ~finished
-            episode_return += np.asarray(reward, dtype=np.float32) * active_mask
-            finished |= done | truncated
-
-            if render:
-               env.render()
-
-         completed = min(num_envs, num_episodes - len(episode_returns))
-         episode_returns.extend(episode_return[:completed].tolist())
-         pbar.update(completed)
-
-      episode_returns = np.array(episode_returns, dtype=np.float32)
-      
-      if hasattr(env, 'get_normalized_score'):
-         normalized_returns = []
-
-         for ret in episode_returns:
-            normalized = env.get_normalized_score(ret)
-
-            if normalized is not None:
-               normalized_returns.append(100 * float(normalized))
-            else:
-               normalized_returns.append(ret)
-
-         return np.array(normalized_returns, dtype=np.float32)
-
-      return episode_returns
-
-def _calculate_results(
-   data: Dict[str, np.ndarray]
-) -> ProxyResult:
-   print(f"\n{'='*10} RESULTS {'='*10}")
-
-   results: ProxyResult = {}
-
-   base_returns = data.get("default", np.array([], dtype=np.float32))
-   if base_returns.size > 0:
-      base_mean = np.mean(base_returns)
-   
-   for cfg_name, returns in data.items():
-      mean = np.mean(returns)
-      std = np.std(returns)
-      srr = mean / base_mean if base_mean != 0 else float('inf')
-      print(f"\nRandomization {cfg_name}:")
-      print(f" - Mean: {mean:.2f}")
-      print(f" - Std: {std:.2f}")
-      print(f" - Ratio Randomized / Baseline: {srr:.2f}")
-
-      robustness_analysis={}
-      if base_returns.size > 0:
-         if cfg_name != "default":
-            robustness_analysis = _evaluate_robustness(base_returns, returns)
-
-      results[cfg_name] = ConfigResult(
-         mean=float(mean),
-         std=float(std),
-         ratio_randomized_baseline=float(srr),
-         robustness_analysis=robustness_analysis
-      )
-
-   return results
-
-def _evaluate_robustness(
-   base_arr: np.ndarray, 
-   rand_arr: np.ndarray
-) -> Dict[str, float]:
-   print("\nRobustness Analysis (Paired Trajectories)...")
-
-   result = {}
-   
-   deltas = rand_arr - base_arr
-   mean_delta = np.mean(deltas)
-   p5_delta = np.percentile(deltas, 5)  # 5% piores quedas de desempenho
-   
-   print(f" - Mean Delta: {mean_delta:+.2f}")
-   print(f" - Worst Case (5th Percentile): {p5_delta:+.2f}")
-   result["mean_delta"] = float(mean_delta)
-   result["worst_case_5th_percentile"] = float(p5_delta)
-   
-   with np.errstate(divide='ignore', invalid='ignore'):
-      rel_drops = np.where(
-         base_arr != 0,
-         (base_arr - rand_arr) / np.abs(base_arr), 
-         0.0
-      )
-   
-   critical_rate = np.mean(rel_drops > 0.10) * 100
-   print(f" - Critical Drop Rate (>10% loss): {critical_rate:.1f}%")
-   result["critical_drop_rate"] = float(critical_rate)
-   
-   if np.allclose(base_arr, rand_arr):
-      print(" - No significant difference between baseline and randomized returns.")
-
+def suite_supported(env_name: str, suite: str = SRR_SUITE) -> bool:
+   """Whether ``env_name`` has the observation layout the perturbation suite assumes."""
+   cfg_file = REPO_ROOT / f"configs/randomize/{suite}.yaml"
+   configs = get_predefined_randomize_configs("custom", str(cfg_file), env_name)
+   env = registry.load(env_name, config_overrides={"impl": "jax"})
    try:
-      from scipy.stats import bootstrap
-      
-      def ratio_stat(b, r):
-         m_b = np.mean(b, axis=-1)
-         m_r = np.mean(r, axis=-1)
-         return np.where(m_b != 0, m_r / m_b, np.nan)
-      
-      res = bootstrap(
-         (base_arr, rand_arr),
-         statistic=ratio_stat,
-         paired=True,
-         n_resamples=1000,
-         method='basic',
-      )
-      ci_low = res.confidence_interval.low
-      ci_high = res.confidence_interval.high
-      print(f" - 95% CI (Ratio): [{ci_low:.2f}, {ci_high:.2f}]")
-      result["95_ci_ratio_low"] = float(ci_low)
-      result["95_ci_ratio_high"] = float(ci_high)
+      _assert_supported_obs_layout(env, configs, env_name)
+   except ValueError as exc:
+      print(f"Skipping suite '{suite}': {exc}")
+      return False
+   return True
 
-   except (ImportError, ValueError):
-      pass
+def evaluate(
+   checkpoint_path: str,
+   env_name: str,
+   device: str = "cuda",
+   dict_prefix: Optional[str] = None,
+) -> Dict:
+   """Score the run in ``checkpoint_path`` on `default` + the SRR suite.
 
-   return result
+   The checkpoint is picked the same way as the SRR scripts do (checkpoint_final.npz,
+   else the highest step). Envs outside the supported observation layout get only
+   the `default` baseline; that partial record is written next to the checkpoint
+   instead of logs/compare/metrics, so the SRR matrix still treats the run as pending.
+   """
+   supported = suite_supported(env_name)
+   record = compare_main(CompareRandomizeAttributes(
+      checkpoint_path=str(checkpoint_path),
+      n_actors=SRR_ACTORS,
+      n_episodes=SRR_EPISODES,
+      device=device,
+      configs=SRR_SUITE if supported else "default",
+      metrics_dir=str(METRICS_DIR if supported else checkpoint_path),
+   ))
+
+   return format_metrics(record, dict_prefix)
+
+def format_metrics(record: Dict, dict_prefix: Optional[str] = None) -> Dict:
+   """W&B-ready metrics from a compare_randomize record (in memory or its JSON)."""
+   metrics = clean_dict(record["metrics"])
+   return metrics if dict_prefix is None else _flatten_proxy_results(metrics, prefix=dict_prefix)

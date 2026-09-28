@@ -121,10 +121,11 @@ inicializado em `target_return * reward_scale` e **decrementado pela recompensa
 observada a cada passo**, normalização de estado **sem epsilon**. Os três detalhes
 precisam bater com o treino.
 
-> O adaptador de DT dentro de `dt_jax._train` (o que alimenta `proxy.evaluate`) mantém
-> o RTG **constante** e só o reseta quando `t_step` estoura `episode_len`, ignorando o
-> fim real do episódio. Os números de DT logados no wandb pelo proxy vêm desse caminho;
-> os do `compare_randomize` vêm do rollout correto e não são comparáveis com eles.
+> O `proxy.evaluate` chamado no fim de cada treino roda este mesmo `compare_randomize`
+> (mesma suíte, 100 episódios / 50 atores) sobre o `checkpoint_final.npz`, então as
+> métricas `eval/proxy_results/*` no wandb são as mesmas do JSON. Runs de antes dessa
+> mudança usavam um adaptador de DT próprio, com RTG **constante**, e a suíte
+> `humanoid_gym` em escala ×100; esses números não são comparáveis com os atuais.
 
 Validação (2026-09-26, 4 episódios): `DT-Go2JoystickFlatTerrain-87131cbc` (expert) dá
 1.01 ± 0.03 no `default`, e o `medium-replay` do mesmo env dá -0.02 — ou seja, o

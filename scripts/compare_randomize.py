@@ -708,6 +708,7 @@ def _main(attrs: CompareRandomizeAttributes):
    out_path = out_dir / f"{run_name}.json"
    out_path.write_text(json.dumps(record, indent=2))
    print(f"\nMétricas salvas em: {out_path}")
+   return record
 
 def main():
    wrapped_main = wrap()(_main)

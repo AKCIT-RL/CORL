@@ -975,87 +975,6 @@ def _train(config: DTConfig):
             })
             print(f"Final Shifted Score for Target Return {target_return}: {shifted_score}")
 
-    print("Running proxy evaluation of the final policy...")
-
-    # ``proxy.evaluate`` uses the same vectorized environment as the regular
-    # evaluator.  Keep a DT context per actor instead of flattening the actor
-    # axis into the state features.
-    proxy_batch_size = getattr(env, "num_envs", 1)
-    t_step = 0
-    states = jnp.zeros(
-        (proxy_batch_size, config.episode_len, state_dim), dtype=jnp.float32
-    )
-    actions = jnp.zeros(
-        (proxy_batch_size, config.episode_len, act_dim), dtype=jnp.float32
-    )
-    timesteps = jnp.repeat(
-        jnp.arange(0, config.episode_len, 1, jnp.int32)[None, :],
-        proxy_batch_size,
-        axis=0,
-    )
-    rewards_to_go = jnp.zeros(
-        (proxy_batch_size, config.episode_len, 1), dtype=jnp.float32
-    )
-    running_rtg = jnp.full(
-        (proxy_batch_size,), target_return * config.reward_scale, dtype=jnp.float32
-    )
-
-    def policy_fn(obs: jnp.ndarray) -> jnp.ndarray:
-        nonlocal t_step, states, actions, rewards_to_go, running_rtg
-        
-        if t_step >= config.episode_len:
-            t_step = 0
-            running_rtg = jnp.full(
-                (proxy_batch_size,),
-                target_return * config.reward_scale,
-                dtype=jnp.float32,
-            )
-
-        # The proxy normalizes observations before calling its policy.  Do not
-        # normalize again here; reshape only to retain the batch dimension.
-        normalized_state = jnp.asarray(obs).reshape(proxy_batch_size, state_dim)
-        states = states.at[:, t_step].set(normalized_state)
-        rewards_to_go = rewards_to_go.at[:, t_step, 0].set(running_rtg)
-
-        if t_step < config.seq_len:
-            act_preds = algo.get_action(
-                train_state,
-                timesteps[:, : t_step + 1],
-                states[:, : t_step + 1],
-                actions[:, : t_step + 1],
-                rewards_to_go[:, : t_step + 1],
-            )
-        else:
-            act_preds = algo.get_action(
-                train_state,
-                timesteps[:, t_step - config.seq_len + 1 : t_step + 1],
-                states[:, t_step - config.seq_len + 1 : t_step + 1],
-                actions[:, t_step - config.seq_len + 1 : t_step + 1],
-                rewards_to_go[:, t_step - config.seq_len + 1 : t_step + 1],
-            )
-
-        act = act_preds[:, -1]
-            
-        actions = actions.at[:, t_step].set(act)
-        t_step += 1
-        return jnp.asarray(act)
-
-
-    proxyResult = proxy.evaluate(
-        policy_fn,
-        env,
-        config.n_eval_episodes_final, 
-        state_mean, 
-        state_std, 
-        render=True,
-        algorithm_name=config.name,
-        dict_prefix="eval/proxy_results",
-        env_name=config.env_name
-    )
-
-    # Log proxy results
-    wandb.log(proxyResult)
-
     # Save final checkpoint
     if config.checkpoints_path is not None:
         checkpoint = {
@@ -1067,6 +986,20 @@ def _train(config: DTConfig):
         checkpoint_path = os.path.join(config.checkpoints_path, "checkpoint_final.npz")
         np.savez(checkpoint_path, **checkpoint)
         print(f"Saved final checkpoint to {checkpoint_path}")
+
+    # Sim2real proxy: the scripts/run_srr_eval.sh evaluation on the checkpoint saved
+    # above. Its failure must not take the finished run down with it.
+    if config.checkpoints_path is not None:
+        print("Running proxy evaluation of the final policy...")
+        try:
+            wandb.log(proxy.evaluate(
+                config.checkpoints_path,
+                env_name=config.env_name,
+                device=config.device,
+                dict_prefix="eval/proxy_results",
+            ))
+        except Exception as e:
+            print(f"[proxy] failed to run proxy evaluation: {e}")
 
     # Record a rollout video of the final policy (highest target return)
     try:
