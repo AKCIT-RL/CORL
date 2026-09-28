@@ -743,23 +743,8 @@ def _train(config: IQLConfig):
             "eval/robustness_gap": normalized_score - shifted_score,
         })
 
-    print("Running proxy evaluation of the final policy...")
     fn = policy_fn
     policy_fn = lambda obs: fn(observations=obs)
-    proxyResult = proxy.evaluate(
-        policy_fn,
-        env,
-        config.n_eval_episodes_final, 
-        obs_mean, 
-        obs_std,
-        render=True,
-        algorithm_name=config.name,
-        dict_prefix="eval/proxy_results",
-        env_name=config.env
-    )
-
-    # Log proxy results
-    wandb.log(proxyResult)
 
     # Save final checkpoint
     if config.checkpoints_path is not None:
@@ -775,6 +760,20 @@ def _train(config: IQLConfig):
         checkpoint_path = os.path.join(config.checkpoints_path, "checkpoint_final.npz")
         np.savez(checkpoint_path, **checkpoint)
         print(f"Saved final checkpoint to {checkpoint_path}")
+
+    # Sim2real proxy: the scripts/run_srr_eval.sh evaluation on the checkpoint saved
+    # above. Its failure must not take the finished run down with it.
+    if config.checkpoints_path is not None:
+        print("Running proxy evaluation of the final policy...")
+        try:
+            wandb.log(proxy.evaluate(
+                config.checkpoints_path,
+                env_name=config.env,
+                device=config.device,
+                dict_prefix="eval/proxy_results",
+            ))
+        except Exception as e:
+            print(f"[proxy] failed to run proxy evaluation: {e}")
 
     # Record a rollout video of the final policy
     try:
