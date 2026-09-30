@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, Literal, Optional, Tuple
 
@@ -71,6 +71,57 @@ class RandomizeFunctions:
     # with signature `action_fn(action) -> action`.
     action_factory: Optional[Callable[[Any, Any], Callable[[Any], Any]]] = None
     randomize_every_episode: bool = True
+
+@dataclass(frozen=True)
+class ObsLayout:
+    """Where the perturbable sensor readings sit in an env's policy observation.
+
+    ``key`` is the observation dict entry the policy sees ("state"), or None for a
+    flat observation. ``slices`` maps each component to its [start, stop) range;
+    anything not listed (last action, command, phase, goal, ...) is never touched.
+    ``mirrors`` lists extra copies of the same reading: they get the same
+    perturbation, so a policy cannot bypass the noise through a clean duplicate.
+    """
+    key: Optional[str]
+    size: int
+    slices: Dict[str, Tuple[int, int]]
+    mirrors: Dict[str, Tuple[Tuple[int, int], ...]] = field(default_factory=dict)
+
+
+_OBS_NOISE_FIELDS = ("linvel", "gyro", "gravity", "joint_angles", "joint_vel")
+_GO2_LOCOMOTION = {
+    "linvel": (0, 3), "gyro": (3, 6), "gravity": (6, 9),
+    "joint_angles": (9, 21), "joint_vel": (21, 33),
+}
+
+# Read off each env's _get_obs in mujoco_playground; checked against the simulator
+# state by scripts/check_randomize_envs.py.
+OBS_LAYOUTS: Dict[str, ObsLayout] = {
+    # linvel, gyro, gravity, joints, joint vel, last act + command (3)
+    "Go2JoystickFlatTerrain": ObsLayout("state", 48, _GO2_LOCOMOTION),
+    "Go2PushRecovery": ObsLayout("state", 48, _GO2_LOCOMOTION),
+    "Go2RoughCurriculum": ObsLayout("state", 48, _GO2_LOCOMOTION),
+    # ... + last act, no command
+    "Go2Handstand": ObsLayout("state", 45, _GO2_LOCOMOTION),
+    "Go2Footstand": ObsLayout("state", 45, _GO2_LOCOMOTION),
+    # ... + last act, stood (1), local goal (2): same size as joystick, other tail
+    "Go2GetupWalk": ObsLayout("state", 48, _GO2_LOCOMOTION),
+    # no linvel: gyro, gravity, joints, joint vel, last act
+    "Go2Getup": ObsLayout("state", 42, {
+        "gyro": (0, 3), "gravity": (3, 6), "joint_angles": (6, 18), "joint_vel": (18, 30),
+    }),
+    # linvel, gyro, gravity, command (3), 29 joints, joint vel, last act, phase (4)
+    "G1JoystickFlatTerrain": ObsLayout("state", 103, {
+        "linvel": (0, 3), "gyro": (3, 6), "gravity": (6, 9),
+        "joint_angles": (12, 41), "joint_vel": (41, 70),
+    }),
+    # flat: gyro, gravity, 19 joints, joint vel, last act, command (3), then a
+    # one-step qvel_history and qpos_error_history built from the clean state
+    "H1JoystickGaitTracking": ObsLayout(None, 113, {
+        "gyro": (0, 3), "gravity": (3, 6), "joint_angles": (6, 25), "joint_vel": (25, 44),
+    }, mirrors={"joint_vel": ((66, 85),), "joint_angles": ((85, 104),)}),
+}
+
 
 def _concat_observation_dict(comp_dict: Dict[str, Any]) -> np.ndarray:
     """Concatenate component dictionary into the standard 48-dim observation vector.
@@ -380,20 +431,29 @@ class RandomizeConfigs:
             if rng is None:
                 return observation_randomize(obs, rng)
 
+            layout = OBS_LAYOUTS[self.env_name]
+
             def randomize_single(single_obs, single_rng):
                 # Compose on the env's own noisy observation so a custom suite is a
                 # strict superset of `default`; starting from the clean state would
                 # make weak YAML noise act as a de-noising instead of a perturbation.
-                _, noisy_dict = _extract_observation_components(single_obs)
-                comp_dict = dict(noisy_dict)
-                
+                # Perturb in place so components outside the layout pass untouched.
+                state = jnp.asarray(
+                    single_obs[layout.key] if layout.key is not None else single_obs
+                )
                 rng_key = single_rng
-                for k in ["linvel", "gyro", "gravity", "joint_angles", "joint_vel"]:
+                for k in _OBS_NOISE_FIELDS:
                     fn = getattr(self.configs, k, None)
-                    if fn is not None:
-                        rng_key, key = jax.random.split(rng_key)
-                        comp_dict[k] = fn(noisy_dict[k], key)
-                return _concat_observation_dict(comp_dict)
+                    if fn is None or k not in layout.slices:
+                        continue
+                    rng_key, key = jax.random.split(rng_key)
+                    start, stop = layout.slices[k]
+                    old = state[start:stop]
+                    new = fn(old, key)
+                    state = state.at[start:stop].set(new)
+                    for m_start, m_stop in layout.mirrors.get(k, ()):
+                        state = state.at[m_start:m_stop].add(new - old)
+                return np.asarray(state)
 
             if getattr(rng, "ndim", 0) == 1:
                 return randomize_single(obs, rng)
@@ -455,7 +515,7 @@ def get_predefined_randomize_configs(
 
     def get_fn(
         dist: Literal["uniform", "normal"],
-        type: Literal["additive", "scale", "absolute"],
+        type: Literal["additive", "scale", "absolute", "additive_total"],
         range: Tuple[float, float],
         indices: Optional[np.ndarray] = None
     ) -> Callable[[jax.Array, jax.Array], jax.Array]:
@@ -477,6 +537,10 @@ def get_predefined_randomize_configs(
             value = sample(current, key)
             if type == "additive":
                 out = current + value
+            elif type == "additive_total":
+                # value is a fraction of the summed array: for body_mass, a payload
+                # expressed as a share of the robot's total mass.
+                out = current + value * jnp.sum(current)
             elif type == "scale":
                 out = current * value
             else:
@@ -599,7 +663,7 @@ def get_predefined_randomize_configs(
                 
                 if component.get("type") is None:
                     raise ValueError(f"Missing 'type' for component {component}")
-                elif component["type"] not in ["additive", "scale", "absolute"]:
+                elif component["type"] not in ["additive", "scale", "absolute", "additive_total"]:
                     raise ValueError(f"Unknown 'type' for component {component}: {component['type']}")
                 
                 if component.get("min") is None:
@@ -631,6 +695,8 @@ def get_predefined_randomize_configs(
                     raise ValueError(f"Unknown 'noise' config type for component {key}: {type(cfg)}")
                 if key not in noise_fields:
                     raise ValueError(f"Unknown component for noise randomization: {key}")
+                if cfg.get("type") == "additive_total" and key != "body_mass":
+                    raise ValueError(f"'additive_total' is only defined for body_mass, got {key}")
                 
                 functions[key] = get_noise_fn(cfg)
 
@@ -716,37 +782,51 @@ def get_predefined_randomize_configs(
     else:
         raise ValueError(f"Unknown randomize_type: {randomize_type}")
 
-# `_extract_observation_components` hardcodes the Go2 joystick layout. Getup (42/91),
-# Handstand/Footstand (45/94) and GetupWalk (48/97) reorder it -- and GetupWalk keeps
-# state at 48, so a mismatch there would silently perturb the wrong channels instead of
-# raising. Identify the supported layout by both sizes.
+# `disabled` and `only_domain` rebuild the observation from the *clean* readings in
+# privileged_state, which `_extract_observation_components` reads at the Go2 joystick
+# offsets. Getup (42/91), Handstand/Footstand (45/94) and GetupWalk (48/97) reorder it
+# -- GetupWalk keeps state at 48, so identify the layout by both sizes -- and H1 has
+# no privileged_state at all. `custom` only perturbs the noisy state, through
+# OBS_LAYOUTS, and works on every env listed there.
 _SUPPORTED_OBS_LAYOUT = {"state": 48, "privileged_state": 123}
 
 
 def _assert_supported_obs_layout(env, randomize_configs, env_name):
-    """Raise unless ``env`` uses the observation layout the component split assumes.
+    """Raise unless ``env``'s observation fits the randomize type's assumptions.
 
-    Only the modes that decompose the observation into named components need this;
-    ``default``/``full`` forward ``obs["state"]`` untouched and work on any env.
+    ``default``/``full`` forward the observation untouched and work on any env.
     """
-    split_types = {
-        RandomizeConfigs.RandomizeType.DISABLED,
-        RandomizeConfigs.RandomizeType.ONLY_DOMAIN,
-        RandomizeConfigs.RandomizeType.CUSTOM,
-    }
-    if randomize_configs.type not in split_types:
-        return
-
     sizes = env.observation_size
     if isinstance(sizes, dict):
         sizes = {
             k: (v[0] if isinstance(v, tuple) else v) for k, v in sizes.items()
         }
-    if sizes != _SUPPORTED_OBS_LAYOUT:
+
+    if randomize_configs.type == RandomizeConfigs.RandomizeType.CUSTOM:
+        layout = OBS_LAYOUTS.get(env_name)
+        if layout is None:
+            raise ValueError(
+                f"{env_name} has no observation layout in OBS_LAYOUTS; add one "
+                "(and check it with scripts/check_randomize_envs.py) before using "
+                "a custom randomization suite."
+            )
+        actual = sizes.get(layout.key) if layout.key is not None else sizes
+        if isinstance(actual, dict) or actual != layout.size:
+            raise ValueError(
+                f"{env_name} observation {sizes} does not match its OBS_LAYOUTS "
+                f"entry ({layout.key or 'flat'}: {layout.size}); the env changed."
+            )
+        return
+
+    clean_split_types = {
+        RandomizeConfigs.RandomizeType.DISABLED,
+        RandomizeConfigs.RandomizeType.ONLY_DOMAIN,
+    }
+    if randomize_configs.type in clean_split_types and sizes != _SUPPORTED_OBS_LAYOUT:
         raise ValueError(
             f"{env_name} has observation layout {sizes}, but randomize type "
-            f"'{randomize_configs.type.value}' assumes the Go2 joystick layout "
-            f"{_SUPPORTED_OBS_LAYOUT}. Add a per-env component map before using it."
+            f"'{randomize_configs.type.value}' reads clean readings at the Go2 "
+            f"joystick offsets {_SUPPORTED_OBS_LAYOUT}."
         )
 
 

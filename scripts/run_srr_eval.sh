@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Sim2Real proxy evaluation across algorithms.
 #
-# Only Go2JoystickFlatTerrain, Go2PushRecovery and Go2RoughCurriculum share the
-# observation layout that the perturbation suites assume; the layout guard in
-# randomize_gym.py rejects the rest, so they are not enumerated here.
+# Every env with an entry in randomize_gym.OBS_LAYOUTS (all nine benchmark envs)
+# can be scored; the custom suite perturbs each one through its own layout.
 #
 # Resume is keyed on the metrics JSON, which compare_randomize.py writes only after
 # a run finishes, so an interrupted run is retried rather than silently skipped.
@@ -16,8 +15,8 @@ cd "$REPO_ROOT"
 export MINARI_DATASETS_PATH="${MINARI_DATASETS_PATH:-$REPO_ROOT/datasets}"
 
 ALGOS="${ALGOS:-AWAC CQL IQL TD3-BC DT}"
-ENVS="${ENVS:-Go2JoystickFlatTerrain Go2PushRecovery Go2RoughCurriculum}"
-SUITE="${SUITE:-humanoid_gym_medium}"
+ENVS="${ENVS:-Go2JoystickFlatTerrain Go2PushRecovery Go2RoughCurriculum Go2Getup Go2GetupWalk Go2Footstand Go2Handstand G1JoystickFlatTerrain H1JoystickGaitTracking}"
+SUITE="${SUITE:-humanoid_gym_relative}"
 EPISODES="${EPISODES:-100}"
 ACTORS="${ACTORS:-50}"
 
