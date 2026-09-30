@@ -1,8 +1,14 @@
 """Publish sim2real evaluation metrics to the akcit-rl/offline-benchmark dataset repo.
 
-Reads two sources and merges them into one flat table:
+Reads two local sources and merges them into one flat table:
   * logs/compare/metrics/*.json  -- written by compare_randomize.py (full precision)
   * logs/compare/**/*.txt        -- older runs that predate the JSON output (2 decimals)
+
+The table is merged into the one already on the Hub, never replaced by it: rows
+evaluated on other machines (whose JSONs are not here) are kept, and a local row
+only overrides the Hub row for the same (checkpoint, checkpoint_step, suite).
+Rows whose checkpoint no longer has a W&B run are dropped (--no-prune keeps them).
+--restore REV also brings back rows from an older revision of the Hub file.
 
 Run with --push to upload; without it, the CSV is only written locally.
 """
@@ -15,6 +21,9 @@ import pandas as pd
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 REPO_ID = "akcit-rl/offline-benchmark"
+REPO_FILE = "sim2real/metrics.csv"
+WANDB_PROJECT = "akcit-offlinerl/Offline-Benchmark"
+KEY = ["checkpoint", "checkpoint_step", "suite"]
 OUT = ROOT / "logs/compare/sim2real_metrics.csv"
 
 # Older text logs, kept so the published table covers everything already simulated.
@@ -164,11 +173,10 @@ def rows_from_legacy(source, path):
         yield row
 
 
-def main(push):
+def local_table():
     rows = []
     for f in sorted((ROOT / "logs/compare/metrics").glob("*.json")):
         rows.extend(rows_from_json(f))
-    n_json = len(rows)
 
     have = {(r["checkpoint"], r["checkpoint_step"], r["suite"]) for r in rows}
     for source, folder in LEGACY.items():
@@ -178,15 +186,70 @@ def main(push):
                 if key not in have:  # full-precision JSON always wins
                     rows.append(row)
                     have.add(key)
+    return pd.DataFrame(rows)
 
-    df = pd.DataFrame(rows).sort_values(
+
+def hub_table(revision=None):
+    """The published table at ``revision`` (latest when None); None if it has none."""
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import EntryNotFoundError
+
+    try:
+        path = hf_hub_download(REPO_ID, REPO_FILE, repo_type="dataset", revision=revision)
+    except EntryNotFoundError:
+        return None
+    return pd.read_csv(path)
+
+
+def wandb_run_names():
+    import wandb
+
+    names = {r.name for r in wandb.Api(timeout=60).runs(WANDB_PROJECT, per_page=1000)}
+    # An empty or truncated listing would prune the whole table.
+    if len(names) < 50:
+        raise RuntimeError(f"only {len(names)} W&B runs listed; refusing to prune")
+    return names
+
+
+def main(push, restore, prune):
+    local = local_table()
+
+    # Oldest first: on a duplicate key the later source wins, and local wins over all.
+    try:
+        sources = [(f"hub@{rev[:8]}", hub_table(rev)) for rev in restore]
+        sources.append(("hub", hub_table()))
+    except Exception as e:
+        if push:
+            raise SystemExit(f"could not read {REPO_ID}:{REPO_FILE} ({e}); not pushing "
+                             "a table that would drop the rows only the Hub has")
+        print(f"AVISO: tabela do Hub indisponível ({e}); usando só a local")
+        sources = []
+    sources.append(("local", local))
+
+    frames = [df.dropna(axis=1, how="all").assign(_origin=name)
+              for name, df in sources if df is not None and len(df)]
+    df = pd.concat(frames, ignore_index=True).drop_duplicates(KEY, keep="last")
+    df["train_seed"] = [matrix_seed(a, s) for a, s in zip(df["algorithm"], df["train_seed"])]
+
+    pruned = []
+    if prune:
+        alive = wandb_run_names()
+        pruned = sorted(set(df["checkpoint"]) - alive)
+        df = df[df["checkpoint"].isin(alive)]
+
+    print(f"{len(df)} linhas, {df['checkpoint'].nunique()} checkpoints | suites: {sorted(df['suite'].unique())}")
+    for origin, n in df.groupby("_origin")["checkpoint"].nunique().items():
+        print(f"  {origin:14} {n:4} checkpoints")
+    if pruned:
+        print(f"  removidos (sem run no W&B): {len(pruned)}")
+        for c in pruned:
+            print(f"    {c}")
+
+    df = df.drop(columns="_origin").sort_values(
         ["env", "task", "dataset", "train_seed", "checkpoint_step", "suite"],
         na_position="first")
     OUT.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUT, index=False)
-
-    print(f"{len(df)} linhas ({n_json} de JSON, {len(df) - n_json} de logs antigos)")
-    print(f"{df['checkpoint'].nunique()} checkpoints | suites: {sorted(df['suite'].unique())}")
     print(f"escrito em {OUT}")
 
     if not push:
@@ -196,15 +259,20 @@ def main(push):
     from huggingface_hub import HfApi
     HfApi().upload_file(
         path_or_fileobj=str(OUT),
-        path_in_repo="sim2real/metrics.csv",
+        path_in_repo=REPO_FILE,
         repo_id=REPO_ID,
         repo_type="dataset",
         commit_message=f"sim2real metrics: {len(df)} rows, {df['checkpoint'].nunique()} checkpoints",
     )
-    print(f"enviado para {REPO_ID}:sim2real/metrics.csv")
+    print(f"enviado para {REPO_ID}:{REPO_FILE}")
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--push", action="store_true")
-    main(p.parse_args().push)
+    p.add_argument("--restore", action="append", default=[], metavar="REV",
+                   help="also merge rows from this older revision of the Hub file")
+    p.add_argument("--no-prune", dest="prune", action="store_false",
+                   help="keep rows whose checkpoint has no W&B run")
+    a = p.parse_args()
+    main(a.push, a.restore, a.prune)
