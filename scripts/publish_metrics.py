@@ -8,7 +8,8 @@ The table is merged into the one already on the Hub, never replaced by it: rows
 evaluated on other machines (whose JSONs are not here) are kept, and a local row
 only overrides the Hub row for the same (checkpoint, checkpoint_step, suite).
 Rows whose checkpoint no longer has a W&B run are dropped (--no-prune keeps them).
---restore REV also brings back rows from an older revision of the Hub file.
+--restore REV also brings back rows from an older revision of the Hub file;
+--reset ignores the Hub table and publishes only this machine's evaluations.
 
 Run with --push to upload; without it, the CSV is only written locally.
 """
@@ -46,6 +47,11 @@ METRIC_COLS = [
 DEGENERATE_NOMINAL = 0.05
 
 
+def algorithm_of(checkpoint):
+    """'TD3-BC-G1JoystickFlatTerrain-1a2b3c4d' -> 'TD3-BC'; 'BC-Go2Getup-...' -> 'BC'."""
+    return "TD3-BC" if checkpoint.startswith("TD3-BC-") else checkpoint.split("-")[0]
+
+
 def matrix_seed(algorithm, train_seed):
     """Seed as labeled in the benchmark.
 
@@ -71,11 +77,11 @@ def rows_from_json(path):
     nominal = rec["metrics"].get("default", {}).get("score")
     for suite, stats in rec["metrics"].items():
         row = {
-            "algorithm": rec["checkpoint"].split("-Go2")[0],
+            "algorithm": algorithm_of(rec["checkpoint"]),
             "env": rec.get("env"),
             "task": task,
             "dataset": split,
-            "train_seed": matrix_seed(rec["checkpoint"].split("-Go2")[0], rec.get("train_seed")),
+            "train_seed": matrix_seed(algorithm_of(rec["checkpoint"]), rec.get("train_seed")),
             "checkpoint": rec["checkpoint"],
             "checkpoint_step": rec.get("checkpoint_step"),
             "suite": suite,
@@ -155,11 +161,11 @@ def rows_from_legacy(source, path):
             if "p5_delta" in stats:
                 stats["p5_retention"] = (baseline + stats["p5_delta"]) / baseline
         row = {
-            "algorithm": ckpt_dir.split("-Go2")[0],
+            "algorithm": algorithm_of(ckpt_dir),
             "env": cfg["env"],
             "task": task,
             "dataset": split,
-            "train_seed": matrix_seed(ckpt_dir.split("-Go2")[0], cfg["train_seed"]),
+            "train_seed": matrix_seed(algorithm_of(ckpt_dir), cfg["train_seed"]),
             "checkpoint": ckpt_dir,
             "checkpoint_step": step,
             "suite": suite,
@@ -211,13 +217,21 @@ def wandb_run_names():
     return names
 
 
-def main(push, restore, prune):
+COLUMNS = [
+    "algorithm", "env", "task", "dataset", "train_seed", "checkpoint", "checkpoint_step",
+    "suite", "n_episodes", "nominal_score", "ratio_valid", "precision", "source",
+] + METRIC_COLS
+
+
+def main(push, restore, prune, reset):
     local = local_table()
 
     # Oldest first: on a duplicate key the later source wins, and local wins over all.
+    # --reset starts over: the Hub table is not read (its history keeps it).
     try:
-        sources = [(f"hub@{rev[:8]}", hub_table(rev)) for rev in restore]
-        sources.append(("hub", hub_table()))
+        sources = [] if reset else [(f"hub@{rev[:8]}", hub_table(rev)) for rev in restore]
+        if not reset:
+            sources.append(("hub", hub_table()))
     except Exception as e:
         if push:
             raise SystemExit(f"could not read {REPO_ID}:{REPO_FILE} ({e}); not pushing "
@@ -228,7 +242,8 @@ def main(push, restore, prune):
 
     frames = [df.dropna(axis=1, how="all").assign(_origin=name)
               for name, df in sources if df is not None and len(df)]
-    df = pd.concat(frames, ignore_index=True).drop_duplicates(KEY, keep="last")
+    empty = pd.DataFrame(columns=COLUMNS + ["_origin"])
+    df = pd.concat([empty, *frames], ignore_index=True).drop_duplicates(KEY, keep="last")
     df["train_seed"] = [matrix_seed(a, s) for a, s in zip(df["algorithm"], df["train_seed"])]
 
     pruned = []
@@ -272,7 +287,11 @@ if __name__ == "__main__":
     p.add_argument("--push", action="store_true")
     p.add_argument("--restore", action="append", default=[], metavar="REV",
                    help="also merge rows from this older revision of the Hub file")
+    p.add_argument("--reset", action="store_true",
+                   help="ignore the Hub table and publish only this machine's evaluations")
     p.add_argument("--no-prune", dest="prune", action="store_false",
                    help="keep rows whose checkpoint has no W&B run")
     a = p.parse_args()
-    main(a.push, a.restore, a.prune)
+    if a.reset and a.restore:
+        p.error("--reset and --restore are mutually exclusive")
+    main(a.push, a.restore, a.prune, a.reset)
