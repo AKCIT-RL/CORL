@@ -22,7 +22,7 @@ from algorithms.utils.randomize_gym import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Same defaults as scripts/run_srr_eval.sh and scripts/run_srr_matrix.sh.
-SRR_SUITE = "humanoid_gym_medium"
+SRR_SUITE = "humanoid_gym_relative"
 SRR_EPISODES = 100
 SRR_ACTORS = 50
 METRICS_DIR = REPO_ROOT / "logs/compare/metrics"

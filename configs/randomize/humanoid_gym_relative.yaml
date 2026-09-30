@@ -1,0 +1,68 @@
+# humanoid_gym_medium with every physical range expressed relative to the robot,
+# so one suite scores all envs (Go2 tasks, G1, H1) at a comparable strength.
+#
+# The relative ranges are derived from the Go2, where humanoid_gym_medium was
+# calibrated, so on every Go2 env this suite samples exactly the same
+# distributions as humanoid_gym_medium:
+#   * friction: absolute U(0.3, 1.0) on the Go2 floor (mu = 0.6) is a
+#     U(0.5, 1.667) scale of the env's own floor friction (G1/H1/rough: mu = 1.0);
+#   * payload: +-1.0 kg on the Go2 trunk is +-6.576% of its 15.206 kg total mass
+#     (G1: +-2.2 kg on the pelvis, H1: +-3.4 kg).
+# Sensor noise stays absolute (rad, rad/s): it models the sensor, not the robot.
+
+noise:
+  # Friction | x default | [0.5, 1.667] | uniform.
+  geom_friction:
+    dist: uniform
+    type: scale
+    min: 0.5
+    max: 1.666667
+
+  # Payload | fraction of total mass | [-0.06576, 0.06576] | additive | Gaussian.
+  # Applied to body 1 (Go2 base, G1/H1 pelvis).
+  body_mass:
+    dist: normal
+    type: additive_total
+    min: -0.065762
+    max: 0.065762
+    indices: [1]
+
+  # Motor Strength | % | [95, 105] | scaling | Gaussian.
+  motor_strength:
+    dist: normal
+    type: scale
+    min: 0.95
+    max: 1.05
+
+  # Joint Position | rad | [-0.05, 0.05] | additive | Gaussian.
+  joint_angles:
+    dist: normal
+    type: additive
+    min: -0.05
+    max: 0.05
+
+  # Joint Velocity | rad/s | [-0.5, 0.5] | additive | Gaussian.
+  joint_vel:
+    dist: normal
+    type: additive
+    min: -0.5
+    max: 0.5
+
+  # Angular Velocity | rad/s | [-0.1, 0.1] | additive | Gaussian.
+  gyro:
+    dist: normal
+    type: additive
+    min: -0.1
+    max: 0.1
+
+  # Projected gravity | unit vector | [-0.03, 0.03] | additive | Gaussian.
+  gravity:
+    dist: normal
+    type: additive
+    min: -0.03
+    max: 0.03
+
+# System Delay | 0-1 control step (20 ms on every env) | uniform.
+action_factory:
+  type: randomized_delay
+  max_delay: 1

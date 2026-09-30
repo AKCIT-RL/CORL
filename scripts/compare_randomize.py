@@ -611,7 +611,8 @@ def _main(attrs: CompareRandomizeAttributes):
    custom_configs = {
       "example": "configs/randomize/example.yaml",
       "humanoid_gym": "configs/randomize/humanoid_gym.yaml",
-      "humanoid_gym_medium": "configs/randomize/humanoid_gym_medium.yaml"
+      "humanoid_gym_medium": "configs/randomize/humanoid_gym_medium.yaml",
+      "humanoid_gym_relative": "configs/randomize/humanoid_gym_relative.yaml",
    }
 
    selected = None
