@@ -10,7 +10,7 @@ For each env:
   4. rollout  -- the GymWrapper runs the suite end to end with finite observations,
                  and the env exposes the rng the observation noise needs.
 
-CPU-bound (JIT + MJX rollouts): run it through run_check_randomize.slurm.
+CPU-bound (JIT + MJX rollouts): on a cluster, run it as a batch job.
 
 Usage:
   python -m scripts.check_randomize_envs [--envs Go2Getup H1JoystickGaitTracking]

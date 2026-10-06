@@ -1,17 +1,18 @@
 """Finish training runs that died in the end-of-training proxy evaluation.
 
-The matrix runs of job 33282 trained to completion, then crashed while saving the
-proxy video (no ffmpeg on the node), before logging the proxy metrics and saving
-checkpoint_final.npz. The last periodic checkpoint is already the final policy,
-so nothing needs retraining. For each failed run's matrix log this:
+Some runs train to completion and then crash in the end-of-training proxy (for
+example, saving the proxy video on a node without ffmpeg), before logging the
+proxy metrics and saving checkpoint_final.npz. The last periodic checkpoint is
+already the final policy, so nothing needs retraining. For each failed run's
+training log this:
 
   1. promotes the last periodic checkpoint to checkpoint_final.npz (only when its
      step is the final training step);
   2. runs proxy.evaluate -- the scripts/run_srr_eval.sh evaluation -- unless the
-     SRR matrix already wrote a JSON for the final policy, which is reused;
+     SRR evaluation already wrote a JSON for the final policy, which is reused;
   3. resumes the same W&B run, logs eval/proxy_results/* and the rollout video,
      and finishes it, so the run shows up as finished;
-  4. touches the .done_runs marker, so run_offline_matrix.sh skips it.
+  4. touches the .done_runs marker, so run_offline_all.sh skips it.
 
 Usage:
   python -m scripts.recover_proxy logs/matrix/bc-go2-footstand-medium-seed2.log [...]
@@ -68,9 +69,9 @@ def _promote_final_checkpoint(ckpt_dir: Path, cfg: dict) -> Path:
 
 
 def _reusable_record(ckpt_dir: Path, cfg: dict) -> Optional[dict]:
-   """The SRR matrix's JSON for this run, if it already scored the final policy.
+   """The SRR evaluation JSON for this run, if it already scored the final policy.
 
-   run_srr_matrix.sh points compare_randomize at the run directory, which picks the
+   run_srr_eval.sh points compare_randomize at the run directory, which picks the
    highest checkpoint, so a JSON written after checkpoint_<final step>.npz scored
    exactly the policy we would evaluate now, with the same suite and budget.
    """
@@ -143,7 +144,7 @@ def recover(log_path: Path, device: str) -> None:
       print(f"[video] failed to record rollout video: {e}")
    run.finish()
 
-   # <group>-seed<N>.log -> .done_runs/<group>-seed<N>.done, as run_offline_matrix.sh does.
+   # <group>-seed<N>.log -> .done_runs/<group>-seed<N>.done, as run_offline_all.sh does.
    marker = REPO_ROOT / ".done_runs" / f"{log_path.stem}.done"
    marker.parent.mkdir(parents=True, exist_ok=True)
    marker.touch()

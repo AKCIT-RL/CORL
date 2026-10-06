@@ -6,12 +6,14 @@ import sys
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "../CORL"))
+# Repo root for `algorithms`, this folder for `portable_actor`, wherever it is run from.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-import cloudpickle
 import numpy as np
 
 from algorithms.utils.wrapper_gym import get_env
+from portable_actor import load_actor
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -26,16 +28,20 @@ DEFAULT_COMMAND_TYPE = "direction"
 
 
 def evaluate(actor, env, num_episodes: int, render: bool = False) -> np.ndarray:
-    """Run *num_episodes* rollouts and return per-episode returns as an array."""
+    """Run *num_episodes* rollouts and return per-episode returns as an array.
+
+    Only the first episode is rendered: every rendered step keeps a full simulator
+    state on the device, and a few episodes of them exhaust GPU memory.
+    """
     episode_returns = []
-    for _ in range(num_episodes):
+    for episode in range(num_episodes):
         episode_return = 0.0
         observation, _ = env.reset()
         done = truncated = False
         while not done and not truncated:
             action = actor(obs=observation)
             observation, reward, done, truncated, _ = env.step(action)
-            if render:
+            if render and episode == 0:
                 env.render()
             episode_return += reward
         episode_returns.append(episode_return)
@@ -78,12 +84,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--render",
         action="store_true",
-        help="Call env.render() at every step.",
+        help="Call env.render() at every step of the first episode.",
     )
     parser.add_argument(
         "--save-video",
         action="store_true",
-        help="Record the trajectory and save an .mp4 video alongside the pickle.",
+        help="Record the first episode and save it as an .mp4 video.",
     )
     parser.add_argument(
         "--video-dir",
@@ -107,10 +113,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # Load actor
+    # Load actor (portable format, or a legacy cloudpickle dict)
     print(f"Loading actor from: {args.pickle_path}")
-    with open(args.pickle_path, "rb") as f:
-        loaded_actor = cloudpickle.load(f)
+    loaded_actor = load_actor(args.pickle_path)
 
     # Build environment
     render_trajectory = []
@@ -126,7 +131,8 @@ def main() -> None:
         actor=loaded_actor["get_action"],
         env=env,
         num_episodes=args.n_episodes,
-        render=args.render,
+        # The wrapper hands frames to render_callback only on env.render().
+        render=args.render or args.save_video,
     )
 
     import json
@@ -179,7 +185,8 @@ def main() -> None:
 
         video_dir = args.video_dir or os.path.dirname(os.path.abspath(args.pickle_path))
         os.makedirs(video_dir, exist_ok=True)
-        video_path = os.path.join(video_dir, f"{args.pickle_path.split('.')[0]}.mp4")
+        video_name = os.path.splitext(os.path.basename(args.pickle_path))[0]
+        video_path = os.path.join(video_dir, f"{video_name}.mp4")
         env.save_video(render_trajectory, save_path=video_path)
         print(f"\nVideo saved to: {video_path}")
 

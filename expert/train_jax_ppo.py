@@ -12,12 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Train a PPO agent using JAX on the specified environment."""
+"""Train a PPO expert with Brax on a MuJoCo Playground environment.
+
+Runs are written to expert/logs/<Env>-<YYYYMMDD-HHMMSS>[-<suffix>]/ (wherever the
+script is run from): orbax checkpoints, the env and PPO configs, and a video of a
+deterministic rollout of the final policy. See expert/README.md.
+"""
 
 from datetime import datetime
 import functools
 import json
 import os
+from pathlib import Path
 import time
 import warnings
 
@@ -54,9 +60,7 @@ os.environ["PYOPENGL_PLATFORM"] = "egl"
 # Ignore the info logs from brax
 logging.set_verbosity(logging.WARNING)
 
-# Suppress warnings
-
-# Silencia os avisos do GLFW emitidos quando não há DISPLAY (ambiente headless).
+# Silence the GLFW warnings emitted when there is no DISPLAY (headless machines).
 try:
   from glfw import GLFWError
 
@@ -74,8 +78,14 @@ warnings.filterwarnings("ignore", category=UserWarning, module="absl")
 
 _ENV_NAME = flags.DEFINE_string(
     "env_name",
-    "LeapCubeReorient",
+    None,
     f"Name of the environment. One of {', '.join(registry.ALL_ENVS)}",
+    required=True,
+)
+_LOGDIR = flags.DEFINE_string(
+    "logdir",
+    str(Path(__file__).resolve().parent / "logs"),
+    "Directory the run folder is created in",
 )
 _VISION = flags.DEFINE_boolean("vision", False, "Use vision input")
 _LOAD_CHECKPOINT_PATH = flags.DEFINE_string(
@@ -171,7 +181,7 @@ def main(argv):
 
   if _NUM_TIMESTEPS.present:
     ppo_params.num_timesteps = _NUM_TIMESTEPS.value
-  if _PLAY_ONLY.present:
+  if _PLAY_ONLY.value:
     ppo_params.num_timesteps = 0
   if _NUM_EVALS.present:
     ppo_params.num_evals = _NUM_EVALS.value
@@ -235,19 +245,24 @@ def main(argv):
   print(f"Experiment name: {exp_name}")
 
   # Set up logging directory
-  logdir = epath.Path("logs").resolve() / exp_name
+  logdir = epath.Path(_LOGDIR.value).resolve() / exp_name
   logdir.mkdir(parents=True, exist_ok=True)
   print(f"Logs are being stored in: {logdir}")
 
   # Initialize Weights & Biases if required
   if _USE_WANDB.value and not _PLAY_ONLY.value:
+    # Logs under WANDB_ENTITY when set, else the default entity of the login.
     wandb.init(
-        entity="akcit-offlinerl",
+        entity=os.environ.get("WANDB_ENTITY"),
         project="Experts-Offline-Benchmark",
         name=exp_name,
     )
     wandb.config.update(env_cfg.to_dict())
-    wandb.config.update({"env_name": _ENV_NAME.value})
+    wandb.config.update({
+        "env_name": _ENV_NAME.value,
+        "seed": _SEED.value,
+        "ppo": ppo_params.to_dict(),
+    })
 
   # Initialize TensorBoard if required
   if _USE_TB.value and not _PLAY_ONLY.value:
@@ -276,9 +291,14 @@ def main(argv):
   ckpt_path.mkdir(parents=True, exist_ok=True)
   print(f"Checkpoint path: {ckpt_path}")
 
-  # Save environment configuration
+  # Save the environment configuration, and the PPO configuration and seed, so a
+  # run can be reproduced (and its network rebuilt) from its folder alone.
   with open(ckpt_path / "config.json", "w", encoding="utf-8") as fp:
     json.dump(env_cfg.to_dict(), fp, indent=4)
+  with open(logdir / "ppo_config.json", "w", encoding="utf-8") as fp:
+    fp.write(ppo_params.to_json_best_effort(indent=4))
+  with open(logdir / "run.json", "w", encoding="utf-8") as fp:
+    json.dump({"env_name": _ENV_NAME.value, "seed": _SEED.value}, fp, indent=4)
 
   # Define policy parameters function for saving checkpoints
   def policy_params_fn(current_step, make_policy, params):  # pylint: disable=unused-argument
@@ -461,6 +481,9 @@ def main(argv):
   video_path = logdir / "rollout.mp4"
   media.write_video(video_path, frames, fps=fps)
   print(f"Rollout video saved as '{video_path}'.")
+
+  if _USE_WANDB.value and not _PLAY_ONLY.value:
+    wandb.finish()
 
 
 if __name__ == "__main__":

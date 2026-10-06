@@ -1,54 +1,95 @@
-# Expert forwardfixed
-python checkpoint_bc.py --checkpoint-path ../checkpoints/BC/BC-Go2JoystickFlatTerrain-4bb13594 --env-name Go2JoystickFlatTerrain
+#!/usr/bin/env bash
+# Export trained runs to portable actors (actor-*.pkl, written to the current
+# directory).
+#
+# Each argument is a run directory:
+#   - an offline run, checkpoints/<ALGO>/<ALGO>-<Env>-<hash>/ (BC, TD3-BC, IQL or AWAC);
+#   - a PPO expert run, expert/logs/<Env>-<YYYYMMDD-HHMMSS>/ (its latest
+#     checkpoint; STEP=<n> picks another one).
+# The env comes from the run, and the observation and action sizes from the env.
+#
+# Usage:
+#   ./sim2real/generate_checkpoints.sh checkpoints/BC/BC-Go2Getup-1a2b3c4d
+#   ./sim2real/generate_checkpoints.sh expert/logs/Go2Getup-20260626-065620
+#   STEP=212336640 ./sim2real/generate_checkpoints.sh expert/logs/Go2Getup-20260626-065620
+set -euo pipefail
 
-# Expert forward
-python checkpoint_bc.py --checkpoint-path ../checkpoints/BC/BC-Go2JoystickFlatTerrain-6a6ba0be --env-name Go2JoystickFlatTerrain
+if [[ "$#" -lt 1 ]]; then
+  echo "usage: $0 <run_dir> [run_dir ...]" >&2
+  exit 2
+fi
 
-# Expert direction
-python checkpoint_bc.py --checkpoint-path ../checkpoints/BC/BC-Go2JoystickFlatTerrain-fd4e6c50 --env-name Go2JoystickFlatTerrain
+SIM2REAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(dirname "$SIM2REAL_DIR")"
+# The uv environment: .venv by default, UV_PROJECT_ENVIRONMENT when set.
+PY="${UV_PROJECT_ENVIRONMENT:-$REPO/.venv}/bin/python"
 
+# "<state_dim> <action_dim>" of env $1. The policies read the "state" observation.
+env_dims() {
+  "$PY" - "$1" <<'PY' 2>/dev/null | tail -n 1
+import sys
 
-# Expert forwardfixed
-python checkpoint_awac.py --checkpoint-path ../checkpoints/AWAC/AWAC-Go2JoystickFlatTerrain-b1f58c5a --env-name Go2JoystickFlatTerrain
+from mujoco_playground import registry
 
-# Expert forward
-python checkpoint_awac.py --checkpoint-path ../checkpoints/AWAC/AWAC-Go2JoystickFlatTerrain-9a9a0a54 --env-name Go2JoystickFlatTerrain
+env = registry.load(sys.argv[1])
+obs = env.observation_size
+obs = obs["state"] if isinstance(obs, dict) else obs
+print(obs[0] if isinstance(obs, tuple) else obs, env.action_size)
+PY
+}
 
-# Expert direction
-python checkpoint_awac.py --checkpoint-path ../checkpoints/AWAC/AWAC-Go2JoystickFlatTerrain-f69a2d43 --env-name Go2JoystickFlatTerrain
+export_offline() {
+  local run="$1" name algo env script
+  name="$(basename "$run")"
+  case "$name" in
+    TD3-BC-*) script="checkpoint_td3_bc.py" ;;
+    BC-*)     script="checkpoint_bc.py" ;;
+    IQL-*)    script="checkpoint_iql.py" ;;
+    AWAC-*)   script="checkpoint_awac.py" ;;
+    *) echo "unsupported run '$name' (expected BC, TD3-BC, IQL or AWAC)" >&2; return 1 ;;
+  esac
+  env="$(sed -n 's/^env: //p' "$run/config.yaml")"
+  [[ -n "$env" ]] || { echo "no 'env' in $run/config.yaml" >&2; return 1; }
+  read -r state_dim action_dim <<< "$(env_dims "$env")"
+  [[ -n "${action_dim:-}" ]] || { echo "could not load env $env" >&2; return 1; }
 
+  echo "=== $name ($env, state_dim=$state_dim, action_dim=$action_dim)"
+  "$PY" "$SIM2REAL_DIR/$script" \
+    --checkpoint-path "$run" --env-name "$env" \
+    --state-dim "$state_dim" --action-dim "$action_dim"
+}
 
-# Expert forwardfixed
-python checkpoint_iql.py --checkpoint-path ../checkpoints/IQL/IQL-Go2JoystickFlatTerrain-170a3036 --env-name Go2JoystickFlatTerrain
+export_expert() {
+  local run="$1" name env step
+  name="$(basename "$run")"
+  env="${name%-*-*}"  # <Env>-<YYYYMMDD>-<HHMMSS>
+  step="${STEP:-$(ls "$run/checkpoints" | grep -E '^[0-9]+$' | sort -n | tail -n 1)}"
+  [[ -n "$step" ]] || { echo "no checkpoint in $run/checkpoints" >&2; return 1; }
+  read -r state_dim action_dim <<< "$(env_dims "$env")"
+  [[ -n "${action_dim:-}" ]] || { echo "could not load env $env" >&2; return 1; }
 
-# Expert forward
-python checkpoint_iql.py --checkpoint-path ../checkpoints/IQL/IQL-Go2JoystickFlatTerrain-f1ba53bb --env-name Go2JoystickFlatTerrain
+  echo "=== $name step $step ($env, state_dim=$state_dim, action_dim=$action_dim)"
+  "$PY" "$SIM2REAL_DIR/checkpoint_expert.py" \
+    --checkpoints-dir "$run/checkpoints" --checkpoint-step "$step" \
+    --run-id "${name#"$env"-}-$step" --env-name "$env" \
+    --state-dim "$state_dim" --action-dim "$action_dim"
+}
 
-# Expert direction
-python checkpoint_iql.py --checkpoint-path ../checkpoints/IQL/IQL-Go2JoystickFlatTerrain-2aadc1c4 --env-name Go2JoystickFlatTerrain
+failed=()
+for run in "$@"; do
+  run="${run%/}"
+  if [[ -f "$run/config.yaml" ]]; then
+    export_offline "$run" || failed+=("$run")
+  elif [[ -d "$run/checkpoints" ]]; then
+    export_expert "$run" || failed+=("$run")
+  else
+    echo "not a run directory: $run" >&2
+    failed+=("$run")
+  fi
+done
 
-
-# Expert forwardfixed
-python checkpoint_td3_bc.py --checkpoint-path ../checkpoints/TD3-BC/TD3-BC-Go2JoystickFlatTerrain-68c5bf5c --env-name Go2JoystickFlatTerrain
-
-# Expert forward
-python checkpoint_td3_bc.py --checkpoint-path ../checkpoints/TD3-BC/TD3-BC-Go2JoystickFlatTerrain-9da07408 --env-name Go2JoystickFlatTerrain
-
-# Expert direction
-python checkpoint_td3_bc.py --checkpoint-path ../checkpoints/TD3-BC/TD3-BC-Go2JoystickFlatTerrain-9073de6c --env-name Go2JoystickFlatTerrain
-
-
-# PPO last checkpoint
-python checkpoint_expert.py --checkpoints-dir ../expert/logs/Go2JoystickFlatTerrain-20250904-225910/checkpoints --checkpoint-step 1008599040 --run-id "20250904-225910-last" --env-name Go2JoystickFlatTerrain
-python checkpoint_expert.py --checkpoints-dir ../expert/logs/Go2JoystickRoughTerrain-20250905-054419/checkpoints --checkpoint-step 1008599040 --run-id "20250905-054419-last" --env-name Go2JoystickRoughTerrain
-python checkpoint_expert.py --checkpoints-dir ../expert/logs/Go2JoystickRoughTerrain-20260303-201251/checkpoints --checkpoint-step 1008599040 --run-id "20260303-201251-last" --env-name Go2JoystickRoughTerrain
-
-
-# PPO intermediate checkpoints
-python checkpoint_expert.py --checkpoints-dir ../expert/logs/Go2JoystickFlatTerrain-20250904-225910/checkpoints --checkpoint-step 212336640 --run-id "20250904-225910-212M" --env-name Go2JoystickFlatTerrain
-python checkpoint_expert.py --checkpoints-dir ../expert/logs/Go2JoystickFlatTerrain-20250904-225910/checkpoints --checkpoint-step 265420800 --run-id "20250904-225910-265M" --env-name Go2JoystickFlatTerrain
-
-python checkpoint_expert.py --checkpoints-dir ../expert/logs/Go2JoystickRoughTerrain-20250905-054419/checkpoints --checkpoint-step 212336640 --run-id "20250905-054419-212M" --env-name Go2JoystickRoughTerrain
-python checkpoint_expert.py --checkpoints-dir ../expert/logs/Go2JoystickRoughTerrain-20250905-054419/checkpoints --checkpoint-step 265420800 --run-id "20250905-054419-265M" --env-name Go2JoystickRoughTerrain
-python checkpoint_expert.py --checkpoints-dir ../expert/logs/Go2JoystickRoughTerrain-20260303-201251/checkpoints --checkpoint-step 212336640 --run-id "20260303-201251-212M" --env-name Go2JoystickRoughTerrain
-python checkpoint_expert.py --checkpoints-dir ../expert/logs/Go2JoystickRoughTerrain-20260303-201251/checkpoints --checkpoint-step 265420800 --run-id "20260303-201251-265M" --env-name Go2JoystickRoughTerrain
+if [[ "${#failed[@]}" -gt 0 ]]; then
+  echo "${#failed[@]} failure(s):" >&2
+  printf '  %s\n' "${failed[@]}" >&2
+  exit 1
+fi

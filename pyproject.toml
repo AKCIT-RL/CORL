@@ -1,7 +1,7 @@
 [project]
 name = "corl"
 version = "0.1.0"
-description = "High-quality single-file implementations of SOTA Offline and Offline-to-Online RL algorithms"
+description = "Offline RL benchmark on MuJoCo Playground locomotion tasks: single-file JAX algorithms and sim2real robustness evaluation"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -93,7 +93,6 @@ target-version = "py311"
 # Lint only the project source. Exploratory notebooks and generated/output
 # directories are excluded so `ruff check` focuses on the actual code.
 extend-exclude = [
-    "notebooks",
     "wandb",
     "checkpoints",
     "datasets",
@@ -103,7 +102,6 @@ extend-exclude = [
 [tool.ruff.lint.per-file-ignores]
 # __init__.py re-exports symbols for the public API; unused-import is expected.
 "__init__.py" = ["F401"]
-# This test sets MUJOCO_GL and initializes an EGL context before importing the
+# This script sets MUJOCO_GL and initializes an EGL context before importing the
 # modules that rely on it, so module-level imports intentionally come later.
-"test/offline/bc_jax.py" = ["E402"]
 "scripts/compare_randomize.py" = ["E402"]

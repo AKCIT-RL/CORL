@@ -1,15 +1,15 @@
 FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
 
-# Evita que JAX pré-aloque toda a memória da GPU
+# Keep JAX from preallocating all GPU memory
 ENV XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-# uv: cria o ambiente do projeto num local fixo e o coloca no PATH, para que
-# `python` dentro do container aponte para o venv resolvido pelo uv.lock.
+# uv: create the project environment in a fixed location and put it on PATH, so
+# `python` inside the container is the venv resolved from uv.lock.
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_LINK_MODE=copy
 ENV PATH=/opt/venv/bin:$PATH
 
-# Instala dependências de sistema e GNU parallel
+# System dependencies and GNU parallel
 RUN apt-get update -q \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y \
        python3-pip build-essential patchelf curl git parallel \
@@ -21,32 +21,30 @@ RUN apt-get update -q \
 
 RUN ln -s /usr/bin/python3 /usr/bin/python
 
-# git-lfs (usado pelos datasets do Hugging Face / Minari)
+# git-lfs (used by the Hugging Face / Minari datasets)
 RUN curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | bash && \
     apt-get install -y git-lfs && \
     git lfs install
 
-# Instala o uv (mesmo gerenciador usado localmente)
+# uv (the same package manager used outside the container)
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-# Código da aplicação
+# The repository is mounted here at run time (docker run -v "$PWD":/CORL ...)
 WORKDIR /CORL
 
-# Instala exatamente o conjunto de pacotes travado no uv.lock (pyproject.toml +
-# uv.lock são a fonte única de verdade). O `playground` (fork AKCIT-RL, rev go2)
-# também é instalado a partir do git aqui, conforme [tool.uv.sources].
+# Install exactly the package set locked in uv.lock (pyproject.toml + uv.lock are
+# the single source of truth). The `playground` fork (AKCIT-RL, rev go2) is also
+# installed from git here, as set in [tool.uv.sources].
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-install-project
 
-# O mujoco_playground precisa dos assets do menagerie ao lado do pacote instalado
+# mujoco_playground needs the menagerie assets next to the installed package
 RUN MJP_DIR="$(python -c 'import mujoco_playground, os; print(os.path.dirname(mujoco_playground.__file__))')" \
     && git clone https://github.com/google-deepmind/mujoco_menagerie.git "$MJP_DIR/external_deps/mujoco_menagerie"
 
-# Configura WandB
-ARG WANDB_KEY
-ENV WANDB_API_KEY=${WANDB_KEY}
+# Datasets live inside the mounted repository
+ENV MINARI_DATASETS_PATH=/CORL/datasets
 
-ENV MINARI_DATASETS_PATH=/datasets
-
-# Comando padrão: abre bash para você executar manualmente dentro do container
+# Default command: open a shell to run things manually inside the container.
+# Pass W&B credentials at run time (docker run -e WANDB_API_KEY ...), not here.
 CMD ["bash"]

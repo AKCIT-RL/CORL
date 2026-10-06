@@ -1,237 +1,231 @@
-# `scripts/` — avaliação sim2real (SRR) e relatórios
+# `scripts/` — sim2real robustness (SRR) evaluation
 
-Conjunto de utilitários usados fora do loop de treino: avaliar um checkpoint sob
-perturbações de dinâmica/observação, agregar os resultados em uma tabela publicável e
-inspecionar a cobertura de seeds no wandb.
+Utilities that run outside the training loop: score a checkpoint under dynamics and
+observation perturbations, and recover runs that died at the end of training.
 
 ## Pipeline
 
 ```mermaid
 flowchart LR
+    T["end of training<br/>(proxy.evaluate)"] --> B
     A["checkpoints/ALGO/run/*.npz"] --> B["compare_randomize.py"]
     B --> C["logs/compare/metrics/run.json"]
-    B --> D["stdout → logs/compare/.../*.txt"]
-    C --> E["publish_metrics.py"]
-    D --> E
-    E --> F["logs/compare/sim2real_metrics.csv"]
-    F -->|--push| G["HF akcit-rl/offline-benchmark<br/>sim2real/metrics.csv"]
+    B --> D["stdout → logs/compare/algorithms/*.txt"]
 ```
 
-Os runners (`run_srr_eval.sh`, `run_srr_phases.sh`, `run_compare_randomize_all.sh`) são
-apenas laços em cima de `compare_randomize.py` com política de *resume*.
+`run_srr_eval.sh` loops over `compare_randomize.py` with a resume policy. Every JAX
+training run also performs this evaluation on its `checkpoint_final.npz`
+(`algorithms/utils/proxy.py`), and the JSON lands in the same `logs/compare/metrics/`.
 
-## Pré-requisitos
+### Supported envs
 
-| Item | Observação |
+Observation perturbations are applied in place to the slices that `OBS_LAYOUTS`
+(`algorithms/utils/randomize_gym.py`) maps for each env (gyro, gravity, joint positions
+and joint velocities). Command, phase, goal and last action are left untouched. All nine
+benchmark envs have a layout:
+
+`Go2JoystickFlatTerrain`, `Go2PushRecovery`, `Go2RoughCurriculum`, `Go2Getup`,
+`Go2GetupWalk`, `Go2Footstand`, `Go2Handstand`, `G1JoystickFlatTerrain`,
+`H1JoystickGaitTracking`.
+
+On H1, the one-step `qvel`/`qpos_error` history is a clean copy of the same readings, so
+it gets the same perturbation (*mirrors*). An env with no layout, or whose observation
+size doesn't match its layout, is rejected with an error. To validate a new layout, use
+[`check_randomize_envs.py`](#check_randomize_envspy).
+
+## Prerequisites
+
+| Item | Notes |
 | --- | --- |
-| `MINARI_DATASETS_PATH` | Precisa apontar para `CORL/datasets` para resolver `playground/...`. Os runners `.sh` já exportam. |
-| GPU / EGL | `compare_randomize.py` força `MUJOCO_GL=egl` e cria o contexto GL antes de importar JAX. |
-| Interpretador | Os runners usam `.venv/bin/python` (ou `uv run`, em `run_compare_randomize_all.sh`). |
-| `WANDB_API_KEY` | Só para `wandb_seed_matrix.py`. |
-| Login no Hugging Face | Só para `publish_metrics.py --push` (repo **privado**). |
+| `MINARI_DATASETS_PATH` | Must point to `CORL/datasets` to resolve `playground/...`. `run_srr_eval.sh` exports it. |
+| GPU / EGL | `compare_randomize.py` forces `MUJOCO_GL=egl` and creates the GL context before importing JAX. |
+| `scipy` | SRR bootstrap CIs (`uv sync --group stats`). |
+| W&B login | Only for `recover_proxy.py`, which resumes the training run in W&B. |
 
 ---
 
 ## `compare_randomize.py`
 
-Avalia um checkpoint em cada suíte de randomização selecionada e grava um JSON com as
-métricas e os retornos por episódio.
+Scores a checkpoint on each selected randomization suite and writes a JSON with the
+metrics and the per-episode returns.
 
 ```bash
 export MINARI_DATASETS_PATH="$PWD/datasets"
-.venv/bin/python -m scripts.compare_randomize \
-  --checkpoint_path checkpoints/BC/BC-Go2JoystickFlatTerrain-59e9c78e \
+uv run python -m scripts.compare_randomize \
+  --checkpoint_path checkpoints/BC/BC-Go2JoystickFlatTerrain-1a2b3c4d \
   --device cuda --n_actors 50 --n_episodes 100 \
-  --configs humanoid_gym_medium
+  --configs humanoid_gym_relative
 ```
 
 ### Flags
 
-| Flag | Padrão | Descrição |
+| Flag | Default | Description |
 | --- | --- | --- |
-| `--checkpoint_path` | — | Diretório do run **ou** um `.npz` específico (permite varrer checkpoints intermediários). Num diretório usa `checkpoint_final.npz`, senão o de maior passo. |
-| `--checkpoint_config` | `None` | `config.yaml` alternativo. Sem ele, lê o `config.yaml` ao lado do checkpoint. |
-| `--n_actors` | `4` | Ambientes vetorizados (limitado a `n_episodes`). Menos lotes = mais rápido. |
-| `--n_episodes` | `20` | Episódios por suíte. |
+| `--checkpoint_path` | — | Run directory **or** a specific `.npz` (to sweep intermediate checkpoints). For a directory, uses `checkpoint_final.npz`, else the highest step. |
+| `--checkpoint_config` | `None` | Alternative `config.yaml`. Without it, reads the `config.yaml` next to the checkpoint. |
+| `--n_actors` | `4` | Vectorized envs (capped at `n_episodes`). Fewer batches = faster. |
+| `--n_episodes` | `20` | Episodes per suite. |
 | `--seed` | `0` | — |
-| `--render` | `False` | Salva vídeo em `videos/<checkpoint>/<suite>-<timestamp>.mp4`. |
+| `--render` | `False` | Saves a video to `videos/<checkpoint>/<suite>-<timestamp>.mp4`. |
 | `--device` | `cuda` | — |
-| `--configs` | `None` (todas) | Lista separada por vírgula de suítes. `default` entra **sempre** como baseline. |
-| `--metrics_dir` | `logs/compare/metrics` | Destino do JSON. |
-| `--dt_target_return` | `None` | Só DT: sobrepõe `target_returns[0]` do config do run. |
+| `--configs` | `None` (all) | Comma-separated list of suites. `default` is **always** included as the baseline. |
+| `--metrics_dir` | `logs/compare/metrics` | Where the JSON is written. |
+| `--dt_target_return` | `None` | DT only: overrides `target_returns[0]` from the run config. |
 
-Do `config.yaml` do checkpoint são lidos `env`, `command_type`, `dataset_id` e `seed`
-(o DT chama o primeiro de `env_name`; os dois nomes são aceitos). A arquitetura do ator
-**não** é lida do config — vem dos próprios pesos. A única exceção é o DT, cujo
-transformer não é reconstruível a partir da árvore de pesos: dele também são lidos
+`env`, `command_type`, `dataset_id` and `seed` are read from the checkpoint's
+`config.yaml` (DT calls the first one `env_name`; both names are accepted). The actor
+architecture is **not** read from the config; it comes from the weights themselves. The
+one exception is DT, whose transformer can't be rebuilt from the weight tree, so
 `seq_len`, `episode_len`, `reward_scale`, `target_returns`, `embedding_dim`,
-`num_layers`, `num_heads` e os três dropouts.
+`num_layers`, `num_heads` and the three dropouts are read too.
 
-### Suítes disponíveis
+### Available suites
 
-| Nome | Origem | Papel |
+| Name | Source | Role |
 | --- | --- | --- |
-| `default` | env nominal | Baseline do SRR (com ruído de sensor nativo). |
-| `disabled` | sem ruído | Piso de ruído do protocolo. |
-| `full`, `only_domain` | randomizador do Playground | Fracos demais para stress test. `only_domain` usa `disabled` como baseline. |
-| `example` | `configs/randomize/example.yaml` | Suíte de exemplo. |
-| `humanoid_gym` | `configs/randomize/humanoid_gym.yaml` | Degrau "strong" (Tabela III do paper). |
-| `humanoid_gym_medium` | `configs/randomize/humanoid_gym_medium.yaml` | **Degrau primário** de avaliação. |
+| `default` | nominal env | SRR baseline (with the env's native sensor noise). |
+| `disabled` | no noise | Noise floor of the protocol. |
+| `full`, `only_domain` | Playground randomizer | Too weak for a stress test. `only_domain` uses `disabled` as its baseline. |
+| `example` | `configs/randomize/example.yaml` | Example suite. |
+| `humanoid_gym` | `configs/randomize/humanoid_gym.yaml` | "Strong" level: the training ranges of Humanoid-Gym (Gu et al., 2024), Table III. |
+| `humanoid_gym_medium` | `configs/randomize/humanoid_gym_medium.yaml` | "Medium" level with absolute ranges, calibrated on the Go2. |
+| `humanoid_gym_relative` | `configs/randomize/humanoid_gym_relative.yaml` | **Default SRR suite** (`run_srr_eval.sh` and the training proxy). |
 
-### Métricas por suíte
+`humanoid_gym_relative` is `humanoid_gym_medium` with its physical ranges expressed
+relative to the robot, so a single suite has comparable strength on Go2, G1 and H1:
+
+- **friction**: a `U(0.5, 1.667)` scale of the env's default floor friction (on the Go2,
+  μ = 0.6, this is exactly `medium`'s absolute `U(0.3, 1.0)`);
+- **payload**: ±6.576% of the total mass on body 1 (`additive_total` type), i.e. ±1.0 kg
+  on the Go2, ±2.2 kg on the G1 and ±3.4 kg on the H1;
+- motor strength, sensor noise (absolute, in rad and rad/s) and the 0–1 control-step
+  delay are the same as `medium`.
+
+On the Go2 envs both suites sample the same distributions.
+
+### Per-suite metrics
 
 `score`, `score_std`, `score_median`, `n_episodes`, `srr` (= score / baseline), `gap`,
 `delta_mean`, `p5_delta`, `p5_retention`, `critical_rate_10`, `critical_rate_50`,
-`srr_ci_low`, `srr_ci_high` (bootstrap pareado, 1000 reamostragens, requer `scipy`).
+`srr_ci_low`, `srr_ci_high` (paired bootstrap, 1000 resamples, requires `scipy`).
 
-O score é normalizado no padrão D4RL (`return_min`/`return_expert` da metadata do Minari)
-quando o config traz `dataset_id`; sem ele, são retornos brutos e o script avisa.
+The score is D4RL-normalized (`return_min`/`return_expert` from the Minari metadata, on a
+0–1 scale) when the config has a `dataset_id`; without one, scores are raw returns and
+the script warns.
 
-### Saída
+> **Ratio metrics need a policy that learned the task.** When the `default` score is
+> below about 0.05, every ratio metric degenerates: a policy that fails **equally** in
+> both conditions gets SRR 1.0, and with a baseline ≈ 0 or negative the ratio blows up or
+> flips sign. Leave those runs out before comparing SRR.
 
-`logs/compare/metrics/<run>.json`, onde `<run>` é o nome do diretório do checkpoint, ou
-`<diretório>@<passo>` quando o alvo é um `.npz` intermediário. O JSON guarda também
-`episode_returns` por suíte, para recomputar métricas sem simular de novo.
+### Output
 
-### Reconstrução da política (ponto sensível)
+`logs/compare/metrics/<run>.json`, where `<run>` is the checkpoint directory name, or
+`<directory>@<step>` when the target is an intermediate `.npz`. The JSON also stores
+`episode_returns` per suite, so metrics can be recomputed without simulating again.
 
-`build_policy` remonta um ator determinístico **a partir da árvore de pesos**, despachando
-por estrutura e não por nome de diretório:
+### Policy reconstruction (sensitive)
 
-| Detecção | Algoritmo | Forward |
+`build_policy` rebuilds a deterministic actor **from the weight tree**, dispatching on
+structure rather than on the directory name:
+
+| Detection | Algorithm | Forward |
 | --- | --- | --- |
-| chave `policy_params` | CQL | `base_network` → `split(out, 2)` → `tanh(mean)` |
-| `log_stds` nos params | IQL / AWAC | `MLP_0` com ReLU em todas as camadas → `Dense_0` → `clip(mean, -1, 1)` |
-| caso contrário | BC / TD3+BC | `MLP_0` → `clip(max_action * tanh(x), -1, 1)` |
+| `policy_params` key | CQL | `base_network` → `split(out, 2)` → `tanh(mean)` |
+| `log_stds` in params | IQL / AWAC | `MLP_0` with ReLU on every layer → `Dense_0` → `clip(mean, -1, 1)` |
+| otherwise | BC / TD3+BC | `MLP_0` → `clip(max_action * tanh(x), -1, 1)` |
 
-> **Atenção:** BC, TD3-BC, AWAC e IQL compartilham a chave `actor_params`. Carregar todos
-> com a arquitetura do BC **não gera erro** (o Flax ignora params não requisitados) e
-> produz resultados silenciosamente errados. Qualquer refactor aqui precisa ser
-> revalidado contra `sim2real/checkpoint_{bc,td3_bc,iql,awac}.py`.
+> **Warning:** BC, TD3-BC, AWAC and IQL all use the `actor_params` key. Loading every one
+> of them with the BC architecture raises **no error** (Flax ignores params it doesn't ask
+> for) and silently produces wrong results. Any refactor here must be revalidated against
+> `sim2real/checkpoint_{bc,td3_bc,iql,awac}.py`.
 
 ### Decision Transformer
 
-A chave `transformer_params` no `.npz` desvia para `build_dt_policy`, que remonta o
-`DecisionTransformer` do `dt_jax` com os hiperparâmetros do `config.yaml` do run e
-normaliza com `state_mean`/`state_std` (não `obs_mean`/`obs_std`).
+A `transformer_params` key in the `.npz` routes to `build_dt_policy`, which rebuilds
+`dt_jax`'s `DecisionTransformer` with the hyperparameters from the run's `config.yaml`
+and normalizes with `state_mean`/`state_std` (not `obs_mean`/`obs_std`).
 
-O rollout (`_rollout_dt`) é autoregressivo e espelha o de `dt_jax.evaluate`: janela
-deslizante de `seq_len` sobre (timesteps, estados, ações, *returns-to-go*), RTG
-inicializado em `target_return * reward_scale` e **decrementado pela recompensa
-observada a cada passo**, normalização de estado **sem epsilon**. Os três detalhes
-precisam bater com o treino.
+The rollout (`_rollout_dt`) is autoregressive and mirrors `dt_jax.evaluate`: a sliding
+window of `seq_len` over (timesteps, states, actions, returns-to-go), RTG initialized to
+`target_return * reward_scale` and **decremented by the observed reward at every step**,
+and state normalization **without epsilon**. All three details must match training.
 
-> O `proxy.evaluate` chamado no fim de cada treino roda este mesmo `compare_randomize`
-> (mesma suíte, 100 episódios / 50 atores) sobre o `checkpoint_final.npz`, então as
-> métricas `eval/proxy_results/*` no wandb são as mesmas do JSON. Runs de antes dessa
-> mudança usavam um adaptador de DT próprio, com RTG **constante**, e a suíte
-> `humanoid_gym` em escala ×100; esses números não são comparáveis com os atuais.
-
-Validação (2026-09-26, 4 episódios): `DT-Go2JoystickFlatTerrain-87131cbc` (expert) dá
-1.01 ± 0.03 no `default`, e o `medium-replay` do mesmo env dá -0.02 — ou seja, o
-rollout discrimina política boa de política que não aprendeu.
+> The `proxy.evaluate` call at the end of each training run uses this same
+> `compare_randomize` (`default` + `humanoid_gym_relative`, 100 episodes / 50 actors) on
+> `checkpoint_final.npz`, so the `eval/proxy_results/*` metrics in W&B are the same as
+> the JSON.
 
 ---
 
 ## `run_srr_eval.sh`
 
-Varre `checkpoints/<ALGO>/<ALGO>-<ENV>-*/` e avalia cada run. Resume baseado na existência
-do JSON de métricas (escrito só no fim, então run interrompido é refeito).
+Walks `checkpoints/<ALGO>/<ALGO>-<ENV>-*/` and scores each run. Resume is keyed on the
+metrics JSON (written only at the end, so an interrupted run is redone).
 
 ```bash
 ALGOS="IQL CQL" EPISODES=50 ./scripts/run_srr_eval.sh
 ```
 
-| Variável | Padrão |
+| Variable | Default |
 | --- | --- |
-| `ALGOS` | `AWAC CQL IQL TD3-BC DT` |
-| `ENVS` | `Go2JoystickFlatTerrain Go2PushRecovery Go2RoughCurriculum` |
-| `SUITE` | `humanoid_gym_medium` |
+| `ALGOS` | `BC AWAC CQL IQL TD3-BC DT` |
+| `ENVS` | the nine envs in [Supported envs](#supported-envs) |
+| `SUITE` | `humanoid_gym_relative` |
 | `EPISODES` | `100` |
 | `ACTORS` | `50` |
+| `REPO_ROOT` | repo root (derived from the script's path) |
 
-Só esses três envs compartilham o layout de observação assumido pelas suítes; os demais
-são rejeitados pela trava em `algorithms/utils/randomize_gym.py`. BC fica fora do padrão
-por ter sido avaliado em rodada própria (89 runs); para incluí-lo, `ALGOS="BC"`.
-
-Saídas: `logs/compare/metrics/*.json` e logs de texto em `logs/compare/algorithms/`.
+Outputs: `logs/compare/metrics/*.json` and text logs in `logs/compare/algorithms/`.
 
 ---
 
-## `run_srr_phases.sh`
+## `recover_proxy.py`
 
-Roteiro das fases 2 e 3 do estudo, sempre `default` vs `humanoid_gym_medium`. Pula logs já
-completos (procura por `RESULTADOS` no arquivo).
-
-- **Fase 2 — cobertura cross-tier:** `BC-Go2PushRecovery-*` e `BC-Go2RoughCurriculum-*`
-  (4 datasets × 2 seeds), 50 atores / 100 episódios → `logs/compare/phase2/<run>.txt`.
-- **Fase 3 — sweep de checkpoints:** um a cada dois `checkpoint_[0-9]*.npz` de
-  `BC-Go2JoystickFlatTerrain-59e9c78e` e `-9c6e818a`, 50 atores / 50 episódios →
-  `logs/compare/sweep/<run>__checkpoint_<passo>.txt`.
-
----
-
-## `run_compare_randomize_all.sh`
-
-Runner legado: roda **todas** as suítes em **todo** diretório direto de `checkpoints/*/`,
-em CPU (`JAX_PLATFORMS=cpu`, `uv run`), com `--render True`, e redireciona a saída para
-`logs/compare/<nome>.txt`. Não tem resume nem filtro de env. Prefira `run_srr_eval.sh`.
-
----
-
-## `publish_metrics.py`
-
-Funde as duas fontes de resultado em uma tabela plana e, opcionalmente, publica no
-Hugging Face.
+Finishes runs that trained to completion but died in the end-of-training proxy evaluation
+(for example, no `ffmpeg` on the node when saving the video), before logging the metrics
+and saving `checkpoint_final.npz`. Nothing is retrained.
 
 ```bash
-python scripts/publish_metrics.py          # dry-run: só escreve o CSV local
-python scripts/publish_metrics.py --push   # envia para o HF
+uv run python -m scripts.recover_proxy logs/matrix/bc-go2-footstand-medium-seed2.log [...]
 ```
 
-- Fontes: `logs/compare/metrics/*.json` (`precision="full"`) e os logs de texto antigos em
-  `logs/compare/{after,medium,phase2,sweep}/*.txt` (`precision="2dp"`, parseados por regex).
-  Em conflito na chave `(checkpoint, checkpoint_step, suite)`, o JSON sempre vence.
-- Metadados dos logs antigos (`env`, `dataset_id`, `train_seed`) são recuperados de
-  `checkpoints/BC/<run>/config.yaml`.
-- Saída local: `logs/compare/sim2real_metrics.csv`.
-- Destino remoto: dataset repo **privado** `akcit-rl/offline-benchmark`, arquivo
-  `sim2real/metrics.csv`.
+For each training log (`<algo>-<task>-<difficulty>-seed<N>.log`), it:
 
-### Colunas
+1. promotes the last periodic checkpoint to `checkpoint_final.npz`, **only** if its step
+   is the final training step (otherwise the run is considered unfinished and fails);
+2. runs `proxy.evaluate`, or reuses the JSON in `logs/compare/metrics/` if it was written
+   after the final checkpoint with the same suite and budget (100 episodes / 50 actors);
+3. resumes the **same** W&B run (URL and `Checkpoints path` read from the log), logs
+   `eval/proxy_results/*` and the rollout video, and finishes the run;
+4. creates `.done_runs/<group>-seed<N>.done`, so the runner skips that training.
 
-Identificação: `algorithm`, `env`, `task`, `dataset`, `train_seed`, `checkpoint`,
-`checkpoint_step`, `suite`, `n_episodes`, `precision`, `source`.
-Métricas: as mesmas de `compare_randomize.py` (`METRIC_COLS`).
-Guarda: `nominal_score` e `ratio_valid`.
+`run_offline_all.sh` calls this script on its own when a training run ends without the
+SRR JSON; running it by hand is only needed for logs from older sweeps.
 
-> `ratio_valid = nominal_score >= DEGENERATE_NOMINAL` (0.05). Abaixo desse piso toda
-> métrica de razão degenera — uma política que falha **igual** nas duas condições recebe
-> SRR 1.0, e com nominal ≈ 0 ou negativo a razão explode ou inverte de sinal. Filtre por
-> `ratio_valid` antes de comparar SRR.
+Supports the MLP trainers and DT (the DT video isn't re-recorded). `--device` defaults to
+`cuda`. Exits with status 1 if any log fails.
 
 ---
 
-## `wandb_seed_matrix.py`
+## `check_randomize_envs.py`
 
-Matriz de cobertura de seeds (algoritmo × task × dificuldade) a partir do projeto wandb
-`akcit-offlinerl/Offline-Benchmark`, cruzada com `configs/offline/_datasets.yaml`.
+Validates the `humanoid_gym_relative` suite on every env in `OBS_LAYOUTS`. Run it after
+adding or changing a layout.
 
 ```bash
-export WANDB_API_KEY=...
-python scripts/wandb_seed_matrix.py --target 5 --markdown
-python scripts/wandb_seed_matrix.py --offline          # reusa o cache, sem chamar a API
+uv run python -m scripts.check_randomize_envs
+uv run python -m scripts.check_randomize_envs --envs Go2Getup H1JoystickGaitTracking
 ```
 
-| Flag | Padrão | Descrição |
-| --- | --- | --- |
-| `--target` | `5` | Seeds desejadas por célula. |
-| `--project` | `akcit-offlinerl/Offline-Benchmark` | — |
-| `--cache` | `/tmp/wandb_runs.json` | Onde o dump dos runs é gravado/lido. |
-| `--offline` | `False` | Lê só o cache. |
-| `--markdown` | `False` | Tabela em Markdown em vez de colunas alinhadas. |
+For each env:
 
-O triplo `(task, difficulty, seed)` vem da **metadata** do run (`--dataset_id` / `--seed`
-na linha de comando registrada), porque os scripts de treino não enviam config para o
-wandb e os runs antigos têm `--group` quebrado. Runs não `finished` ou sem metadata são
-contados como ignorados.
+1. **layout**: with the env's own sensor noise off, every `OBS_LAYOUTS` slice (and mirror)
+   equals the simulator quantity it claims to hold;
+2. **obs**: the suite perturbs exactly the mapped slices, leaves every other entry
+   untouched and moves each mirror by the same amount;
+3. **domain**: friction, payload and motor strength stay inside the suite's relative
+   ranges and change nothing else;
+4. **rollout**: the `GymWrapper` runs the suite end to end with finite observations.
+
+It's CPU-heavy (JIT + MJX rollouts); on a cluster, run it as a batch job.

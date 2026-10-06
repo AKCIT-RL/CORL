@@ -13,8 +13,10 @@ set -uo pipefail
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$REPO_ROOT"
 export MINARI_DATASETS_PATH="${MINARI_DATASETS_PATH:-$REPO_ROOT/datasets}"
+# The uv environment: .venv by default, UV_PROJECT_ENVIRONMENT when set.
+PY="${UV_PROJECT_ENVIRONMENT:-$REPO_ROOT/.venv}/bin/python"
 
-ALGOS="${ALGOS:-AWAC CQL IQL TD3-BC DT}"
+ALGOS="${ALGOS:-BC AWAC CQL IQL TD3-BC DT}"
 ENVS="${ENVS:-Go2JoystickFlatTerrain Go2PushRecovery Go2RoughCurriculum Go2Getup Go2GetupWalk Go2Footstand Go2Handstand G1JoystickFlatTerrain H1JoystickGaitTracking}"
 SUITE="${SUITE:-humanoid_gym_relative}"
 EPISODES="${EPISODES:-100}"
@@ -34,7 +36,7 @@ for algo in $ALGOS; do
 done
 
 total=${#todo[@]}
-echo "fila: $total checkpoints | suites: default + $SUITE | $EPISODES episodios"
+echo "queue: $total checkpoints | suites: default + $SUITE | $EPISODES episodes"
 started=$(date +%s)
 failed=0
 
@@ -49,13 +51,13 @@ for i in "${!todo[@]}"; do
   fi
 
   echo "$pos run   $name"
-  if ! .venv/bin/python -m scripts.compare_randomize \
+  if ! "$PY" -m scripts.compare_randomize \
       --checkpoint_path "$d" --device cuda \
       --n_actors "$ACTORS" --n_episodes "$EPISODES" \
       --configs "$SUITE" > "$LOG_DIR/$name.txt" 2>&1; then
     failed=$((failed + 1))
-    echo "         FALHOU: $(tail -3 "$LOG_DIR/$name.txt" | tr '\n' ' ' | cut -c1-150)"
+    echo "         FAILED: $(tail -3 "$LOG_DIR/$name.txt" | tr '\n' ' ' | cut -c1-150)"
   fi
 done
 
-echo "TERMINOU em $(((($(date +%s) - started)) / 60)) min | falhas: $failed"
+echo "done in $(((($(date +%s) - started)) / 60)) min | failures: $failed"

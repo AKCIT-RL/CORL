@@ -776,7 +776,7 @@ def record_dt_video(
     state_std: Any = 1,
 ):
     """Roll out the DT policy for a single episode and save an mp4 of it."""
-    # Headless rendering backend (matches algorithms/utils/save_video.py).
+    # Headless rendering backend (matches randomize_gym.record_policy_video).
     os.environ.setdefault("MUJOCO_GL", "egl")
 
     render_trajectory = []
@@ -847,7 +847,7 @@ def record_dt_video(
         ):
             break
 
-    # Establish a headless GL context before rendering (mirrors save_video.py).
+    # Establish a headless GL context before rendering (mirrors record_policy_video).
     try:
         import mujoco.egl
 

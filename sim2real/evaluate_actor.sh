@@ -1,28 +1,58 @@
-# # Record and save an mp4 video
-python evaluate_actor.py --pickle-path actor-BC-Go2JoystickFlatTerrain-4bb13594.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
-python evaluate_actor.py --pickle-path actor-BC-Go2JoystickFlatTerrain-6a6ba0be.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
-python evaluate_actor.py --pickle-path actor-BC-Go2JoystickFlatTerrain-fd4e6c50.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
+#!/usr/bin/env bash
+# Evaluate exported actors in simulation and record a video of each one.
+#
+# The env of each actor is read from its metadata. Optional settings:
+#   N_EPISODES    episodes per actor (default 20)
+#   COMMAND_TYPE  joystick command, e.g. forwardfixed (default: evaluate_actor.py's)
+#   VIDEO_DIR     where videos go (default ./videos)
+#   RANDOMIZE=1   turn on the Playground domain randomizer
+#
+# Usage:
+#   ./sim2real/evaluate_actor.sh actor-*.pkl
+#   COMMAND_TYPE=forwardfixed N_EPISODES=5 ./sim2real/evaluate_actor.sh actor-BC-Go2JoystickFlatTerrain-1a2b3c4d.pkl
+set -euo pipefail
 
-python evaluate_actor.py --pickle-path actor-AWAC-Go2JoystickFlatTerrain-b1f58c5a.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
-python evaluate_actor.py --pickle-path actor-AWAC-Go2JoystickFlatTerrain-9a9a0a54.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
-python evaluate_actor.py --pickle-path actor-AWAC-Go2JoystickFlatTerrain-f69a2d43.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
+if [[ "$#" -lt 1 ]]; then
+  echo "usage: $0 <actor.pkl> [actor.pkl ...]" >&2
+  exit 2
+fi
 
-python evaluate_actor.py --pickle-path actor-IQL-Go2JoystickFlatTerrain-170a3036.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
-python evaluate_actor.py --pickle-path actor-IQL-Go2JoystickFlatTerrain-f1ba53bb.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
-python evaluate_actor.py --pickle-path actor-IQL-Go2JoystickFlatTerrain-2aadc1c4.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
+SIM2REAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(dirname "$SIM2REAL_DIR")"
+# The uv environment: .venv by default, UV_PROJECT_ENVIRONMENT when set.
+PY="${UV_PROJECT_ENVIRONMENT:-$REPO/.venv}/bin/python"
 
-python evaluate_actor.py --pickle-path actor-TD3BC-Go2JoystickFlatTerrain-9da07408.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
-python evaluate_actor.py --pickle-path actor-TD3BC-Go2JoystickFlatTerrain-68c5bf5c.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
-python evaluate_actor.py --pickle-path actor-TD3BC-Go2JoystickFlatTerrain-9073de6c.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
+# env_name stored in actor $1's metadata.
+actor_env() {
+  "$PY" - "$SIM2REAL_DIR" "$1" <<'PY'
+import sys
 
-python evaluate_actor.py --pickle-path actor-PPOExpert-Go2JoystickFlatTerrain-20250904-225910-212M.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
-python evaluate_actor.py --pickle-path actor-PPOExpert-Go2JoystickFlatTerrain-20250904-225910-265M.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
-python evaluate_actor.py --pickle-path actor-PPOExpert-Go2JoystickFlatTerrain-20250904-225910-last.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
+sys.path.insert(0, sys.argv[1])
+from portable_actor import load_actor
 
-python evaluate_actor.py --pickle-path actor-PPOExpert-Go2JoystickRoughTerrain-20250905-054419-212M.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
-python evaluate_actor.py --pickle-path actor-PPOExpert-Go2JoystickRoughTerrain-20250905-054419-265M.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
-python evaluate_actor.py --pickle-path actor-PPOExpert-Go2JoystickRoughTerrain-20250905-054419-last.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
+print(load_actor(sys.argv[2]).get("env_name") or "")
+PY
+}
 
-python evaluate_actor.py --pickle-path actor-PPOExpert-Go2JoystickRoughTerrain-20260303-201251-212M.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
-python evaluate_actor.py --pickle-path actor-PPOExpert-Go2JoystickRoughTerrain-20260303-201251-265M.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
-python evaluate_actor.py --pickle-path actor-PPOExpert-Go2JoystickRoughTerrain-20260303-201251-last.pkl --env-name Go2JoystickFlatTerrain --command-type forward_realrobot --render --save-video --video-dir ./videos
+failed=()
+for pkl in "$@"; do
+  env="$(actor_env "$pkl")"
+  if [[ -z "$env" ]]; then
+    echo "no env_name in $pkl" >&2
+    failed+=("$pkl")
+    continue
+  fi
+  args=(--pickle-path "$pkl" --env-name "$env"
+        --n-episodes "${N_EPISODES:-20}" --save-video --video-dir "${VIDEO_DIR:-./videos}")
+  [[ -n "${COMMAND_TYPE:-}" ]] && args+=(--command-type "$COMMAND_TYPE")
+  [[ "${RANDOMIZE:-0}" == "1" ]] && args+=(--randomize)
+
+  echo "=== $pkl ($env)"
+  "$PY" "$SIM2REAL_DIR/evaluate_actor.py" "${args[@]}" || failed+=("$pkl")
+done
+
+if [[ "${#failed[@]}" -gt 0 ]]; then
+  echo "${#failed[@]} failure(s):" >&2
+  printf '  %s\n' "${failed[@]}" >&2
+  exit 1
+fi

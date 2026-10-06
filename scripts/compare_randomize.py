@@ -304,7 +304,7 @@ def load_checkpoint(
    env: GymWrapper
 ) -> Tuple[Callable[[jnp.ndarray], jnp.ndarray] | _DTPolicy, np.ndarray, np.ndarray]:
    checkpoint_path = parse_checkpoint_path(attrs.checkpoint_path)
-   print("Carregando checkpoint de:", checkpoint_path)
+   print("Loading checkpoint from:", checkpoint_path)
 
    checkpoint = np.load(checkpoint_path, allow_pickle=True)
 
@@ -465,9 +465,8 @@ def _normalize_returns(env: GymWrapper, episode_returns: List[float]) -> np.ndar
    for ret in returns:
       normalized = env.get_normalized_score(ret)
       if normalized is not None:
-         # 0-1 scale, NOT the x100 used in the training logs: the published
-         # table merges these JSONs with older .txt logs and publish_metrics
-         # calibrates DEGENERATE_NOMINAL against this scale.
+         # 0-1 scale, NOT the x100 used in the training logs: the SRR metrics
+         # and the 0.05 degenerate-nominal floor in the README use this scale.
          normalized_returns.append(float(normalized))
       else:
          normalized_returns.append(ret)
@@ -478,7 +477,7 @@ def _normalize_returns(env: GymWrapper, episode_returns: List[float]) -> np.ndar
 _BASELINE_OVERRIDE = {"only_domain": "disabled"}
 
 def print_results(data: Dict[str, np.ndarray]) -> Dict[str, Dict[str, float]]:
-   print(f"\n{'='*10} RESULTADOS {'='*10}")
+   print(f"\n{'='*10} RESULTS {'='*10}")
 
    metrics: Dict[str, Dict[str, float]] = {}
    for cfg_name, returns in data.items():
@@ -497,8 +496,8 @@ def print_results(data: Dict[str, np.ndarray]) -> Dict[str, Dict[str, float]]:
       }
       metrics[cfg_name] = stats
 
-      print(f"\nRandomização {cfg_name}:")
-      print(f" - Média: {stats['score']:.2f}")
+      print(f"\nSuite {cfg_name}:")
+      print(f" - Mean: {stats['score']:.2f}")
       print(f" - Std: {stats['score_std']:.2f}")
 
       if base_arr.size == 0:
@@ -509,7 +508,7 @@ def print_results(data: Dict[str, np.ndarray]) -> Dict[str, Dict[str, float]]:
       stats["srr"] = srr
       stats["gap"] = base_mean - stats["score"]
       print(f" - Baseline: {base_name}")
-      print(f" - Relação Randomizado / Baseline: {srr:.2f}")
+      print(f" - Randomized / baseline ratio: {srr:.2f}")
 
       if cfg_name != base_name:
          stats.update(evaluate_robustness(base_arr, arr))
@@ -519,14 +518,14 @@ def print_results(data: Dict[str, np.ndarray]) -> Dict[str, Dict[str, float]]:
    return metrics
 
 def evaluate_robustness(base_arr: np.ndarray, rand_arr: np.ndarray) -> Dict[str, float]:
-   print("\nAnálise de Robustez (Trajetórias Pareadas)...")
+   print("\nRobustness analysis (paired trajectories)...")
    
    deltas = rand_arr - base_arr
    mean_delta = float(np.mean(deltas))
-   p5_delta = float(np.percentile(deltas, 5))  # 5% piores quedas de desempenho
+   p5_delta = float(np.percentile(deltas, 5))  # the worst 5% of performance drops
    
-   print(f" - Variação Média (Delta): {mean_delta:+.2f}")
-   print(f" - Pior Caso (5º Percentil): {p5_delta:+.2f}")
+   print(f" - Mean change (Delta): {mean_delta:+.2f}")
+   print(f" - Worst case (5th percentile): {p5_delta:+.2f}")
 
    metrics: Dict[str, float] = {"delta_mean": mean_delta, "p5_delta": p5_delta}
    
@@ -541,10 +540,10 @@ def evaluate_robustness(base_arr: np.ndarray, rand_arr: np.ndarray) -> Dict[str,
    for threshold in (0.10, 0.50):
       rate = float(np.mean(rel_drops > threshold) * 100)
       metrics[f"critical_rate_{int(threshold * 100)}"] = rate
-      print(f" - Taxa de Queda Crítica (>{threshold:.0%} perda): {rate:.1f}%")
+      print(f" - Critical drop rate (>{threshold:.0%} loss): {rate:.1f}%")
    
    if np.allclose(base_arr, rand_arr):
-      print(" - IC 95% (Relação): [1.00, 1.00] (Trajetórias idênticas)")
+      print(" - 95% CI (ratio): [1.00, 1.00] (identical trajectories)")
       metrics["srr_ci_low"] = 1.0
       metrics["srr_ci_high"] = 1.0
       return metrics
@@ -568,7 +567,7 @@ def evaluate_robustness(base_arr: np.ndarray, rand_arr: np.ndarray) -> Dict[str,
       ci_high = float(res.confidence_interval.high)
       metrics["srr_ci_low"] = ci_low
       metrics["srr_ci_high"] = ci_high
-      print(f" - IC 95% (Relação): [{ci_low:.2f}, {ci_high:.2f}]")
+      print(f" - 95% CI (ratio): [{ci_low:.2f}, {ci_high:.2f}]")
    except (ImportError, ValueError):
       pass
 
@@ -588,10 +587,10 @@ def _run_identity(checkpoint_path: str) -> Tuple[str, Optional[int]]:
 
 def _main(attrs: CompareRandomizeAttributes):
    # Get config
-   print("Carregando configuração do checkpoint...")
+   print("Loading checkpoint config...")
    config = load_config(attrs)
    
-   print("Configuração carregada:")
+   print("Loaded config:")
    for field in fields(CompareRandomizeConfig):
       value = getattr(config, field.name)
       print(f" - {field.name}: {value}")
@@ -603,7 +602,7 @@ def _main(attrs: CompareRandomizeAttributes):
    dataset_id = attrs.dataset_id or config.dataset_id
    dataset = minari.load_dataset(dataset_id) if dataset_id else None
    if dataset is None:
-      print("AVISO: sem dataset_id, os scores serão retornos brutos (não normalizados).")
+      print("WARNING: no dataset_id, scores are raw (unnormalized) returns.")
 
    run_name, ckpt_step = _run_identity(attrs.checkpoint_path)
 
@@ -633,7 +632,7 @@ def _main(attrs: CompareRandomizeAttributes):
       display_name = display_name or cfg_name
 
       print(f"\n {'='*10} Randomize Config: {display_name} {'='*10}")
-      print("\nCarregando ambiente...")
+      print("\nLoading env...")
 
       env = get_env(
          device=attrs.device, 
@@ -649,14 +648,14 @@ def _main(attrs: CompareRandomizeAttributes):
 
       # Get checkpoint
       if not policy:
-         print("Carregando checkpoint...")
+         print("Loading checkpoint...")
          policy, obs_mean, obs_std = load_checkpoint(
             attrs, config, env
          )
       else:
-         print("Checkpoint já carregado, reutilizando política...")
+         print("Checkpoint already loaded, reusing the policy...")
 
-      print("Executando política...")
+      print("Running policy...")
       base_returns = evaluate(
          policy, env, attrs.n_episodes, obs_mean, obs_std, render=attrs.render
       )
@@ -672,7 +671,7 @@ def _main(attrs: CompareRandomizeAttributes):
          timestamp = time.strftime("%Y%m%d-%H%M%S")
          filepath = f"{directory}/{display_name}-{timestamp}.mp4"
 
-         print(f"Salvando vídeo em: {filepath}")
+         print(f"Saving video to: {filepath}")
          env.save_video(render_trajectory, save_path=filepath)
          render_trajectory.clear()
 
@@ -708,7 +707,7 @@ def _main(attrs: CompareRandomizeAttributes):
    out_dir.mkdir(parents=True, exist_ok=True)
    out_path = out_dir / f"{run_name}.json"
    out_path.write_text(json.dumps(record, indent=2))
-   print(f"\nMétricas salvas em: {out_path}")
+   print(f"\nMetrics saved to: {out_path}")
    return record
 
 def main():

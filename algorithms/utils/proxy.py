@@ -1,6 +1,6 @@
 """Sim2real proxy evaluation of a finished training run.
 
-Runs exactly the evaluation of scripts/run_srr_eval.sh / run_srr_matrix.sh
+Runs exactly the evaluation of scripts/run_srr_eval.sh
 (scripts/compare_randomize.py: same suite, rollout budget, normalization and
 metrics) on the run's final checkpoint, so the numbers logged to W&B at the end
 of training are the same ones the SRR table is built from.
@@ -21,7 +21,7 @@ from algorithms.utils.randomize_gym import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Same defaults as scripts/run_srr_eval.sh and scripts/run_srr_matrix.sh.
+# Same defaults as scripts/run_srr_eval.sh.
 SRR_SUITE = "humanoid_gym_relative"
 SRR_EPISODES = 100
 SRR_ACTORS = 50
@@ -81,7 +81,7 @@ def evaluate(
    The checkpoint is picked the same way as the SRR scripts do (checkpoint_final.npz,
    else the highest step). Envs outside the supported observation layout get only
    the `default` baseline; that partial record is written next to the checkpoint
-   instead of logs/compare/metrics, so the SRR matrix still treats the run as pending.
+   instead of logs/compare/metrics, so run_srr_eval.sh still treats the run as pending.
    """
    supported = suite_supported(env_name)
    record = compare_main(CompareRandomizeAttributes(

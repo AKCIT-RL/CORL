@@ -1,4 +1,7 @@
+.venv/
 checkpoints/
-experts_checkpoints/
-wandb/
 datasets/
+logs/
+videos/
+wandb/
+expert/logs/
