@@ -1,7 +1,7 @@
 # `expert/` — expert policies (PPO)
 
 Trains the expert policies for the benchmark tasks with PPO (Brax) on the
-[MuJoCo Playground](https://github.com/AKCIT-RL/mujoco_playground) envs, evaluates the
+[MuJoCo Playground](https://github.com/ANONYMOUS/mujoco_playground) envs, evaluates the
 checkpoints and records rollout videos. To take an expert to the robot or to Isaac, export
 it with `sim2real/checkpoint_expert.py` (see [sim2real/README.md](../sim2real/README.md)).
 

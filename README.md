@@ -1,8 +1,8 @@
 # CORL (Clean Offline Reinforcement Learning)
 
-A fork of [corl-team/CORL](https://github.com/corl-team/CORL), adapted for an **offline RL benchmark on robotics locomotion tasks** built on top of [MuJoCo Playground](https://github.com/AKCIT-RL/mujoco_playground). It provides high-quality, single-file implementations of state-of-the-art offline reinforcement learning algorithms in **JAX**.
+A fork of [corl-team/CORL](https://github.com/corl-team/CORL), adapted for an **offline RL benchmark on robotics locomotion tasks** built on top of [MuJoCo Playground](https://github.com/ANONYMOUS/mujoco_playground). It provides high-quality, single-file implementations of state-of-the-art offline reinforcement learning algorithms in **JAX**.
 
-**Datasets:** Pre-collected trajectories are available on Hugging Face at [akcit-rl/playground](https://huggingface.co/datasets/akcit-rl/playground). The benchmark runner downloads any missing dataset automatically.
+**Datasets:** Pre-collected trajectories are available on Hugging Face at [anonymous/playground](https://huggingface.co/datasets/anonymous/playground). The benchmark runner downloads any missing dataset automatically.
 
 ## Key Features
 
@@ -19,7 +19,7 @@ A fork of [corl-team/CORL](https://github.com/corl-team/CORL), adapted for an **
 
 ## Benchmark Datasets
 
-Datasets live on disk under `datasets/playground/<task_id>/<difficulty>-v0` and mirror the Hugging Face repo [akcit-rl/playground](https://huggingface.co/datasets/akcit-rl/playground) one-to-one. Minari resolves them via the id `playground/<task_id>/<difficulty>-v0`.
+Datasets live on disk under `datasets/playground/<task_id>/<difficulty>-v0` and mirror the Hugging Face repo [anonymous/playground](https://huggingface.co/datasets/anonymous/playground) one-to-one. Minari resolves them via the id `playground/<task_id>/<difficulty>-v0`.
 
 ### Tasks
 
@@ -63,11 +63,11 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 **Install dependencies:**
 
 ```bash
-git clone https://github.com/AKCIT-RL/CORL.git && cd CORL
+git clone https://github.com/ANONYMOUS/CORL.git && cd CORL
 uv sync
 ```
 
-`uv sync` installs the pinned MuJoCo Playground fork ([AKCIT-RL/mujoco_playground](https://github.com/AKCIT-RL/mujoco_playground), branch `go2`) that provides the benchmark environments. The interpreter comes from `.python-version` (Python 3.13).
+`uv sync` installs the pinned MuJoCo Playground fork ([ANONYMOUS/mujoco_playground](https://github.com/ANONYMOUS/mujoco_playground), branch `go2`) that provides the benchmark environments. The interpreter comes from `.python-version` (Python 3.13).
 
 The SRR bootstrap confidence intervals need `scipy`, which lives in an optional group:
 
@@ -289,7 +289,7 @@ CORL/
 │   └── randomize/            # SRR perturbation suites (humanoid_gym_relative is the default)
 ├── scripts/                  # SRR evaluation and run recovery (see scripts/README.md)
 ├── datasets/
-│   └── playground/           # Local mirror of akcit-rl/playground
+│   └── playground/           # Local mirror of anonymous/playground
 ├── expert/                   # Expert policy training (PPO; see expert/README.md)
 ├── sim2real/                 # Export to portable NumPy actors for deployment (see sim2real/README.md)
 ├── run_offline_all.sh        # Sweep runner (task × difficulty)
@@ -312,7 +312,7 @@ CORL/
   - `imageio-ffmpeg` (ffmpeg fallback for video on nodes without a system ffmpeg)
   - `pyrallis==0.3.1`
   - `wandb==0.25.1`
-  - `playground` ([AKCIT-RL/mujoco_playground](https://github.com/AKCIT-RL/mujoco_playground), branch `go2`)
+  - `playground` ([ANONYMOUS/mujoco_playground](https://github.com/ANONYMOUS/mujoco_playground), branch `go2`)
 - **Optional:** `scipy` (`uv sync --group stats`) for SRR confidence intervals
 
 ---

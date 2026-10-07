@@ -120,7 +120,7 @@ mkdir -p "$METRICS_DIR" "$EVAL_LOG_DIR" "$TRAIN_LOG_DIR"
 
 # Manifest columns: dataset_id \x1f env \x1f command_type \x1f group \x1f target_returns \x1f eval_shift
 # Optional args filter by task_id. Datasets missing on disk are downloaded from
-# the Hugging Face hub (akcit-rl/playground) into DATA_ROOT before being emitted.
+# the Hugging Face hub (anonymous/playground) into DATA_ROOT before being emitted.
 manifest="$("$PY" - "$REGISTRY" "$DATA_ROOT" "$ALGO" "$@" <<'PY'
 import os, sys, yaml, json
 
@@ -130,7 +130,7 @@ algo = sys.argv[3]
 filters = set(sys.argv[4:])
 
 # datasets/playground mirrors this Hugging Face dataset repo one-to-one.
-HF_REPO = "akcit-rl/playground"
+HF_REPO = "anonymous/playground"
 
 
 def ensure_dataset(task, diff):

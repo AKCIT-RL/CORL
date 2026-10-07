@@ -490,7 +490,7 @@ requires-dist = [
     { name = "mujoco-mjx", specifier = "==3.6.0" },
     { name = "numpy", specifier = "<2.5" },
     { name = "pandas", specifier = "==2.3.2" },
-    { name = "playground", git = "https://github.com/AKCIT-RL/mujoco_playground.git?rev=go2" },
+    { name = "playground", git = "https://github.com/ANONYMOUS/mujoco_playground.git?rev=go2" },
     { name = "pyrallis", specifier = "==0.3.1" },
     { name = "torch", specifier = "==2.8.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "tqdm", specifier = "==4.67.1" },
@@ -514,7 +514,7 @@ isaac-test = [
     { name = "jax", extras = ["cuda12"], marker = "python_full_version == '3.11.13'", specifier = "==0.6.0" },
     { name = "minari", extras = ["all"], marker = "python_full_version == '3.11.13'", specifier = "==0.5.3" },
     { name = "numpy", marker = "python_full_version == '3.11.13'", specifier = "==1.26.0" },
-    { name = "playground", marker = "python_full_version == '3.11.13'", git = "https://github.com/AKCIT-RL/mujoco_playground.git?rev=go2" },
+    { name = "playground", marker = "python_full_version == '3.11.13'", git = "https://github.com/ANONYMOUS/mujoco_playground.git?rev=go2" },
     { name = "torch", marker = "python_full_version == '3.11.13'", specifier = "==2.8.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "tqdm", marker = "python_full_version == '3.11.13'", specifier = "==4.67.1" },
 ]
@@ -2467,7 +2467,7 @@ wheels = [
 [[package]]
 name = "playground"
 version = "0.2.0"
-source = { git = "https://github.com/AKCIT-RL/mujoco_playground.git?rev=go2#d3d38978039f3ba6e505f2a03e4070d41ba8bf2e" }
+source = { git = "https://github.com/ANONYMOUS/mujoco_playground.git?rev=go2#d3d38978039f3ba6e505f2a03e4070d41ba8bf2e" }
 dependencies = [
     { name = "absl-py" },
     { name = "brax" },

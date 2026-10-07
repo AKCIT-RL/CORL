@@ -33,7 +33,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 WORKDIR /CORL
 
 # Install exactly the package set locked in uv.lock (pyproject.toml + uv.lock are
-# the single source of truth). The `playground` fork (AKCIT-RL, rev go2) is also
+# the single source of truth). The `playground` fork (ANONYMOUS, rev go2) is also
 # installed from git here, as set in [tool.uv.sources].
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-install-project
