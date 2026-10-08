@@ -123,6 +123,50 @@ OBS_LAYOUTS: Dict[str, ObsLayout] = {
 }
 
 
+# Where a `geom_friction` scale lands:
+#   floor_contacts -- every floor contact's sliding friction moves by the same factor
+#                     as the floor (the default);
+#   floor_geom     -- only geom_friction[0, 0], as the suites evaluated before this
+#                     option existed did. G1 and H1 then never feel the low end of
+#                     the range (see floor_friction_targets); kept to reproduce them.
+FRICTION_TARGETS = ("floor_contacts", "floor_geom")
+
+
+def floor_friction_targets(model) -> Tuple[np.ndarray, np.ndarray]:
+    """Return ``(pair_ids, geom_ids)`` whose friction must follow the floor's.
+
+    MuJoCo does not always use the floor's own coefficient for a floor contact:
+      * an explicit <pair> carries its own friction (G1: both feet, mu = 0.6);
+      * for geom contacts, the higher-priority geom wins, and equal priorities take
+        the max (H1: floor and feet both mu = 1.0, so the max floors any decrease).
+    Scaling those pairs, and the partners that are not outranked by the floor, by
+    the floor's factor gives every floor contact s * its nominal coefficient:
+    max(s*a, s*b) = s*max(a, b). Lower-priority partners (Go2 feet) need nothing.
+
+    Read from the static model, as MJX's collision driver builds its contacts, so a
+    partner's priority cannot itself be randomized.
+    """
+    # The pair list MJX itself collides, with excludes and pair overrides applied.
+    from mujoco.mjx._src.collision_driver import geom_pairs
+
+    pairs = np.asarray(list(geom_pairs(model)), dtype=int).reshape(-1, 3)
+    floor = (pairs[:, 0] == 0) | (pairs[:, 1] == 0)
+    pair_ids = np.unique(pairs[floor & (pairs[:, 2] >= 0), 2])
+    geom = pairs[floor & (pairs[:, 2] < 0)]
+    partners = np.where(geom[:, 0] == 0, geom[:, 1], geom[:, 0])
+    priority = np.asarray(model.geom_priority)
+    geom_ids = np.unique(partners[priority[partners] >= priority[0]])
+    # Scaling a partner's own friction would leak into its non-floor contacts.
+    others = pairs[~floor & (pairs[:, 2] < 0)][:, :2]
+    leaked = np.intersect1d(geom_ids, others)
+    if leaked.size:
+        raise ValueError(
+            f"floor friction partners {leaked.tolist()} also touch other geoms; "
+            "scaling them would change contacts away from the floor"
+        )
+    return pair_ids, geom_ids
+
+
 def _concat_observation_dict(comp_dict: Dict[str, Any]) -> np.ndarray:
     """Concatenate component dictionary into the standard 48-dim observation vector.
     
@@ -200,6 +244,8 @@ class RandomizeConfigs:
     class RandomizeOptions:
         # Domain
         geom_friction: Optional[Callable[[Any, Any], jax.Array]] = None
+        # One of FRICTION_TARGETS; set from geom_friction's `target` in the YAML.
+        friction_target: str = "floor_contacts"
         dof_frictionloss: Optional[Callable[[Any, Any], jax.Array]] = None
         dof_armature: Optional[Callable[[Any, Any], jax.Array]] = None
         body_ipos: Optional[Callable[[Any, Any], jax.Array]] = None
@@ -332,8 +378,13 @@ class RandomizeConfigs:
             in_axes_replace = dict()
             model_replace_keys = []
             
+            friction_pairs = friction_geoms = np.zeros(0, dtype=int)
             if self.configs.geom_friction is not None:
                 model_replace_keys.append("geom_friction")
+                if self.configs.friction_target == "floor_contacts":
+                    friction_pairs, friction_geoms = floor_friction_targets(model)
+                    if friction_pairs.size:
+                        model_replace_keys.append("pair_friction")
             if self.configs.dof_frictionloss is not None:
                 model_replace_keys.append("dof_frictionloss")
             if self.configs.dof_armature is not None:
@@ -356,11 +407,19 @@ class RandomizeConfigs:
                 rng_key = single_rng
                 if self.configs.geom_friction is not None:
                     rng_key, key = jax.random.split(rng_key)
-                    res["geom_friction"] = model.geom_friction.at[0, 0].set(
-                        self.configs.geom_friction(
-                            model.geom_friction[0, 0], key
-                        )
-                    )
+                    mu0 = model.geom_friction[0, 0]
+                    mu = self.configs.geom_friction(mu0, key)
+                    friction = model.geom_friction.at[0, 0].set(mu)
+                    # Empty under floor_geom; otherwise every floor contact
+                    # follows the floor's factor (see floor_friction_targets).
+                    scale = mu / mu0
+                    friction = friction.at[friction_geoms, 0].multiply(scale)
+                    res["geom_friction"] = friction
+                    if friction_pairs.size:
+                        # both tangential slots: a pair stores 5 friction values
+                        res["pair_friction"] = model.pair_friction.at[
+                            friction_pairs, :2
+                        ].multiply(scale)
                 if self.configs.dof_frictionloss is not None:
                     rng_key, key = jax.random.split(rng_key)
                     res["dof_frictionloss"] = model.dof_frictionloss.at[6:].set(
@@ -697,7 +756,13 @@ def get_predefined_randomize_configs(
                     raise ValueError(f"Unknown component for noise randomization: {key}")
                 if cfg.get("type") == "additive_total" and key != "body_mass":
                     raise ValueError(f"'additive_total' is only defined for body_mass, got {key}")
-                
+                if "target" in cfg:
+                    if key != "geom_friction":
+                        raise ValueError(f"'target' is only defined for geom_friction, got {key}")
+                    if cfg["target"] not in FRICTION_TARGETS:
+                        raise ValueError(f"Unknown geom_friction 'target': {cfg['target']} (expected one of {FRICTION_TARGETS})")
+                    functions["friction_target"] = cfg["target"]
+
                 functions[key] = get_noise_fn(cfg)
 
             if "motor_strength" in functions and "actuator_gainprm" in functions:
