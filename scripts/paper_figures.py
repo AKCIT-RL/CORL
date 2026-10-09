@@ -4,11 +4,12 @@ Reads sim2real/metrics.csv from the Hugging Face dataset akcit-rl/offline-benchm
 (or a local copy via --csv) and writes:
 
   nominal_vs_perturbed.pdf  one panel per algorithm: nominal vs. perturbed score of
-                            every checkpoint, the identity line and the joint linear fit.
+                            every checkpoint, the identity line, the joint linear fit
+                            and the band N < 0.05 where the SRR is not computed.
   srr_decomposition.pdf     SRR of every valid checkpoint grouped by task (top) and by
                             algorithm (bottom) on a shared axis, with group means.
 
-Conventions match visao_geral_repositorios.md: suite humanoid_gym_relative, the
+Conventions match visao_geral_repositorios.md: suite humanoid_gym_relative_v2, the
 orphan row DT-H1JoystickGaitTracking-f12bb1c4 is dropped, the AWAC run without a
 score counts as nominal = perturbed = 0, and SRR uses only ratio_valid rows.
 
@@ -26,8 +27,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-SUITE = "humanoid_gym_relative"
+SUITE = "humanoid_gym_relative_v2"  # v1 on Go2 + friction fix on G1/H1 (scripts/merge_srr_v2.py)
 ORPHAN = "DT-H1JoystickGaitTracking-f12bb1c4"
+FLOOR = 0.05  # SRR eligibility threshold on the nominal score
 ALGOS = ["IQL", "DT", "BC", "AWAC", "TD3-BC", "CQL"]  # nominal ranking order
 
 # Reference palette (dataviz skill), validated on the light surface.
@@ -79,6 +81,7 @@ def nominal_vs_perturbed(df, out):
     fig, axes = plt.subplots(1, 6, figsize=(7.0, 1.55), sharex=True, sharey=True)
     for ax, algo in zip(axes, ALGOS):
         style(ax)
+        ax.axvspan(lo, FLOOR, color=GRID, alpha=0.6, linewidth=0, zorder=0)
         rest = df[df["algorithm"] != algo]
         mine = df[df["algorithm"] == algo]
         ax.scatter(rest["nominal_score"], rest["score"], s=3, color=CONTEXT, linewidths=0, zorder=1)
@@ -101,9 +104,10 @@ def nominal_vs_perturbed(df, out):
         plt.Line2D([], [], marker="o", linestyle="", markersize=3, color=BLUE, label="Checkpoints of the algorithm"),
         plt.Line2D([], [], marker="o", linestyle="", markersize=3, color=CONTEXT, label="Other algorithms"),
         plt.Line2D([], [], color=INK_2, linewidth=0.7, linestyle=(0, (3, 2)), label="Perturbed = nominal"),
-        plt.Line2D([], [], color=ORANGE, linewidth=1.0, label=f"Joint fit: P = {a:.2f} N + {b:.2f}"),
+        plt.Line2D([], [], color=ORANGE, linewidth=1.0, label=f"Joint fit: P = {a:.2f} N + {b:.3f}"),
+        plt.matplotlib.patches.Patch(color=GRID, alpha=0.6, label=f"N < {FLOOR}: no SRR"),
     ]
-    fig.legend(handles=handles, loc="upper center", ncol=4, frameon=False, bbox_to_anchor=(0.5, 1.08))
+    fig.legend(handles=handles, loc="upper center", ncol=5, frameon=False, bbox_to_anchor=(0.5, 1.08))
     fig.tight_layout(pad=0.3, w_pad=0.4)
     path = os.path.join(out, "nominal_vs_perturbed.pdf")
     fig.savefig(path, bbox_inches="tight")
@@ -126,7 +130,7 @@ def srr_decomposition(df, out):
     rng = np.random.default_rng(0)
 
     fig, (ax_t, ax_a) = plt.subplots(
-        2, 1, figsize=(3.33, 3.4), sharex=True,
+        2, 1, figsize=(3.33, 3.0), sharex=True,
         gridspec_kw={"height_ratios": [len(task_order), len(algo_order)], "hspace": 0.32},
     )
     for ax, key, order, label in ((ax_t, "task", task_order, "By task"), (ax_a, "algorithm", algo_order, "By algorithm")):

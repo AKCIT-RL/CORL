@@ -1,12 +1,19 @@
 """All statistics reported in Section 4 of the paper, with confidence intervals.
 
 Inputs (analysis/paper_stats/inputs/):
-  runs.csv                 final nominal score (x100) and held-out score of the 720
-                           runs, from scripts/export_wandb_scores.py
+  runs.csv                 metadata of the 720 runs and the end-of-training scores
+                           (50 episodes), from scripts/export_wandb_scores.py
+  heldout_metrics.csv      held-out regime of the disturbed-locomotion tier, scored by
+                           the SRR pipeline (100 episodes per arm), from
+                           scripts/unpaired_srr_metrics.py --suite heldout
   sim2real_metrics.csv     published SRR evaluation (Hugging Face akcit-rl/offline-benchmark)
   unpaired_srr_metrics.csv per-checkpoint relative-degradation rates, from
                            scripts/unpaired_srr_metrics.py on the 720 metrics JSONs
   dataset_refs.csv         mean normalized score of each dataset and R_min / R_max
+
+Every nominal score comes from the nominal arm of the SRR evaluation (100 episodes),
+so that N is the same number in every section. The 50-episode end-of-training score
+of runs.csv is kept as score_50 but not used.
 
 Estimand (fixed benchmark, reviewer STAT-07): for an algorithm a,
   theta_a = (1/40) * sum over the 40 task x dataset cells of the mean over the
@@ -23,7 +30,8 @@ for each algorithm. Nominal and perturbed scores of a checkpoint are resampled
 together. For the SRR, only eligible checkpoints are resampled inside each cell,
 so the set of cells (the support) stays fixed in every draw. A secondary bootstrap
 resamples whole tasks. Percentile intervals are pointwise; for the 15 pairwise
-contrasts we also report Bonferroni-simultaneous intervals (level 1 - 0.05/15).
+contrasts we also report Bonferroni-simultaneous intervals (level 1 - 0.05/15),
+from their own B_bonf draws (default 50,000) on a separate random stream.
 
 Usage (from the CORL root):
   python -m scripts.paper_stats --inputs analysis/paper_stats/inputs \
@@ -38,8 +46,6 @@ import os
 import numpy as np
 import pandas as pd
 from scipy import stats
-import statsmodels.formula.api as smf
-from statsmodels.stats.anova import anova_lm
 
 ALGOS = ["BC", "TD3-BC", "AWAC", "IQL", "CQL", "DT"]
 TIERS = {
@@ -49,7 +55,7 @@ TIERS = {
     "go2-getup": 4, "go2-getup-walk": 4,
     "go2-push-recovery": 5, "go2-rough-terrain": 5,
 }
-SUITE = "humanoid_gym_relative"
+SUITE = "humanoid_gym_relative_v2"  # v1 on Go2 + friction fix on G1/H1 (scripts/merge_srr_v2.py)
 ORPHAN = "DT-H1JoystickGaitTracking-f12bb1c4"
 FLOOR = 0.05
 
@@ -99,12 +105,27 @@ def cell_weighted(df, value, by=("algorithm",)):
     return cells.groupby(level=list(range(len(by)))).mean()
 
 
-def load(inputs):
-    runs = pd.read_csv(os.path.join(inputs, "runs.csv"))
-    runs["tier"] = runs.task.map(TIERS)
+def load_checkpoints(inputs):
     m = pd.read_csv(os.path.join(inputs, "sim2real_metrics.csv"))
     ck = m[(m.suite == SUITE) & (m.checkpoint != ORPHAN)].copy()
     ck[["nominal_score", "score"]] = ck[["nominal_score", "score"]].fillna(0.0)
+    return ck
+
+
+def load_runs(inputs):
+    """runs.csv with `score` replaced by the 100-episode nominal arm of the SRR
+    evaluation (x100), and the 50-episode end-of-training score kept as score_50."""
+    runs = pd.read_csv(os.path.join(inputs, "runs.csv")).rename(columns={"score": "score_50"})
+    n = load_checkpoints(inputs).set_index("checkpoint").nominal_score * 100
+    runs["score"] = runs.run.map(n)
+    assert runs.score.notna().all()
+    runs["tier"] = runs.task.map(TIERS)
+    return runs
+
+
+def load(inputs):
+    runs = load_runs(inputs)
+    ck = load_checkpoints(inputs)
     ck = ck.rename(columns={"nominal_score": "N", "score": "P"})
     ck["valid"] = ck.N >= FLOOR
     ck["srr"] = np.where(ck.valid, ck.P / ck.N, np.nan)
@@ -152,6 +173,9 @@ def interaction_anova(runs):
     """Does the difference between algorithms vary across tasks? Classical F and
     a heteroskedasticity-robust (HC3) Wald F as sensitivity check. The residual
     spread differs a lot between algorithms, so the classical F may be optimistic."""
+    import statsmodels.formula.api as smf  # local: load_runs() is imported without statsmodels
+    from statsmodels.stats.anova import anova_lm
+
     model = smf.ols("score ~ C(algorithm) * C(task) + C(dataset)", data=runs).fit()
     tab = anova_lm(model, typ=2)
     row = tab.loc["C(algorithm):C(task)"]
@@ -252,6 +276,47 @@ def pairwise(ck, B, rng):
     return rows
 
 
+def pairwise_bonferroni(ck, B, rng):
+    """Bonferroni-simultaneous intervals (level 1 - 0.05/15) of the pairwise contrasts,
+    from their own B draws (reviewer MLR3-05: with 2,000 draws each tail of these
+    intervals rests on about three draws). Same resampling as pairwise(), and the same
+    draws for the same rng, with the cell means computed in NumPy so that B can be large."""
+    keys = ["algorithm", "task", "dataset"]
+    v = ck[ck.valid]
+
+    def cell_means(df, cols):
+        """(B, cells, len(cols)) bootstrap cell means and the (algorithm, task, dataset) of each cell."""
+        boot = StratifiedBootstrap(df, keys, rng)
+        sizes = np.array([len(g) for g in boot.groups])
+        starts = np.r_[0, np.cumsum(sizes)[:-1]]
+        vals = df[cols].to_numpy(float)
+        return boot, sizes, starts, vals, list(df.groupby(keys, sort=False).indices)
+
+    bc, sc, stc, vc, cells_c = cell_means(ck, ["N", "P"])
+    bv, sv, stv, vv, cells_v = cell_means(v, ["srr"])
+    mc = np.empty((B, len(cells_c), 2))
+    mv = np.empty((B, len(cells_v)))
+    for i in range(B):  # same order of rng calls as pairwise()
+        mc[i] = np.add.reduceat(vc[bc.draw()], stc, axis=0) / sc[:, None]
+        mv[i] = np.add.reduceat(vv[bv.draw()][:, 0], stv) / sv
+
+    col_c = {c: j for j, c in enumerate(cells_c)}
+    col_v = {c: j for j, c in enumerate(cells_v)}
+    out = {}
+    for a, b in itertools.combinations(ALGOS, 2):
+        rec = {}
+        td = sorted({c[1:] for c in cells_c if c[0] == a} & {c[1:] for c in cells_c if c[0] == b})
+        ia, ib = [col_c[(a, *c)] for c in td], [col_c[(b, *c)] for c in td]
+        dN = (mc[:, ia, 0] - mc[:, ib, 0]).mean(axis=1)
+        dP = (mc[:, ia, 1] - mc[:, ib, 1]).mean(axis=1)
+        tv = sorted({c[1:] for c in cells_v if c[0] == a} & {c[1:] for c in cells_v if c[0] == b})
+        dS = (mv[:, [col_v[(a, *c)] for c in tv]] - mv[:, [col_v[(b, *c)] for c in tv]]).mean(axis=1)
+        for name, d in (("N", dN), ("P", dP), ("SRR", dS), ("D_shift_interaction", dP - dN)):
+            rec[name] = ci_bonf(d)
+        out[f"{a} vs {b}"] = rec
+    return out
+
+
 def ranking(ck, B, rng):
     thN = cell_weighted(ck, "N")
     thP = cell_weighted(ck, "P")
@@ -339,6 +404,9 @@ def joint_anova(df, value, formula="C(task)*C(algorithm) + C(task)*C(dataset) + 
     """Type II sums of squares; shares are SS_effect / SS_total. Use the full
     interaction model only where every task x algorithm and task x dataset cell
     has data (the balanced 720 checkpoints); otherwise use the additive model."""
+    import statsmodels.formula.api as smf
+    from statsmodels.stats.anova import anova_lm
+
     model = smf.ols(f"{value} ~ {formula}", data=df).fit()
     X = model.model.exog
     assert np.linalg.matrix_rank(X) == X.shape[1], "rank-deficient design"
@@ -450,15 +518,22 @@ def algorithm_table(ck, B, rng):
     return out
 
 
-def heldout(runs, B, rng):
-    h = runs[runs.shifted.notna()]
+def heldout(runs, inputs, B, rng):
+    """Held-out over nominal score per cell. Both arms come from the same SRR run of
+    each checkpoint, so the nominal here is that run's own nominal arm (x100)."""
+    hm = pd.read_csv(os.path.join(inputs, "heldout_metrics.csv"))
+    h = runs[["run", "algorithm", "task", "dataset"]].merge(
+        hm[["checkpoint", "nominal_score", "perturbed_score"]], left_on="run", right_on="checkpoint")
+    assert len(h) == 144, f"expected the 144 runs of the tier, got {len(h)}"
+    h = h.assign(score=h.nominal_score * 100, shifted=h.perturbed_score * 100)
+    floor = FLOOR * 100
     out = {}
     for (a, t, d), g in h.groupby(["algorithm", "task", "dataset"]):
-        ratio = g.shifted.mean() / g.score.mean() if g.score.mean() > 5 else np.nan
+        ratio = g.shifted.mean() / g.score.mean() if g.score.mean() >= floor else np.nan
         draws = []
         for _ in range(B):
             s = g.iloc[rng.integers(0, len(g), len(g))]
-            draws.append(s.shifted.mean() / s.score.mean() if s.score.mean() > 5 else np.nan)
+            draws.append(s.shifted.mean() / s.score.mean() if s.score.mean() >= floor else np.nan)
         out[f"{a}|{t}|{d}"] = {"nominal": float(g.score.mean()), "heldout": float(g.shifted.mean()),
                                "ratio": (None if np.isnan(ratio) else float(ratio)),
                                "ratio_ci": (None if np.isnan(ratio) else ci(np.asarray(draws)[~np.isnan(draws)]))}
@@ -471,10 +546,12 @@ def main():
     parser.add_argument("--out", default="analysis/paper_stats/results")
     parser.add_argument("--B", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--B_bonf", type=int, default=50000,
+                        help="Draws for the Bonferroni-simultaneous intervals of the pairwise contrasts.")
     args = parser.parse_args()
     rng = np.random.default_rng(args.seed)
     runs, ck, refs = load(args.inputs)
-    res = {"config": {"B": args.B, "seed": args.seed, "floor": FLOOR, "suite": SUITE,
+    res = {"config": {"B": args.B, "B_bonf": args.B_bonf, "seed": args.seed, "floor": FLOOR, "suite": SUITE,
                       "versions": {"numpy": np.__version__, "pandas": pd.__version__,
                                    "scipy": __import__("scipy").__version__,
                                    "statsmodels": __import__("statsmodels").__version__}}}
@@ -501,9 +578,19 @@ def main():
     res["joint_anova_perturbed_score"] = joint_anova(ck, "P")
     res["sensitivity_srr"] = sensitivity(ck, refs)
     res["srr_by_nominal_level"] = srr_by_nominal_level(ck)
-    res["heldout"] = heldout(runs, args.B, rng)
+    if os.path.exists(os.path.join(args.inputs, "heldout_metrics.csv")):
+        res["heldout"] = heldout(runs, args.inputs, args.B, rng)
+    else:
+        print("WARNING: no heldout_metrics.csv, the held-out analysis is skipped")
     # Separate stream so that adding this analysis leaves the draws above unchanged.
     res["gains_over_bc"] = gains_over_bc(runs, args.B, np.random.default_rng(args.seed + 1))
+    # Separate stream, and more draws, for the simultaneous intervals only (MLR3-05).
+    # The intervals from the B draws of pairwise() are kept as ci_bonf15_B.
+    bonf = pairwise_bonferroni(ck, args.B_bonf, np.random.default_rng(args.seed + 2))
+    for rec in res["pairwise"]:
+        for m in ("N", "P", "SRR", "D_shift_interaction"):
+            rec[m]["ci_bonf15_B"] = rec[m]["ci_bonf15"]
+            rec[m]["ci_bonf15"] = bonf[rec["pair"]][m]
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "paper_stats.json"), "w") as f:
         json.dump(res, f, indent=1, default=float)

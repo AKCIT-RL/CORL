@@ -46,11 +46,15 @@ def row_from_json(path: str, suite: str) -> dict:
     n_mean = float(nominal.mean())
     p_mean = float(perturbed.mean())
     valid = n_mean >= VALID_FLOOR
+    checkpoint = d.get("run") or os.path.basename(path).removesuffix(".json")
+    seed = d.get("train_seed")
+    if checkpoint.startswith("DT-") and seed == 10:
+        seed = 0  # the DT runs trained with seed 10 are the benchmark's seed 0
     return {
-        "checkpoint": d.get("run") or os.path.basename(path).removesuffix(".json"),
+        "checkpoint": checkpoint,
         "env": d.get("env"),
         "dataset_id": d.get("dataset_id"),
-        "train_seed": d.get("train_seed"),
+        "train_seed": seed,
         "suite": suite,
         "n_nominal": nominal.size,
         "n_perturbed": perturbed.size,

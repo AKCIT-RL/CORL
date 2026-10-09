@@ -2,9 +2,8 @@
 
 Every table is written to <out>/<name>.tex and included by supplementary.tex
 with \\input. Sources: the MuJoCo Playground fork (models and configs), the
-datasets under datasets/playground, the offline configs, the CORL defaults in
-analysis/corl_defaults, and the analysis inputs and results of
-scripts/paper_stats.py.
+datasets under datasets/playground, the offline configs, and the analysis
+inputs and results of scripts/paper_stats.py.
 
 Usage (from the CORL root, with the CORL environment):
   python -m scripts.supplementary_tables --out ../overleaf_paper/supp
@@ -19,6 +18,8 @@ import h5py
 import numpy as np
 import pandas as pd
 import yaml
+
+from scripts.paper_stats import load_runs
 
 TASKS = ["go2-flat-forward", "h1-gait-tracking", "go2-joystick-direction", "g1-joystick-direction",
          "go2-footstand", "go2-handstand", "go2-getup", "go2-getup-walk",
@@ -87,9 +88,9 @@ def env_tables(out):
         "$k_p$ and $k_d$ are the proportional and damping gains of the position actuators "
         "in the MJCF model (a range lists the per-joint values). Masses are those of the "
         "simulated models.",
-        "tab:robots", "p{0.30\\textwidth}rrrrrrr",
+        "tab:robots", "p{0.25\\textwidth}rrrrrrr",
         "Tasks & Joints & Mass (kg) & Sim. step (ms) & Action scale & $k_p$ & $k_d$ & Episode",
-        rows_robot, star=True))
+        rows_robot, star=True, size="\\footnotesize"))
     write(out, "rewards", table(
         "Non-zero reward terms and weights of each environment, as configured in the fork.",
         "tab:rewards", "p{0.25\\textwidth}p{0.68\\textwidth}", "Tasks & Terms and weights",
@@ -189,7 +190,7 @@ def dataset_tables(out, root):
     write(out, "checkpoints", table(
         "Size of the checkpoint pool of each task and the checkpoints selected as expert and medium "
         "policies (training run and environment step).",
-        "tab:checkpoints", "lrll", "Task & Pool & Expert & Medium", sel_rows, star=True, size="\\footnotesize"))
+        "tab:checkpoints", "lrll", "Task & Pool & Expert & Medium", sel_rows, star=True, size="\\scriptsize"))
     # phases of go2-getup-walk
     rows = []
     for q in QUALITIES:
@@ -230,17 +231,11 @@ def hyper_tables(out):
     for algo, key in [("BC", "bc"), ("TD3+BC", "td3_bc"), ("AWAC", "awac"), ("IQL", "iql"),
                       ("CQL", "cql"), ("Decision Transformer", "dt")]:
         ours = yaml.safe_load(open(f"configs/offline/{key}/base.yaml"))
-        ref = yaml.safe_load(open(f"analysis/corl_defaults/{key}.yaml"))
-        rows = []
-        for k in sorted(set(ours) - skip):
-            v, r = ours[k], ref.get(k, "--")
-            mark = "" if str(v) == str(r) else "$\\dagger$"
-            esc = lambda x: str(x).replace("_", "\\_")
-            rows.append(f"{esc(k)} & {esc(v)} & {esc(r)}{mark}")
+        esc = lambda x: str(x).replace("_", "\\_")
+        rows = [f"{esc(k)} & {esc(ours[k])}" for k in sorted(set(ours) - skip)]
         blocks.append(table(
-            f"{algo}: configuration used for all tasks, and the CORL configuration for D4RL "
-            f"\\texttt{{halfcheetah-medium-v2}}. $\\dagger$ marks a difference.",
-            f"tab:hp-{key}", "lll", "Parameter & Ours & CORL", rows, size="\\scriptsize"))
+            f"{algo}: configuration used for all tasks.",
+            f"tab:hp-{key}", "ll", "Parameter & Value", rows, size="\\scriptsize"))
     write(out, "hyperparameters", "\n".join(blocks))
     reg = yaml.safe_load(open("configs/offline/_datasets.yaml"))["tasks"]
     refs = pd.read_csv("analysis/paper_stats/inputs/dataset_refs.csv")
@@ -254,7 +249,7 @@ def hyper_tables(out):
 
 
 def cql_table(out):
-    r = pd.read_csv("analysis/paper_stats/inputs/runs.csv")
+    r = load_runs("analysis/paper_stats/inputs")
     c = r[r.algorithm == "CQL"].copy()
     c["at_clip"] = c.cql_alpha_prime >= 1e6 - 1
     g = c.groupby("dataset").agg(runs=("run", "size"), clip=("at_clip", "sum"), score=("score", "mean"))
@@ -279,9 +274,9 @@ def compute_table(out):
 # ---------------------------------------------------------------- results
 def results_tables(out):
     res = json.load(open("analysis/paper_stats/results/paper_stats.json"))
-    runs = pd.read_csv("analysis/paper_stats/inputs/runs.csv")
+    runs = load_runs("analysis/paper_stats/inputs")
     m = pd.read_csv("analysis/paper_stats/inputs/sim2real_metrics.csv")
-    ck = m[(m.suite == "humanoid_gym_relative") & (m.checkpoint != "DT-H1JoystickGaitTracking-f12bb1c4")].copy()
+    ck = m[(m.suite == "humanoid_gym_relative_v2") & (m.checkpoint != "DT-H1JoystickGaitTracking-f12bb1c4")].copy()
     ck[["nominal_score", "score"]] = ck[["nominal_score", "score"]].fillna(0.0)
     ck["valid"] = ck.nominal_score >= 0.05
     ck["srr"] = np.where(ck.valid, ck.score / ck.nominal_score, np.nan)
@@ -330,7 +325,8 @@ def results_tables(out):
                         f"{x['cells_a_better']} & {x['W']:.0f} & {pfmt(x['p'])} & {pfmt(x['p_holm45'])}")
         blocks.append(table(
             f"Pairwise comparisons on the {title} (first minus second), over the cells used by the contrast. "
-            "CI: pointwise 95\\% bootstrap interval. Bonf.: simultaneous interval for the 15 pairs. "
+            "CI: pointwise 95\\% bootstrap interval. Bonf.: simultaneous interval for the 15 pairs, "
+            f"from {res['config']['B_bonf']:,} separate draws. "
             "Better: cells where the first method has the higher mean. $W$ and $p$: two-sided Wilcoxon "
             "signed-rank test on the cell differences; Holm: adjusted over the 45 tests of the three tables.",
             f"tab:pairwise-{k}", "lrrrrrrrr",
