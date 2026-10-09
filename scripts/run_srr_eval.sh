@@ -8,6 +8,10 @@
 # a run finishes, so an interrupted run is retried rather than silently skipped.
 #
 #   ALGOS="IQL CQL" EPISODES=50 ./scripts/run_srr_eval.sh
+#
+# Tier-5 held-out regime, kept apart from the SRR metrics:
+#   SUITE=heldout ENVS="Go2PushRecovery Go2RoughCurriculum" \
+#     METRICS_DIR=logs/compare/metrics_heldout ./scripts/run_srr_eval.sh
 set -uo pipefail
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -22,8 +26,12 @@ SUITE="${SUITE:-humanoid_gym_relative}"
 EPISODES="${EPISODES:-100}"
 ACTORS="${ACTORS:-50}"
 
-METRICS_DIR="logs/compare/metrics"
-LOG_DIR="logs/compare/algorithms"
+if [[ -n "${METRICS_DIR:-}" ]]; then
+  LOG_DIR="${LOG_DIR:-${METRICS_DIR%/}_logs}"
+else
+  METRICS_DIR="logs/compare/metrics"
+  LOG_DIR="${LOG_DIR:-logs/compare/algorithms}"
+fi
 mkdir -p "$METRICS_DIR" "$LOG_DIR"
 
 todo=()
@@ -54,7 +62,7 @@ for i in "${!todo[@]}"; do
   if ! "$PY" -m scripts.compare_randomize \
       --checkpoint_path "$d" --device cuda \
       --n_actors "$ACTORS" --n_episodes "$EPISODES" \
-      --configs "$SUITE" > "$LOG_DIR/$name.txt" 2>&1; then
+      --configs "$SUITE" --metrics_dir "$METRICS_DIR" > "$LOG_DIR/$name.txt" 2>&1; then
     failed=$((failed + 1))
     echo "         FAILED: $(tail -3 "$LOG_DIR/$name.txt" | tr '\n' ' ' | cut -c1-150)"
   fi

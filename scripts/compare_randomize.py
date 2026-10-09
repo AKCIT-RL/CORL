@@ -17,7 +17,7 @@ os.environ["MUJOCO_GL"] = "egl"
 gl_context = mujoco.egl.GLContext(1024, 1024)
 gl_context.make_current()
 
-from algorithms.utils.randomize_gym import GymWrapper, get_env
+from algorithms.utils.randomize_gym import GymWrapper, get_env, parse_eval_shift
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
@@ -32,6 +32,8 @@ class CompareRandomizeAttributes:
    dataset_id: Optional[str] = None
    device: str = "cuda"
    # Comma-separated suite names to run; "default" is always included as the SRR baseline.
+   # "heldout" runs the Tier-5 held-out regime: the default env with the run's
+   # eval_shift overrides, the same env the training script scores at the end.
    configs: Optional[str] = None
    metrics_dir: str = "logs/compare/metrics"
    # Decision Transformer only: overrides target_returns[0] from the run config.
@@ -46,6 +48,8 @@ class CompareRandomizeConfig:
    # Needed for D4RL normalization: carries return_min/return_expert in its metadata.
    dataset_id: Optional[str] = None
    seed: Optional[int] = None
+   # Tier-5 env-config overrides for the held-out regime (see _datasets.yaml).
+   eval_shift: Optional[str] = None
    # Decision Transformer only. A transformer cannot be reconstructed from the
    # weight tree the way the five MLP actors can, so its architecture and rollout
    # parameters are read from the run's own config.yaml.
@@ -617,7 +621,7 @@ def _main(attrs: CompareRandomizeAttributes):
    selected = None
    if attrs.configs:
       selected = {name.strip() for name in attrs.configs.split(",")} | {"default"}
-      unknown = selected - set(randomize_configs) - set(custom_configs)
+      unknown = selected - set(randomize_configs) - set(custom_configs) - {"heldout"}
       if unknown:
          raise ValueError(f"Unknown configs: {sorted(unknown)}")
 
@@ -626,7 +630,7 @@ def _main(attrs: CompareRandomizeAttributes):
    obs_mean = None
    obs_std = None
 
-   def run_test(cfg_name, cfg_file=None, display_name=None):
+   def run_test(cfg_name, cfg_file=None, display_name=None, overrides=None):
       nonlocal data, attrs, policy, obs_mean, obs_std
 
       display_name = display_name or cfg_name
@@ -639,7 +643,7 @@ def _main(attrs: CompareRandomizeAttributes):
          render_callback=_render_callback,
          num_actors=num_actors,
          command_type=config.command_type,
-         config_overrides={"impl": "jax"},
+         config_overrides={"impl": "jax", **(overrides or {})},
          randomize_configs=cfg_name,
          randomize_options=cfg_file,
          dataset=dataset,
@@ -682,6 +686,12 @@ def _main(attrs: CompareRandomizeAttributes):
                run_test(cfg_name, cfg_file, display_name)
       elif selected is None or cfg_name in selected:
          run_test(cfg_name)
+
+   if selected is not None and "heldout" in selected:
+      overrides = parse_eval_shift(config.eval_shift)
+      if overrides is None:
+         raise ValueError(f"{config.env} has no eval_shift, so it has no held-out regime.")
+      run_test("default", display_name="heldout", overrides=overrides)
    
    # Show results
    metrics = print_results(data)

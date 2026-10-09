@@ -957,6 +957,24 @@ def get_env(
     return env
 
 
+def parse_eval_shift(eval_shift) -> Optional[Dict[str, Any]]:
+    """Env-config overrides of an ``eval_shift`` block, or None when it is empty.
+
+    Accepts a JSON string, the single-quoted Python dict repr that pyrallis writes
+    to a run's config.yaml, or an already-parsed dict.
+    """
+    if not eval_shift:
+        return None
+    if isinstance(eval_shift, str):
+        try:
+            return json.loads(eval_shift)
+        except json.JSONDecodeError:
+            # pyrallis may round-trip the JSON through yaml/str(), turning it
+            # into a single-quoted Python dict repr; fall back to literal_eval.
+            return ast.literal_eval(eval_shift)
+    return dict(eval_shift)
+
+
 def maybe_get_shifted_env(
     device,
     command_type=None,
@@ -974,17 +992,9 @@ def maybe_get_shifted_env(
     forwarded so the D4RL reference scores stay in-distribution, keeping the shifted
     score comparable to the in-distribution one.
     """
-    if not eval_shift:
+    overrides = parse_eval_shift(eval_shift)
+    if overrides is None:
         return None
-    if isinstance(eval_shift, str):
-        try:
-            overrides = json.loads(eval_shift)
-        except json.JSONDecodeError:
-            # pyrallis may round-trip the JSON through yaml/str(), turning it
-            # into a single-quoted Python dict repr; fall back to literal_eval.
-            overrides = ast.literal_eval(eval_shift)
-    else:
-        overrides = dict(eval_shift)
     return get_env(
         device,
         command_type=command_type,
