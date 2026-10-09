@@ -74,7 +74,7 @@ def row(run) -> dict:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--project", default="akcit-offlinerl/Offline-Benchmark")
+    parser.add_argument("--project", default="anonymous/Offline-Benchmark")
     parser.add_argument("--exclude_from", default="2026-10-07")
     parser.add_argument("--out", default="analysis/paper_stats/inputs/runs.csv")
     args = parser.parse_args()

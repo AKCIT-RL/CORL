@@ -1,6 +1,6 @@
 """Figures for the paper, built from the published SRR metrics.
 
-Reads sim2real/metrics.csv from the Hugging Face dataset akcit-rl/offline-benchmark
+Reads sim2real/metrics.csv from the Hugging Face dataset anonymous/offline-benchmark
 (or a local copy via --csv) and writes:
 
   nominal_vs_perturbed.pdf  one panel per algorithm: nominal vs. perturbed score of
@@ -61,7 +61,7 @@ plt.rcParams.update({
 def load(csv_path=None):
     if csv_path is None:
         from huggingface_hub import hf_hub_download
-        csv_path = hf_hub_download("akcit-rl/offline-benchmark", "sim2real/metrics.csv", repo_type="dataset")
+        csv_path = hf_hub_download("anonymous/offline-benchmark", "sim2real/metrics.csv", repo_type="dataset")
     df = pd.read_csv(csv_path)
     df = df[(df["suite"] == SUITE) & (df["checkpoint"] != ORPHAN)].copy()
     df[["nominal_score", "score"]] = df[["nominal_score", "score"]].fillna(0.0)

@@ -6,7 +6,7 @@ Inputs (analysis/paper_stats/inputs/):
   heldout_metrics.csv      held-out regime of the disturbed-locomotion tier, scored by
                            the SRR pipeline (100 episodes per arm), from
                            scripts/unpaired_srr_metrics.py --suite heldout
-  sim2real_metrics.csv     published SRR evaluation (Hugging Face akcit-rl/offline-benchmark)
+  sim2real_metrics.csv     published SRR evaluation (Hugging Face anonymous/offline-benchmark)
   unpaired_srr_metrics.csv per-checkpoint relative-degradation rates, from
                            scripts/unpaired_srr_metrics.py on the 720 metrics JSONs
   dataset_refs.csv         mean normalized score of each dataset and R_min / R_max
