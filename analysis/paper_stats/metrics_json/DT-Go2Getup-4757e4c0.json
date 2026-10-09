@@ -6,7 +6,7 @@
   "env": "Go2Getup",
   "dataset_id": "playground/go2-getup/expert-v0",
   "command_type": null,
-  "train_seed": 10,
+  "train_seed": 0,
   "n_episodes": 100,
   "n_actors": 50,
   "normalized": true,

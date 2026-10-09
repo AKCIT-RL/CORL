@@ -6,7 +6,7 @@
   "env": "G1JoystickFlatTerrain",
   "dataset_id": "playground/g1-joystick-direction/medium-v0",
   "command_type": null,
-  "train_seed": 10,
+  "train_seed": 0,
   "n_episodes": 100,
   "n_actors": 50,
   "normalized": true,

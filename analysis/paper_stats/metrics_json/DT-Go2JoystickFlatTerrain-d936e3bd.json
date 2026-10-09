@@ -6,7 +6,7 @@
   "env": "Go2JoystickFlatTerrain",
   "dataset_id": "playground/go2-flat-forward/medium-v0",
   "command_type": "forwardfixed",
-  "train_seed": 10,
+  "train_seed": 0,
   "n_episodes": 100,
   "n_actors": 50,
   "normalized": true,
