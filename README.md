@@ -60,10 +60,9 @@ Every task is provided in four difficulties:
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-**Install dependencies:**
+**Install dependencies:** download the repository from <https://anonymous.4open.science/r/CORL-97F5/>, then run from its root:
 
 ```bash
-git clone https://github.com/ANONYMOUS/CORL.git && cd CORL
 uv sync
 ```
 
