@@ -1,0 +1,889 @@
+# source https://github.com/ikostrikov/jaxrl
+# https://arxiv.org/abs/2006.09359
+import os
+import uuid
+from dataclasses import asdict, dataclass
+from functools import partial
+from pathlib import Path
+from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple
+
+import distrax
+import flax.linen as nn
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+from pyrallis.argparsing import wrap as pyrallis_wrap
+from pyrallis.cfgparsing import dump as pyrallis_dump
+import tqdm
+import wandb
+import yaml
+from flax import core as flax_core
+from flax import serialization as flax_serialization
+from flax.training.train_state import TrainState
+
+import minari
+
+from algorithms.utils import proxy
+from algorithms.utils.randomize_gym import GymWrapper, get_env, maybe_get_shifted_env, record_policy_video
+from algorithms.utils.dataset import Dataset, qlearning_dataset
+
+os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True"
+
+@dataclass
+class AWACConfig:
+   # wandb project name
+   project: str = "CORL"
+   # wandb group name
+   group: str = "AWAC-D4RL"
+   # wandb run name
+   name: str = "AWAC"
+   # training dataset and evaluation environment
+   env: str = "halfcheetah-medium-expert-v2"
+   dataset_id: str = "halfcheetah-medium-expert-v2"
+   command_type: Optional[str] = None
+   # Optional Tier-5 shifted evaluation: JSON string of flattened env-config
+   # overrides (e.g. stronger push-recovery kicks) applied only to a second eval
+   # env. Normalization reuses the in-distribution dataset refs, so the shifted
+   # score is comparable to eval/final_score (their gap = robustness gap).
+   eval_shift: Optional[str] = None
+   # actor and critic hidden dim
+   hidden_dim: int = 256
+   # actor and critic learning rate
+   learning_rate: float = 3e-4
+   # discount factor
+   gamma: float = 0.99
+   # coefficient for the target critic Polyak's update
+   tau: float = 5e-3
+   # awac actor loss temperature, controlling balance
+   # between behaviour cloning and Q-value maximization
+   awac_lambda: float = 1.0
+   # training batch size
+   batch_size: int = 256 
+   # Maximum number of transitions to store in the replay buffer
+   buffer_size: int = 20_000_000 
+   # Number of offline updates
+   offline_iterations: int = int(1e6)  
+   # Number of online updates
+   online_iterations: int = int(1e6)  
+   # whether to normalize reward (like in IQL)
+   normalize_reward: bool = False
+   # whether to normalize states
+   normalize_state: bool = True
+   # evaluation frequency, will evaluate every eval_freq training steps
+   eval_frequency: int = int(5e3) 
+   # number of actors to use for evaluation (parallel)
+   n_eval_actors: int = 10
+   # number of episodes to run during evaluation
+   n_test_episodes: int = 10  # alias for n_test_episodes
+   # number of episodes for the final evaluation (larger -> lower variance)
+   n_eval_episodes_final: int = 50
+   # fixed seed for evaluation rollouts (reproducible / comparable)
+   eval_seed: int = 0
+   # path for checkpoints saving, optional
+   checkpoints_path: Optional[str] = None
+   # save an intermediate checkpoint every N evaluations (final always saved)
+   checkpoints_every: int = 10
+   # training random seed
+   seed: int = 0
+   test_seed: int = 69  # seed for evaluation
+   # training device
+   device: str = "cuda"
+   # NETWORK (JAX specific)
+   actor_hidden_dims: Tuple[int, ...] = (256, 256, 256, 256)
+   critic_hidden_dims: Tuple[int, ...] = (256, 256)
+   # JAX specific
+   n_jitted_updates: int = 8
+
+   def __post_init__(self):
+      self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
+      if self.checkpoints_path is not None:
+         self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
+
+   def __hash__(self):  
+      # make config hashable to be specified as static_argnums in jax.jit.
+      return hash(self.__repr__())
+
+
+def default_init(scale: Optional[float] = 1.0):
+   return nn.initializers.variance_scaling(scale, "fan_avg", "uniform")
+
+class MLP(nn.Module):
+   hidden_dims: Sequence[int]
+   activations: Callable[[jnp.ndarray], jnp.ndarray] = nn.relu
+   activate_final: bool = False
+   kernel_init: Callable[[Any, Sequence[int], Any], jnp.ndarray] = default_init()
+   add_layer_norm: bool = False
+   layer_norm_final: bool = False
+
+   @nn.compact
+   def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+      for i, hidden_dims in enumerate(self.hidden_dims):
+         x = nn.Dense(hidden_dims, kernel_init=self.kernel_init)(x)
+         if self.add_layer_norm:  # Add layer norm after activation
+            if self.layer_norm_final or i + 1 < len(self.hidden_dims):
+               x = nn.LayerNorm()(x)
+         if i + 1 < len(self.hidden_dims) or self.activate_final:
+            # Add activation after layer norm
+            x = self.activations(x)
+      return x
+
+
+class DoubleCritic(nn.Module):
+   hidden_dims: Sequence[int]
+
+   @nn.compact
+   def __call__(
+      self, observation: jnp.ndarray, action: jnp.ndarray
+   ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+      x = jnp.concatenate([observation, action], axis=-1)
+      q1 = MLP((*self.hidden_dims, 1), add_layer_norm=True)(x)
+      q2 = MLP((*self.hidden_dims, 1), add_layer_norm=True)(x)
+      return q1, q2
+
+
+class GaussianPolicy(nn.Module):
+   hidden_dims: Sequence[int]
+   action_dim: int
+   log_std_min: Optional[float] = -20.0
+   log_std_max: Optional[float] = 2.0
+   final_fc_init_scale: float = 1e-3
+
+   @nn.compact
+   def __call__(
+      self, observations: jnp.ndarray, temperature: float = 1.0
+   ) -> distrax.Distribution:
+      outputs = MLP(
+         self.hidden_dims,
+         activate_final=True,
+      )(observations)
+
+      means = nn.Dense(
+         self.action_dim, kernel_init=default_init(self.final_fc_init_scale)
+      )(outputs)
+
+      log_stds = self.param("log_stds", nn.initializers.zeros, (self.action_dim,))
+      log_stds = jnp.clip(log_stds, self.log_std_min, self.log_std_max)
+
+      distribution = distrax.MultivariateNormalDiag(
+         loc=means, scale_diag=jnp.exp(log_stds) * temperature
+      )
+      return distribution
+
+class Batch(NamedTuple):
+   observations: jnp.ndarray | np.ndarray
+   actions: jnp.ndarray | np.ndarray
+   rewards: jnp.ndarray | np.ndarray
+   next_observations: jnp.ndarray | np.ndarray
+   dones: jnp.ndarray | np.ndarray
+
+class ReplayBuffer:
+   def __init__(
+      self, 
+      state_dim: int, 
+      action_dim: int, 
+      buffer_size: int,
+      seed: int = 0
+   ):
+      self._buffer_size = buffer_size
+      self._pointer = 0
+      self._size = 0
+      self._rng = np.random.default_rng(seed)
+
+      self._data = Batch(
+         observations=np.zeros((buffer_size, state_dim), dtype=np.float32),
+         actions=np.zeros((buffer_size, action_dim), dtype=np.float32),
+         rewards=np.zeros((buffer_size,), dtype=np.float32),
+         next_observations=np.zeros((buffer_size, state_dim), dtype=np.float32),
+         dones=np.zeros((buffer_size,), dtype=np.float32),
+      )
+
+   def size(self) -> int:
+      return self._size
+
+   def max_size(self) -> int:
+      return self._buffer_size
+
+   def _to_numpy(self, value) -> np.ndarray:
+      return np.asarray(value, dtype=np.float32)
+
+   def load_dataset(
+      self, 
+      dataset,
+      config,
+      clip_to_eps: bool = True,
+      eps: float = 1e-5
+   ) -> Tuple[Any, Any]:
+      if self._size != 0:
+         raise ValueError("Trying to load data into non-empty replay buffer")
+
+      obs = self._to_numpy(dataset.observations)
+      act = self._to_numpy(dataset.actions)
+      rew = self._to_numpy(dataset.rewards)
+      next_obs = self._to_numpy(dataset.next_observations)
+      
+      if clip_to_eps:
+         lim = 1 - eps
+         act = np.clip(act, -lim, lim)
+
+      imputed_next_observations = np.roll(obs, -1, axis=0)
+      same_obs = np.all(
+         np.isclose(imputed_next_observations, next_obs, atol=1e-5),
+         axis=-1,
+      )
+      dones = 1.0 - same_obs.astype(np.float32)
+      dones[-1] = 1.0
+      
+      n_transitions = len(obs)
+
+      if n_transitions > self._buffer_size:
+         raise ValueError(
+            "Replay buffer is smaller than the dataset you are trying to load!"
+         )
+
+      perm = self._rng.permutation(n_transitions)
+
+      self._data.observations[:n_transitions] = obs[perm]
+      self._data.actions[:n_transitions] = act[perm]
+      self._data.rewards[:n_transitions] = rew[perm]
+      self._data.next_observations[:n_transitions] = next_obs[perm]
+      self._data.dones[:n_transitions] = dones[perm]
+
+      self._size = n_transitions
+      self._pointer = n_transitions % self._buffer_size
+
+      obs_mean, obs_std = 0, 1
+      if getattr(config, 'normalize_state', False):
+         valid_obs = self._data.observations[:self._size]
+         obs_mean = valid_obs.mean(0)
+         obs_std = valid_obs.std(0) + eps
+
+         self._data.observations[:self._size] = (self._data.observations[:self._size] - obs_mean) / obs_std
+         self._data.next_observations[:self._size] = (self._data.next_observations[:self._size] - obs_mean) / obs_std
+
+      return obs_mean, obs_std
+
+   def add_transition(self, observation, action, reward, next_observation, done):
+      self._data.observations[self._pointer] = self._to_numpy(observation)
+      self._data.actions[self._pointer] = self._to_numpy(action)
+      self._data.rewards[self._pointer] = self._to_numpy(reward)
+      self._data.next_observations[self._pointer] = self._to_numpy(next_observation)
+      self._data.dones[self._pointer] = self._to_numpy(done)
+
+      self._pointer = (self._pointer + 1) % self._buffer_size
+      self._size = min(self._size + 1, self._buffer_size)
+
+   def add_transitions(self, observations, actions, rewards, next_observations, dones):
+      obs = self._to_numpy(observations)
+      acts = self._to_numpy(actions)
+      rews = self._to_numpy(rewards)
+      next_obs = self._to_numpy(next_observations)
+      dns = self._to_numpy(dones)
+
+      n = len(obs)
+      if n == 0:
+         return
+         
+      if n > self._buffer_size:
+         obs = obs[-self._buffer_size:]
+         acts = acts[-self._buffer_size:]
+         rews = rews[-self._buffer_size:]
+         next_obs = next_obs[-self._buffer_size:]
+         dns = dns[-self._buffer_size:]
+         n = self._buffer_size
+
+      end_idx = self._pointer + n
+
+      if end_idx <= self._buffer_size:
+         self._data.observations[self._pointer:end_idx] = obs
+         self._data.actions[self._pointer:end_idx] = acts
+         self._data.rewards[self._pointer:end_idx] = rews
+         self._data.next_observations[self._pointer:end_idx] = next_obs
+         self._data.dones[self._pointer:end_idx] = dns
+      else:
+         overflow = end_idx - self._buffer_size
+         first_part = n - overflow
+
+         self._data.observations[self._pointer:] = obs[:first_part]
+         self._data.actions[self._pointer:] = acts[:first_part]
+         self._data.rewards[self._pointer:] = rews[:first_part]
+         self._data.next_observations[self._pointer:] = next_obs[:first_part]
+         self._data.dones[self._pointer:] = dns[:first_part]
+
+         self._data.observations[:overflow] = obs[first_part:]
+         self._data.actions[:overflow] = acts[first_part:]
+         self._data.rewards[:overflow] = rews[first_part:]
+         self._data.next_observations[:overflow] = next_obs[first_part:]
+         self._data.dones[:overflow] = dns[first_part:]
+
+      self._pointer = end_idx % self._buffer_size
+      self._size = min(self._size + n, self._buffer_size)
+
+   def sample(self, batch_size: int) -> Batch:
+      if self._size == 0:
+         raise ValueError("Replay buffer is empty, cannot sample.")
+
+      indices = self._rng.choice(self._size, size=batch_size, replace=False)
+
+      return jax.tree_util.tree_map(
+         lambda x: jnp.asarray(x[indices], dtype=jnp.float32), 
+         self._data
+      )
+
+def target_update(
+   model: TrainState, target_model: TrainState, tau: float
+) -> TrainState:
+   new_target_params = jax.tree_util.tree_map(
+      lambda p, tp: p * tau + tp * (1 - tau), model.params, target_model.params
+   )
+   return target_model.replace(params=new_target_params)
+
+
+def update_by_loss_grad(
+   train_state: TrainState, loss_fn: Callable
+) -> Tuple[TrainState, Any]:
+   grad_fn = jax.value_and_grad(loss_fn)
+   loss, grad = grad_fn(train_state.params)
+   new_train_state = train_state.apply_gradients(grads=grad)
+   return new_train_state, loss
+
+
+class AWACTrainState(NamedTuple):
+   rng: jax.Array
+   critic: TrainState
+   target_critic: TrainState
+   actor: TrainState
+
+
+class AWAC(object):
+   @classmethod
+   def update_actor(
+      cls,
+      train_state: AWACTrainState,
+      batch: Batch,
+      rng: jax.Array,
+      config: AWACConfig,
+   ) -> Tuple["AWACTrainState", jnp.ndarray]:
+      def get_actor_loss(actor_params: flax_core.FrozenDict[str, Any]) -> jnp.ndarray:
+         dist = train_state.actor.apply_fn(actor_params, batch.observations)
+         pi_actions = dist.sample(seed=rng)
+         q_1, q_2 = train_state.critic.apply_fn(
+            train_state.critic.params, batch.observations, pi_actions
+         )
+         v = jnp.minimum(q_1, q_2)
+
+         lim = 1 - 1e-5
+         actions = jnp.clip(batch.actions, -lim, lim)
+         q_1, q_2 = train_state.critic.apply_fn(
+            train_state.critic.params, batch.observations, actions
+         )
+         q = jnp.minimum(q_1, q_2)
+         adv = q - v
+         weights = jnp.exp(adv / config.awac_lambda)
+
+         weights = jax.lax.stop_gradient(weights)
+
+         log_prob = dist.log_prob(batch.actions)
+         loss = -jnp.mean(log_prob * weights).mean()
+         return loss
+
+      new_actor, actor_loss = update_by_loss_grad(train_state.actor, get_actor_loss)
+      return train_state._replace(actor=new_actor), actor_loss
+
+   @classmethod
+   def update_critic(
+      cls,
+      train_state: AWACTrainState,
+      batch: Batch,
+      rng: jax.Array,
+      config: AWACConfig,
+   ) -> Tuple["AWACTrainState", jnp.ndarray]:
+      def get_critic_loss(
+         critic_params: flax_core.FrozenDict[str, Any]
+      ) -> jnp.ndarray:
+         dist = train_state.actor.apply_fn(
+            train_state.actor.params, batch.observations
+         )
+         next_actions = dist.sample(seed=rng)
+         n_q_1, n_q_2 = train_state.target_critic.apply_fn(
+            train_state.target_critic.params, batch.next_observations, next_actions
+         )
+         next_q = jnp.minimum(n_q_1, n_q_2)
+         q_target = batch.rewards + config.gamma * (1 - batch.dones) * next_q
+         q_target = jax.lax.stop_gradient(q_target)
+
+         q_1, q_2 = train_state.critic.apply_fn(
+            critic_params, batch.observations, batch.actions
+         )
+
+         loss = jnp.mean((q_1 - q_target) ** 2 + (q_2 - q_target) ** 2)
+         return loss
+
+      new_critic, critic_loss = update_by_loss_grad(
+         train_state.critic, get_critic_loss
+      )
+      return train_state._replace(critic=new_critic), critic_loss
+
+   @classmethod
+   def update_step(
+      cls,
+      train_state: AWACTrainState,
+      batch: Batch,
+      rng: jax.Array,
+      config: AWACConfig,
+   ) -> Tuple["AWACTrainState", Dict]:
+      rng, critic_rng, actor_rng = jax.random.split(rng, 3)
+
+      train_state, critic_loss = cls.update_critic(
+         train_state, batch, critic_rng, config
+      )
+      new_target_critic = target_update(
+         train_state.critic,
+         train_state.target_critic,
+         config.tau,
+      )
+      train_state, actor_loss = cls.update_actor(
+         train_state, batch, actor_rng, config
+      )
+
+      return train_state._replace(target_critic=new_target_critic), {
+         "critic_loss": critic_loss,
+         "actor_loss": actor_loss,
+      }
+   
+   @classmethod
+   def update_n_times(
+      cls,
+      train_state: AWACTrainState,
+      buffer: Batch,
+      rng: jax.Array,
+      config: AWACConfig,
+   ) -> Tuple["AWACTrainState", Dict]:
+      buffer_size = buffer.observations.shape[0]
+      for _ in range(config.n_jitted_updates):
+         rng, batch_rng, critic_rng, actor_rng = jax.random.split(rng, 4)
+
+         batch_indices = jax.random.choice(
+            batch_rng, buffer_size, shape=(config.batch_size,), replace=False
+         )
+         batch = jax.tree_util.tree_map(lambda x: x[batch_indices], buffer)
+
+         train_state, critic_loss = cls.update_critic(
+            train_state, batch, critic_rng, config
+         )
+         new_target_critic = target_update(
+            train_state.critic,
+            train_state.target_critic,
+            config.tau,
+         )
+         train_state, actor_loss = cls.update_actor(
+            train_state, batch, actor_rng, config
+         )
+      return train_state._replace(target_critic=new_target_critic), {
+         "critic_loss": critic_loss,
+         "actor_loss": actor_loss,
+      }
+
+   @classmethod
+   def get_action(
+      cls,
+      train_state: AWACTrainState,
+      observations: np.ndarray,
+      seed: jax.Array,
+      temperature: float = 1.0,
+      max_action: float = 1.0,  # In D4RL envs, the action space is [-1, 1]
+   ) -> jnp.ndarray:
+      actions = train_state.actor.apply_fn(
+         train_state.actor.params, observations=observations, temperature=temperature
+      ).sample(seed=seed)
+      actions = jnp.clip(actions, -max_action, max_action)
+      return actions
+
+
+def create_awac_train_state(
+   rng: jax.Array,
+   observations: jnp.ndarray,
+   actions: jnp.ndarray,
+   config: AWACConfig,
+) -> AWACTrainState:
+   rng, actor_rng, critic_rng, _ = jax.random.split(rng, 4)
+   # initialize actor
+   action_dim = actions.shape[-1]
+   actor_model = GaussianPolicy(
+      config.actor_hidden_dims,
+      action_dim=action_dim,
+   )
+   actor = TrainState.create(
+      apply_fn=actor_model.apply,
+      params=actor_model.init(actor_rng, observations),
+      tx=optax.adam(learning_rate=config.learning_rate),
+   )
+   # initialize critic
+   critic_model = DoubleCritic(config.critic_hidden_dims)
+   critic = TrainState.create(
+      apply_fn=critic_model.apply,
+      params=critic_model.init(critic_rng, observations, actions),
+      tx=optax.adam(learning_rate=config.learning_rate),
+   )
+   # initialize target critic
+   target_critic = TrainState.create(
+      apply_fn=critic_model.apply,
+      params=critic_model.init(critic_rng, observations, actions),
+      tx=optax.adam(learning_rate=config.learning_rate),
+   )
+   return AWACTrainState(
+      rng,
+      critic=critic,
+      target_critic=target_critic,
+      actor=actor,
+   )
+
+
+def evaluate(
+   policy_fn: Callable,
+   env: GymWrapper,
+   num_episodes: int,
+   obs_mean: float,
+   obs_std: float,
+   seed: int = 0,
+) -> Tuple[float, float]:
+   env.reset_rng(seed)
+   num_envs = getattr(env, "num_envs", 1)
+   episode_returns = []
+
+   while len(episode_returns) < num_episodes:
+      episode_return = np.zeros(num_envs, dtype=np.float32)
+      finished = np.zeros(num_envs, dtype=bool)
+      observation, _ = env.reset()
+      while not np.all(finished):
+         observation = (observation - obs_mean) / obs_std
+         action = policy_fn(observations=observation)
+         observation, reward, done, truncated, _ = env.step(np.array(action))
+         active_mask = ~finished
+         episode_return += np.asarray(reward, dtype=np.float32) * active_mask
+         finished |= np.asarray(done, dtype=bool) | np.asarray(truncated, dtype=bool)
+      completed = min(num_envs, num_episodes - len(episode_returns))
+      episode_returns.extend(episode_return[:completed].tolist())
+   mean_return = float(np.mean(episode_returns))
+   # Normalize using the env's D4RL-style reference scores (loaded from the
+   # dataset metadata). Falls back to the raw return when refs are absent.
+   normalized = env.get_normalized_score(mean_return)
+   normalized_score = float(normalized * 100 if normalized is not None else mean_return)
+
+   return normalized_score, mean_return
+
+
+def get_actor_from_checkpoint(checkpoint_path: str, state_dim: int) -> dict:
+   ckpt_path = Path(checkpoint_path).resolve()
+
+   with open(ckpt_path / "config.yaml") as f:
+      config_dict = yaml.safe_load(f)
+
+   checkpoint_data = np.load(
+      ckpt_path / "checkpoint_final.npz", allow_pickle=True
+   )
+
+   raw_actor_params = checkpoint_data["actor_params"].item()
+   obs_mean = jnp.array(checkpoint_data["obs_mean"])
+   obs_std = jnp.array(checkpoint_data["obs_std"])
+
+   print(f"obs_mean: {obs_mean[:5]}... (first 5)")
+   print(f"obs_std:  {obs_std[:5]}... (first 5)")
+
+   params_tree = raw_actor_params.get("params", raw_actor_params)
+   action_dim = params_tree["log_stds"].shape[0]
+
+   actor_model = GaussianPolicy(
+      hidden_dims=config_dict["actor_hidden_dims"],
+      action_dim=action_dim,
+   )
+
+   dummy_obs = jnp.zeros((1, state_dim))
+   initial_vars = actor_model.init(jax.random.PRNGKey(0), dummy_obs)
+   actor_params = flax_serialization.from_state_dict(initial_vars, raw_actor_params)
+   
+   # Unfreeze to use as regular dict, extract params collection
+   from flax.core import unfreeze
+   actor_params_unfrozen = unfreeze(actor_params)
+   params_only = actor_params_unfrozen.get('params', actor_params_unfrozen)
+
+   def get_action(obs: np.ndarray, temperature: float = 0.0, rng: Optional[jax.Array] = None) -> np.ndarray:
+      norm_obs = (obs - obs_mean) / (obs_std + 1e-5)
+      
+      # Apply model and handle both (output, vars) tuple and direct output cases
+      result = actor_model.apply({'params': params_only}, norm_obs, temperature=temperature)
+      dist = result[0] if isinstance(result, tuple) else result
+      
+      if temperature == 0.0:
+         action = dist.loc
+      else:
+         if rng is None:
+            rng = jax.random.PRNGKey(np.random.randint(0, 2**31))
+         action = dist.sample(seed=rng)
+      
+      return np.array(jnp.clip(action, -1.0, 1.0))
+
+   return {
+      "get_action": get_action,
+      "actor_params": actor_params,
+      "obs_mean": obs_mean,
+      "obs_std": obs_std,
+      "config": config_dict,
+   }
+
+def train():
+   wrapped_train = pyrallis_wrap()(_train)
+   wrapped_train()
+
+def _train(config: AWACConfig):
+   wandb.init(
+      project=config.project,
+      group=config.group,
+      name=config.name,
+      config=asdict(config),
+      id=str(uuid.uuid4()),
+   )
+
+   if config.checkpoints_path is not None:
+      print(f"Checkpoints path: {config.checkpoints_path}")
+      os.makedirs(config.checkpoints_path, exist_ok=True)
+      with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
+         pyrallis_dump(config, f)
+
+   rng = jax.random.PRNGKey(config.seed)
+   
+   minari_dataset = minari.load_dataset(config.dataset_id)
+   qdataset = qlearning_dataset(minari_dataset)
+   env = get_env(config.device, command_type=config.command_type, dataset=minari_dataset, num_actors=1, env_name=config.env)
+   eval_env = get_env(config.device, command_type=config.command_type, dataset=minari_dataset, num_actors=config.n_eval_actors, env_name=config.env)
+   shifted_env = maybe_get_shifted_env(
+      config.device, command_type=config.command_type,
+      dataset=minari_dataset, eval_shift=config.eval_shift,
+      num_actors=config.n_eval_actors, env_name=config.env
+   )
+
+   buffer = ReplayBuffer(
+      state_dim=qdataset.observations.shape[1],
+      action_dim=qdataset.actions.shape[1],
+      buffer_size=config.buffer_size,
+      seed=config.seed,
+   )
+   obs_mean, obs_std = buffer.load_dataset(qdataset, config)
+   
+   # create train_state
+   rng, subkey = jax.random.split(rng)
+   example_batch = buffer.sample(1)
+   train_state: AWACTrainState = create_awac_train_state(
+      subkey,
+      example_batch.observations[0],
+      example_batch.actions[0],
+      config,
+   )
+   algo = AWAC()
+   update_fn = jax.jit(algo.update_n_times, static_argnums=(3,))
+   act_fn = jax.jit(algo.get_action)
+
+   offline_steps = config.offline_iterations // config.n_jitted_updates
+   online_steps = config.online_iterations // config.n_jitted_updates
+   total_steps = offline_steps + online_steps
+
+   eval_interval = config.eval_frequency // config.n_jitted_updates
+
+   num_envs = getattr(env, "num_envs", 1)
+   obs, _ = env.reset()
+   obs = np.asarray(obs)
+   if obs.ndim == 1:
+      obs = obs[None, ...]
+
+   episode_steps = np.zeros(num_envs, dtype=np.int32)
+   episode_returns = np.zeros(num_envs, dtype=np.float32)
+
+   rng = jax.random.PRNGKey(config.seed)
+
+   print(f"Offline steps: {offline_steps}, Online steps: {online_steps}")
+   
+   for i in tqdm.tqdm(range(1, total_steps + 1), smoothing=0.1, dynamic_ncols=True):
+      if i == offline_steps + 1:
+         print("Switching to online training...")
+         obs, _ = env.reset()
+         obs = np.asarray(obs)
+         if obs.ndim == 1:
+            obs = obs[None, ...]
+
+      if i >= offline_steps + 1:
+         episode_steps += 1
+         norm_obs = (obs - obs_mean) / obs_std
+
+         rng, subkey = jax.random.split(rng)
+         policy_fn = partial(
+            act_fn,
+            seed=subkey,
+            train_state=train_state,
+         )
+   
+         action = policy_fn(observations=norm_obs)
+         next_obs, reward, terminated, truncated, _ = env.step(np.array(action))
+
+         next_obs = np.asarray(next_obs)
+         if next_obs.ndim == 1:
+            next_obs = next_obs[None, ...]
+
+         reward = np.asarray(reward, dtype=np.float32).reshape(num_envs)
+         terminated = np.asarray(terminated, dtype=bool).reshape(num_envs)
+         truncated = np.asarray(truncated, dtype=bool).reshape(num_envs)
+
+         done = terminated | truncated
+         episode_returns += reward
+
+         norm_next_obs = (next_obs - obs_mean) / obs_std
+
+         buffer.add_transitions(
+            norm_obs, action, reward, norm_next_obs, done
+         )
+
+         for env_idx in range(num_envs):
+            if done[env_idx]:
+               wandb.log({
+                  "training/episode_return": float(episode_returns[env_idx]), 
+                  "training/episode_length": int(episode_steps[env_idx])
+               }, step=i)
+               
+               episode_steps[env_idx] = 0
+               episode_returns[env_idx] = 0
+
+         if np.any(done):
+            obs, _ = env.reset()
+            obs = np.asarray(obs)
+            if obs.ndim == 1:
+               obs = obs[None, ...]
+         else:
+            obs = next_obs
+
+      for _ in range(config.n_jitted_updates):
+         rng, subkey = jax.random.split(rng)
+         batch = buffer.sample(config.batch_size)
+
+         train_state, update_info = update_fn(
+            train_state,
+            batch,
+            subkey,
+            config,
+         )
+
+      train_metrics = {f"training/{k}": v for k, v in update_info.items()}
+      wandb.log(train_metrics, step=i)
+
+      if i % eval_interval == 0:
+         policy_fn = partial(
+            act_fn,
+            temperature=0.0,
+            seed=jax.random.PRNGKey(0),
+            train_state=train_state,
+         )
+         normalized_score, raw_score = evaluate(
+            policy_fn, eval_env, config.n_test_episodes, obs_mean, obs_std, seed=config.eval_seed
+         )
+         print(f"Step {i}: {normalized_score}")
+         eval_metrics = {
+            "eval/score": normalized_score,
+            "eval/raw_score": raw_score,
+         }
+         wandb.log(eval_metrics, step=i)
+
+         if config.checkpoints_path is not None and (i // eval_interval) % config.checkpoints_every == 0:
+            checkpoint = {
+               "actor_params": flax_serialization.to_state_dict(train_state.actor.params),
+               "critic_params": flax_serialization.to_state_dict(train_state.critic.params),
+               "target_critic_params": flax_serialization.to_state_dict(train_state.target_critic.params),
+               "obs_mean": np.array(obs_mean),
+               "obs_std": np.array(obs_std),
+               "step": i,
+            }
+            checkpoint_path = os.path.join(config.checkpoints_path, f"checkpoint_{i}.npz")
+            np.savez(checkpoint_path, **checkpoint)
+            print(f"Saved checkpoint to {checkpoint_path}")
+
+   # final evaluation
+   policy_fn = partial(
+      act_fn,
+      temperature=0.0,
+      seed=jax.random.PRNGKey(0),
+      train_state=train_state,
+   )
+   normalized_score, raw_score = evaluate(policy_fn, eval_env, config.n_eval_episodes_final, obs_mean, obs_std, seed=config.eval_seed)
+   print("Final Evaluation Score:", normalized_score)
+   wandb.log({
+      "eval/final_score": normalized_score,
+      "eval/final_raw_score": raw_score,
+   })
+
+   # Tier-5 shifted evaluation: same policy under a harder / held-out perturbation
+   # regime. Reuses the in-distribution refs, so the gap measures robustness.
+   if shifted_env is not None:
+      shifted_score, shifted_raw = evaluate(
+         policy_fn, shifted_env, config.n_eval_episodes_final, obs_mean, obs_std, seed=config.eval_seed
+      )
+      print("Final Shifted Evaluation Score:", shifted_score)
+      wandb.log({
+         "eval/shifted_final_score": shifted_score,
+         "eval/shifted_final_raw_score": shifted_raw,
+         "eval/robustness_gap": normalized_score - shifted_score,
+      })
+
+   policy_fn = lambda obs: algo.get_action(
+      train_state,
+      obs,
+      seed=jax.random.PRNGKey(0),
+      temperature=0.0,
+   )
+
+   # Save final checkpoint
+   if config.checkpoints_path is not None:
+      checkpoint = {
+         "actor_params": flax_serialization.to_state_dict(train_state.actor.params),
+         "critic_params": flax_serialization.to_state_dict(train_state.critic.params),
+         "target_critic_params": flax_serialization.to_state_dict(train_state.target_critic.params),
+         "obs_mean": np.array(obs_mean),
+         "obs_std": np.array(obs_std),
+         "step": total_steps,
+      }
+      checkpoint_path = os.path.join(config.checkpoints_path, "checkpoint_final.npz")
+      np.savez(checkpoint_path, **checkpoint)
+      print(f"Saved final checkpoint to {checkpoint_path}")
+
+   # Sim2real proxy: the scripts/run_srr_eval.sh evaluation on the checkpoint saved
+   # above. Its failure must not take the finished run down with it.
+   if config.checkpoints_path is not None:
+      print("Running proxy evaluation of the final policy...")
+      try:
+         wandb.log(proxy.evaluate(
+            config.checkpoints_path,
+            env_name=config.env,
+            device=config.device,
+            dict_prefix="eval/proxy_results",
+         ))
+      except Exception as e:
+         print(f"[proxy] failed to run proxy evaluation: {e}")
+
+   # Record a rollout video of the final policy
+   try:
+      video_dir = config.checkpoints_path if config.checkpoints_path is not None else "videos"
+      video_path = os.path.join(video_dir, f"{config.name}.mp4")
+      record_policy_video(
+         env_name=config.env,
+         act=lambda o: policy_fn(obs=o),
+         obs_mean=obs_mean,
+         obs_std=obs_std,
+         device=config.device,
+         save_path=video_path,
+         command_type=config.command_type,
+      )
+      wandb.log({"eval/video": wandb.Video(video_path)})
+      print(f"Saved rollout video to {video_path}")
+   except Exception as e:
+      print(f"[video] failed to record rollout video: {e}")
+
+   wandb.finish()
+
+if __name__ == "__main__":
+   train()
