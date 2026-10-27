@@ -123,14 +123,14 @@ OBS_LAYOUTS: Dict[str, ObsLayout] = {
 }
 
 
-def _concat_observation_dict(comp_dict: Dict[str, Any]) -> np.ndarray:
+def _concat_observation_dict(comp_dict: Dict[str, Any]) -> jax.Array:
     """Concatenate component dictionary into the standard 48-dim observation vector.
     
     Order: linvel (3), gyro (3), gravity (3), joint_angles (12), joint_vel (12), last_act (12), command (3).
     """
     keys = ["linvel", "gyro", "gravity", "joint_angles", "joint_vel", "last_act", "command"]
-    components = [np.asarray(comp_dict[k]) for k in keys if k in comp_dict]
-    return np.concatenate(components, axis=-1)
+    components = [jnp.asarray(comp_dict[k]) for k in keys if k in comp_dict]
+    return jnp.concatenate(components, axis=-1)
 
 
 def _extract_observation_components(obs: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -140,9 +140,9 @@ def _extract_observation_components(obs: Any) -> Tuple[Dict[str, Any], Dict[str,
         (clean_dict, noisy_dict) containing keys:
         'linvel', 'gyro', 'gravity', 'joint_angles', 'joint_vel', 'last_act', 'command'
     """
-    if isinstance(obs, dict):
+    if isinstance(obs, (dict, Mapping)):
         if "privileged_state" in obs:
-            privileged_state = np.asarray(obs["privileged_state"])
+            privileged_state = jnp.asarray(obs["privileged_state"])
             noisy_state = privileged_state[..., :48]
             suffix = privileged_state[..., 48:]
             
@@ -166,11 +166,11 @@ def _extract_observation_components(obs: Any) -> Tuple[Dict[str, Any], Dict[str,
             }
             return clean_dict, noisy_dict
         elif "state" in obs:
-            state = np.asarray(obs["state"])
+            state = jnp.asarray(obs["state"])
         else:
-            state = np.asarray(obs)
+            state = jnp.asarray(obs)
     else:
-        state = np.asarray(obs)
+        state = jnp.asarray(obs)
 
     comp_dict = {
         "linvel": state[..., 0:3],
@@ -248,13 +248,13 @@ class RandomizeConfigs:
     ) -> Callable[[Any, Any], Any]:
         if enabled:
             def observation_randomize(obs, _): # type: ignore
-                if isinstance(obs, dict) and "state" in obs:
-                    return np.asarray(obs["state"])
+                if isinstance(obs, (dict, Mapping)) and "state" in obs:
+                    return jnp.asarray(obs["state"])
                 # A flat observation has no component layout to decompose, and the
                 # split below would reassemble it as the 48-dim Go2 vector: H1's 113
                 # dims would be silently truncated instead of forwarded untouched.
-                if not isinstance(obs, dict):
-                    return np.asarray(obs)
+                if not isinstance(obs, (dict, Mapping)):
+                    return jnp.asarray(obs)
                 _, noisy_dict = _extract_observation_components(obs)
                 return _concat_observation_dict(noisy_dict)
         else:
@@ -453,25 +453,12 @@ class RandomizeConfigs:
                     state = state.at[start:stop].set(new)
                     for m_start, m_stop in layout.mirrors.get(k, ()):
                         state = state.at[m_start:m_stop].add(new - old)
-                return np.asarray(state)
+                return state
 
             if getattr(rng, "ndim", 0) == 1:
                 return randomize_single(obs, rng)
             else:
-                if isinstance(obs, dict):
-                    first_val = next(iter(obs.values()))
-                    batch_size = len(first_val)
-                    results = [
-                        randomize_single({k: v[i] for k, v in obs.items()}, rng[i])
-                        for i in range(batch_size)
-                    ]
-                else:
-                    obs_np = np.asarray(obs)
-                    results = [
-                        randomize_single(obs_np[i], rng[i])
-                        for i in range(len(obs_np))
-                    ]
-                return np.stack(results, axis=0)
+                return jax.vmap(randomize_single)(obs, rng)
 
         # For custom configs, `configs.action` is expected to be a factory that
         # receives an RNG key and returns an `action_fn(action)->action` for
@@ -1038,6 +1025,9 @@ class GymWrapper(gym.Env):
         self._mjx_model_v, self._in_axes = self.domain_randomize_fn(
             self._base_mjx_model, init_keys
         )
+        self._has_domain_rand = any(
+            x is not None for x in jax.tree_util.tree_leaves(self._in_axes)
+        )
 
         # If an action_factory is provided, build per-actor action functions
         # from per-actor RNG keys and create a batched action function that
@@ -1079,6 +1069,51 @@ class GymWrapper(gym.Env):
         self._step_fn = jax.jit(
             jax.vmap(dr_step, in_axes=[self._in_axes, 0, 0])
         )
+        self._build_post_step_fn()
+
+    def _build_post_step_fn(self):
+        obs_rand_fn = self.observation_randomize_fn
+        cmd_type = self.command_type
+        cmd_slice = self._cmd_slice
+
+        def _post_step(env_state):
+            obs = self._maybe_unfreeze(env_state.obs)
+            info = self._maybe_unfreeze(env_state.info)
+            if "rng" in info:
+                rng = info["rng"]
+                if getattr(rng, "ndim", 0) == 1:
+                    next_rng, obs_rng = jax.random.split(rng)
+                else:
+                    split_rngs = jax.vmap(lambda key: jax.random.split(key, 2))(rng)
+                    next_rng, obs_rng = split_rngs[:, 0], split_rngs[:, 1]
+                info["rng"] = next_rng
+            else:
+                obs_rng = None
+
+            state_obs = jnp.asarray(obs_rand_fn(obs, obs_rng))
+
+            if cmd_type is not None and cmd_slice is not None and "command" in info:
+                commands = info["command"]
+                zeros = jnp.zeros_like(commands)
+                if cmd_type == "forwardbackward":
+                    command = zeros.at[..., 0].set(commands[..., 0])
+                elif cmd_type == "forward":
+                    command = zeros.at[..., 0].set(jnp.abs(commands[..., 0]))
+                elif cmd_type == "forwardfixed":
+                    command = zeros.at[..., 0].set(1.0)
+                elif cmd_type == "forward_realrobot":
+                    command = zeros.at[..., 0].set(0.2)
+                else:
+                    command = None
+
+                if command is not None:
+                    start, stop = cmd_slice
+                    state_obs = state_obs.at[..., start:stop].set(command)
+                    info["command"] = command
+
+            return env_state.replace(obs=state_obs, info=info)
+
+        self._post_step_fn = jax.jit(_post_step)
 
     def _build_batched_action_fn(self, actor_keys):
         action_size = self.env.action_size
@@ -1134,52 +1169,24 @@ class GymWrapper(gym.Env):
         return np.asarray(tree)
 
     def _apply_command_override(self, env_state):
-        obs = self._maybe_unfreeze(env_state.obs)
+        if self.command_type is not None and self._cmd_slice is None and "command" in env_state.info:
+            obs = self._maybe_unfreeze(env_state.obs)
+            state_obs = jnp.asarray(self.observation_randomize_fn(obs, None))
+            commands = env_state.info["command"]
+            self._cmd_slice = locate_command_slice(
+                state_obs[0] if state_obs.ndim > 1 else state_obs,
+                commands[0] if commands.ndim > 1 else commands,
+            )
+            self._build_post_step_fn()
 
-        info = self._maybe_unfreeze(env_state.info)
-        if "rng" in info:
-            rng = info["rng"]
-            if getattr(rng, "ndim", 0) == 1:
-                next_rng, obs_rng = jax.random.split(rng)
-            else:
-                split_rngs = jax.vmap(lambda key: jax.random.split(key, 2))(rng)
-                next_rng, obs_rng = split_rngs[:, 0], split_rngs[:, 1]
-            info["rng"] = next_rng
-        else:
-            obs_rng = None
-
-        state_obs = jnp.asarray(self.observation_randomize_fn(obs, obs_rng))
+        env_state = self._post_step_fn(env_state)
 
         observation_fn = getattr(self, "observation_fn", None)
         if observation_fn is not None:
-            state_obs = jnp.asarray(observation_fn(state_obs))
+            state_obs = jnp.asarray(observation_fn(env_state.obs))
+            env_state = env_state.replace(obs=state_obs)
 
-        if self.command_type is not None and "command" in info:
-            commands = info["command"]
-            zeros = jnp.zeros_like(commands)
-
-            if self.command_type == "forwardbackward":
-                command = zeros.at[..., 0].set(commands[..., 0])
-            elif self.command_type == "forward":
-                command = zeros.at[..., 0].set(jnp.abs(commands[..., 0]))
-            elif self.command_type == "forwardfixed":
-                command = zeros.at[..., 0].set(1.0)
-            elif self.command_type == "forward_realrobot":
-                command = zeros.at[..., 0].set(0.2)
-            else:
-                command = None
-
-            if command is not None:
-                if self._cmd_slice is None:
-                    self._cmd_slice = locate_command_slice(
-                        state_obs[0] if state_obs.ndim > 1 else state_obs,
-                        commands[0] if commands.ndim > 1 else commands,
-                    )
-                start, stop = self._cmd_slice
-                state_obs = state_obs.at[..., start:stop].set(command)
-                info["command"] = command
-
-        return env_state.replace(obs=state_obs, info=info)
+        return env_state
 
     def reset_rng(self, seed: int = 0):
         """Reseed the internal RNG so evaluation rollouts are reproducible.
@@ -1207,10 +1214,11 @@ class GymWrapper(gym.Env):
         if self.domain_randomize_fn is not None:
             if self._randomize_every_episode:
                 self.rng, dr_rng = jax.random.split(self.rng)
-                dr_keys = jax.random.split(dr_rng, self.num_envs)
-                self._mjx_model_v, _ = self.domain_randomize_fn(
-                    self._base_mjx_model, dr_keys
-                )
+                if getattr(self, "_has_domain_rand", True):
+                    dr_keys = jax.random.split(dr_rng, self.num_envs)
+                    self._mjx_model_v, _ = self.domain_randomize_fn(
+                        self._base_mjx_model, dr_keys
+                    )
             self.env_state = self._reset_fn(self._mjx_model_v, reset_keys)
         else:
             self.env_state = self._reset_fn(reset_keys)
@@ -1219,9 +1227,9 @@ class GymWrapper(gym.Env):
         self.timesteps = 0
         obs_field = self.env_state.obs
         if isinstance(obs_field, (dict, Mapping)):
-            obs = np.asarray(obs_field["state"])
+            obs = np.asarray(jax.device_get(obs_field["state"]))
         else:
-            obs = np.asarray(obs_field)
+            obs = np.asarray(jax.device_get(obs_field))
         return obs, {}
 
     def step(self, action):
@@ -1246,14 +1254,17 @@ class GymWrapper(gym.Env):
         self.timesteps += 1
         obs_field = self.env_state.obs
         if isinstance(obs_field, (dict, Mapping)):
-            obs = np.asarray(obs_field["state"])
-        else:
-            obs = np.asarray(obs_field)
-        rew = np.asarray(self.env_state.reward)
-        done = np.asarray(self.env_state.done)
-        truncated = np.asarray([self.timesteps >= self.episode_length for _ in range(self.num_envs)])
-        info = self._tree_to_numpy(self.env_state.info)
-        return obs, rew, done, truncated, info
+            obs_field = obs_field["state"]
+        obs, rew, done = jax.device_get(
+            (obs_field, self.env_state.reward, self.env_state.done)
+        )
+        obs = np.asarray(obs)
+        rew = np.asarray(rew)
+        done = np.asarray(done)
+        truncated = np.full(
+            (self.num_envs,), self.timesteps >= self.episode_length, dtype=bool
+        )
+        return obs, rew, done, truncated, {}
 
     def get_normalized_score(self, score):
         """D4RL-style normalized score, where ~1.0 corresponds to the expert.

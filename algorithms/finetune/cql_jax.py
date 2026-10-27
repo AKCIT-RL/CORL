@@ -1,0 +1,1179 @@
+# source https://github.com/young-geng/JaxCQL
+# https://arxiv.org/abs/2006.04779
+import os
+import uuid
+from copy import deepcopy
+from dataclasses import asdict, dataclass
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
+
+import distrax
+import flax.linen as nn
+from pyrallis.argparsing import wrap as pyrallis_wrap
+from pyrallis.cfgparsing import dump as pyrallis_dump
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+import tqdm
+import wandb
+from flax import serialization as flax_serialization
+from flax.training.train_state import TrainState
+
+import minari
+
+from algorithms.utils import proxy
+from algorithms.utils.randomize_gym import GymWrapper, get_env, maybe_get_shifted_env, record_policy_video
+from algorithms.utils.dataset import qlearning_dataset, Dataset
+from algorithms.utils.replay_buffer import Batch, ReplayBuffer
+
+os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True"
+
+
+@dataclass
+class CQLConfig:
+    # wandb project name
+    project: str = "CORL"
+    # wandb group name
+    group: str = "CQL-D4RL"
+    # wandb run name
+    name: str = "CQL"
+    # training device
+    device: str = "cuda"
+    # training dataset and evaluation environment
+    env: str = "halfcheetah-medium-expert-v2"
+    dataset_id: str = "halfcheetah-medium-expert-v2"
+    # training random seed
+    seed: int = 0
+    # evaluation frequency, will evaluate every eval_freq training steps
+    eval_freq: int = int(5e3)
+    # number of episodes to run during evaluation
+    n_episodes: int = 10
+    # number of episodes for the final evaluation (larger -> lower variance)
+    n_eval_episodes_final: int = 50
+    n_eval_actors: int = 10
+    # fixed seed for evaluation rollouts (reproducible / comparable)
+    eval_seed: int = 0
+    # Number of offline updates
+    offline_iterations: int = int(1e6)
+    # Number of online updates
+    online_iterations: int = int(1e6)
+    # path for checkpoints saving, optional
+    checkpoints_path: Optional[str] = None
+    # save an intermediate checkpoint every N evaluations (final always saved)
+    checkpoints_every: int = 10
+    # file name for loading a model, optional
+    load_model: str = ""
+    # maximum size of the replay buffer
+    buffer_size: int = 2_000_000
+    # training batch size
+    batch_size: int = 256
+    # discount factor
+    discount: float = 0.99
+    # Multiplier for alpha in loss
+    alpha_multiplier: float = 1.0
+    # Tune entropy
+    use_automatic_entropy_tuning: bool = True
+    # Use backup entropy
+    backup_entropy: bool = False
+    # Target entropy (computed automatically if 0.0)
+    target_entropy: float = 0.0
+    # Policy learning rate
+    policy_lr: float = 3e-5
+    # Critics learning rate
+    qf_lr: float = 3e-4
+    # Target network update rate
+    soft_target_update_rate: float = 5e-3
+    # Frequency of target nets updates
+    target_update_period: int = 1
+    # Number of sampled actions
+    cql_n_actions: int = 10
+    # Use importance sampling
+    cql_importance_sample: bool = True
+    # Use Lagrange version of CQL
+    cql_lagrange: bool = False
+    # Action gap
+    cql_target_action_gap: float = -1.0
+    # CQL temperature
+    cql_temp: float = 1.0
+    # Minimal Q weight (cql_alpha)
+    cql_alpha: float = 10.0
+    # Use max target backup
+    cql_max_target_backup: bool = False
+    # Use CQL (should always be True for CQL algorithm)
+    use_cql: bool = True
+    # Q-function lower loss clipping
+    cql_clip_diff_min: float = -np.inf
+    # Q-function upper loss clipping
+    cql_clip_diff_max: float = np.inf
+    # Orthogonal initialization
+    orthogonal_init: bool = True
+    # Normalize states
+    normalize: bool = True
+    # Normalize reward
+    normalize_reward: bool = False
+    # Number of hidden layers in Q networks
+    q_n_hidden_layers: int = 3
+    # Number of BC steps at start
+    bc_steps: int = int(0)
+    # Reward scale for normalization
+    reward_scale: float = 5.0
+    # Reward bias for normalization
+    reward_bias: float = -1.0
+    # Stochastic policy std multiplier
+    policy_log_std_multiplier: float = 1.0
+    # Stochastic policy std offset
+    policy_log_std_offset: float = -1.0
+    # NETWORK
+    hidden_dims: Tuple[int, ...] = (256, 256)
+    # Action dimension (set automatically at runtime)
+    action_dim: Optional[int] = None
+    # JAX specific
+    n_jitted_updates: int = 8
+    # Optimizer type ("adam" or "sgd")
+    optimizer_type: str = "adam"
+    # command type for environment (e.g., "direction", "forward", "forwardfixed")
+    command_type: Optional[str] = None
+    # Optional Tier-5 shifted evaluation: JSON string of flattened env-config
+    # overrides (e.g. stronger push-recovery kicks) applied only to a second eval
+    # env. Normalization reuses the in-distribution dataset refs, so the shifted
+    # score is comparable to eval/final_score (their gap = robustness gap).
+    eval_shift: Optional[str] = None
+
+    def __post_init__(self):
+        self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
+        if self.checkpoints_path is not None:
+            self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
+
+    def __hash__(self):
+        return hash(self.__repr__())
+
+
+def extend_and_repeat(tensor: jnp.ndarray, axis: int, repeat: int) -> jnp.ndarray:
+    return jnp.repeat(jnp.expand_dims(tensor, axis), repeat, axis=axis)
+
+
+def mse_loss(val: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
+    return jnp.mean(jnp.square(val - target))
+
+
+def value_and_multi_grad(
+    fun: Callable, n_outputs: int, argnums=0, has_aux=False
+) -> Callable:
+    def select_output(index: int) -> Callable:
+        def wrapped(*args, **kwargs):
+            if has_aux:
+                x, *aux = fun(*args, **kwargs)
+                return (x[index], *aux)
+            else:
+                x = fun(*args, **kwargs)
+                return x[index]
+
+        return wrapped
+
+    grad_fns = tuple(
+        jax.value_and_grad(select_output(i), argnums=argnums, has_aux=has_aux)
+        for i in range(n_outputs)
+    )
+
+    def multi_grad_fn(*args, **kwargs):
+        grads = []
+        values = []
+        for grad_fn in grad_fns:
+            (value, *aux), grad = grad_fn(*args, **kwargs)
+            values.append(value)
+            grads.append(grad)
+        return (tuple(values), *aux), tuple(grads)
+
+    return multi_grad_fn
+
+
+def update_target_network(main_params: Any, target_params: Any, tau: float) -> Any:
+    return jax.tree_util.tree_map(
+        lambda x, y: tau * x + (1.0 - tau) * y, main_params, target_params
+    )
+
+
+def multiple_action_q_function(forward: Callable) -> Callable:
+    # Forward the q function with multiple actions on each state, to be used as a decorator
+    def wrapped(
+        self, observations: jnp.ndarray, actions: jnp.ndarray, **kwargs
+    ) -> jnp.ndarray:
+        multiple_actions = False
+        batch_size = observations.shape[0]
+        if actions.ndim == 3 and observations.ndim == 2:
+            multiple_actions = True
+            observations = extend_and_repeat(observations, 1, actions.shape[1]).reshape(
+                -1, observations.shape[-1]
+            )
+            actions = actions.reshape(-1, actions.shape[-1])
+        q_values = forward(self, observations, actions, **kwargs)
+        if multiple_actions:
+            q_values = q_values.reshape(batch_size, -1)
+        return q_values
+
+    return wrapped
+
+
+class Scalar(nn.Module):
+    init_value: float
+
+    def setup(self) -> None:
+        self.value = self.param("value", lambda x: self.init_value)
+
+    def __call__(self) -> float:
+        return self.value
+
+
+class FullyConnectedNetwork(nn.Module):
+    output_dim: int
+    hidden_dims: Tuple[int, ...] = (256, 256)
+    orthogonal_init: bool = False
+
+    @nn.compact
+    def __call__(self, input_tensor: jnp.ndarray) -> jnp.ndarray:
+        x = input_tensor
+        for h in self.hidden_dims:
+            if self.orthogonal_init:
+                x = nn.Dense(
+                    h,
+                    kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2.0)),
+                    bias_init=jax.nn.initializers.zeros,
+                )(x)
+            else:
+                x = nn.Dense(h)(x)
+            x = nn.relu(x)
+
+        if self.orthogonal_init:
+            output = nn.Dense(
+                self.output_dim,
+                kernel_init=jax.nn.initializers.orthogonal(1e-2),
+                bias_init=jax.nn.initializers.zeros,
+            )(x)
+        else:
+            output = nn.Dense(
+                self.output_dim,
+                kernel_init=jax.nn.initializers.variance_scaling(
+                    1e-2, "fan_in", "uniform"
+                ),
+                bias_init=jax.nn.initializers.zeros,
+            )(x)
+        return output
+
+
+class FullyConnectedQFunction(nn.Module):
+    observation_dim: int
+    action_dim: int
+    hidden_dims: Tuple[int, ...] = (256, 256)
+    orthogonal_init: bool = False
+
+    @nn.compact
+    @multiple_action_q_function
+    def __call__(self, observations: jnp.ndarray, actions: jnp.ndarray) -> jnp.ndarray:
+        x = jnp.concatenate([observations, actions], axis=-1)
+        x = FullyConnectedNetwork(
+            output_dim=1,
+            hidden_dims=self.hidden_dims,
+            orthogonal_init=self.orthogonal_init,
+        )(x)
+        return jnp.squeeze(x, -1)
+
+
+class TanhGaussianPolicy(nn.Module):
+    observation_dim: int
+    action_dim: int
+    hidden_dims: Tuple[int, ...] = (256, 256)
+    orthogonal_init: bool = False
+    log_std_multiplier: float = 1.0
+    log_std_offset: float = -1.0
+
+    def setup(self) -> None:
+        self.base_network = FullyConnectedNetwork(
+            output_dim=2 * self.action_dim,
+            hidden_dims=self.hidden_dims,
+            orthogonal_init=self.orthogonal_init,
+        )
+        self.log_std_multiplier_module = Scalar(self.log_std_multiplier)
+        self.log_std_offset_module = Scalar(self.log_std_offset)
+
+    def log_prob(self, observations: jnp.ndarray, actions: jnp.ndarray) -> jax.Array:
+        if actions.ndim == 3:
+            observations = extend_and_repeat(observations, 1, actions.shape[1])
+        base_network_output = self.base_network(observations)
+        mean, log_std = jnp.split(base_network_output, 2, axis=-1)
+        log_std = (
+            self.log_std_multiplier_module() * log_std + self.log_std_offset_module()
+        )
+        log_std = jnp.clip(log_std, -20.0, 2.0)
+        action_distribution = distrax.Transformed(
+            distrax.MultivariateNormalDiag(mean, jnp.exp(log_std)),
+            distrax.Block(distrax.Tanh(), ndims=1),
+        )
+        return action_distribution.log_prob(actions) # type: ignore
+
+    def __call__(
+        self,
+        observations: jnp.ndarray,
+        rng: jax.Array,
+        deterministic=False,
+        repeat=None,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        if repeat is not None:
+            observations = extend_and_repeat(observations, 1, repeat)
+        base_network_output = self.base_network(observations)
+        mean, log_std = jnp.split(base_network_output, 2, axis=-1)
+        log_std = (
+            self.log_std_multiplier_module() * log_std + self.log_std_offset_module()
+        )
+        log_std = jnp.clip(log_std, -20.0, 2.0)
+        action_distribution = distrax.Transformed(
+            distrax.MultivariateNormalDiag(mean, jnp.exp(log_std)),
+            distrax.Block(distrax.Tanh(), ndims=1),
+        )
+        if deterministic:
+            samples = jnp.tanh(mean)
+            log_prob = action_distribution.log_prob(samples)
+        else:
+            samples, log_prob = action_distribution.sample_and_log_prob(seed=rng)
+
+        return samples, log_prob # type: ignore
+
+
+class Transition(NamedTuple):
+    observations: jnp.ndarray
+    actions: jnp.ndarray
+    rewards: jnp.ndarray
+    next_observations: jnp.ndarray
+    dones: jnp.ndarray
+
+
+def get_dataset(
+    dataset: Dataset, config: CQLConfig, clip_to_eps: bool = True, eps: float = 1e-5
+) -> Tuple[Transition, float, float]:
+    if clip_to_eps:
+        lim = 1 - eps
+        dataset.actions = np.clip(dataset.actions, -lim, lim)
+
+    transition = Transition(
+        observations=jnp.array(dataset.observations, dtype=jnp.float32),
+        actions=jnp.array(dataset.actions, dtype=jnp.float32),
+        rewards=jnp.array(dataset.rewards, dtype=jnp.float32),
+        next_observations=jnp.array(dataset.next_observations, dtype=jnp.float32),
+        dones=jnp.array(dataset.terminals, dtype=jnp.float32),
+    )
+    # shuffle data and select the first buffer_size samples
+    data_size = min(config.buffer_size, len(transition.observations))
+    rng = jax.random.PRNGKey(config.seed)
+    rng, rng_permute, rng_select = jax.random.split(rng, 3)
+    perm = jax.random.permutation(rng_permute, len(transition.observations))
+    transition = jax.tree_util.tree_map(lambda x: x[perm], transition)
+    assert len(transition.observations) >= data_size
+    transition = jax.tree_util.tree_map(lambda x: x[:data_size], transition)
+    # normalize states
+    obs_mean, obs_std = 0, 1
+    if config.normalize:
+        obs_mean = transition.observations.mean(0)
+        obs_std = transition.observations.std(0)
+        transition = transition._replace(
+            observations=(transition.observations - obs_mean) / (obs_std + 1e-5),
+            next_observations=(transition.next_observations - obs_mean) / (obs_std + 1e-5),
+        )
+    return transition, obs_mean, obs_std
+
+
+def collect_metrics(metrics, names, prefix=None):
+    collected = {}
+    for name in names:
+        if name in metrics:
+            collected[name] = jnp.mean(metrics[name])
+    if prefix is not None:
+        collected = {
+            "{}/{}".format(prefix, key): value for key, value in collected.items()
+        }
+    return collected
+
+
+class CQLTrainState(NamedTuple):
+    policy: TrainState 
+    qf1: TrainState 
+    qf2: TrainState 
+    log_alpha: TrainState 
+    alpha_prime: TrainState 
+    target_qf1_params: Any 
+    target_qf2_params: Any 
+    global_steps: int = 0
+
+    def train_params(self):
+        params_dict = {
+            "policy": self.policy.params,
+            "qf1": self.qf1.params,
+            "qf2": self.qf2.params,
+            "log_alpha": self.log_alpha.params,
+            "alpha_prime": self.alpha_prime.params,
+        }
+        return params_dict
+
+    def target_params(self):
+        return {"qf1": self.target_qf1_params, "qf2": self.target_qf2_params}
+
+    def model_keys(self):
+        keys = ["policy", "qf1", "qf2", "log_alpha", "alpha_prime"]
+        return keys
+
+    def to_dict(self):
+        _dict = {
+            "policy": self.policy,
+            "qf1": self.qf1,
+            "qf2": self.qf2,
+            "log_alpha": self.log_alpha,
+            "alpha_prime": self.alpha_prime,
+        }           
+        return _dict
+
+    def update_from_dict(
+        self, new_states: Dict[str, TrainState], new_target_qf_params: Dict[str, Any]
+    ):
+        return self._replace(
+            policy=new_states["policy"],
+            qf1=new_states["qf1"],
+            qf2=new_states["qf2"],
+            log_alpha=new_states["log_alpha"],
+            alpha_prime=new_states["alpha_prime"],
+            target_qf1_params=new_target_qf_params["qf1"],
+            target_qf2_params=new_target_qf_params["qf2"],
+        )
+
+
+class CQL(object):
+    policy: TanhGaussianPolicy
+    
+    @classmethod
+    def update_n_times(
+        cls,
+        train_state: CQLTrainState,
+        batches: Batch,
+        rng: jax.Array,
+        config: CQLConfig,
+        bc: bool = False,
+    ) -> Tuple[CQLTrainState, Dict]:
+        batches = jax.tree_util.tree_map(
+            lambda x: x.reshape(
+                (config.n_jitted_updates, config.batch_size) + x.shape[1:]
+            ),
+            batches,
+        )
+
+        def body_fn(carry, batch):
+            state, step_rng = carry
+            step_rng, update_rng = jax.random.split(step_rng)
+            state, metrics = cls._train_step(
+                state, update_rng, batch, config, bc
+            )
+            return (state, step_rng), metrics
+
+        (train_state, _), update_info = jax.lax.scan(
+            body_fn, (train_state, rng), batches
+        )
+        return train_state, jax.tree_util.tree_map(lambda x: x[-1], update_info)
+
+    @classmethod
+    def _train_step(cls, train_state: CQLTrainState, _rng, batch, config, bc=False):
+        policy_fn = train_state.policy.apply_fn
+        qf_fn = train_state.qf1.apply_fn
+        log_alpha_fn = train_state.log_alpha.apply_fn
+        alpha_prime_fn = train_state.alpha_prime.apply_fn
+        target_qf_params = train_state.target_params()
+
+        def loss_fn(train_params):
+            observations = batch.observations
+            actions = batch.actions
+            rewards = batch.rewards
+            next_observations = batch.next_observations
+            dones = batch.dones
+
+            loss_collection = {}
+
+            rng, new_actions_rng = jax.random.split(_rng)
+            new_actions, log_pi = policy_fn(
+                train_params["policy"], observations, new_actions_rng
+            )
+
+            if config.use_automatic_entropy_tuning:
+                alpha_loss = (
+                    -log_alpha_fn(train_params["log_alpha"])
+                    * (log_pi + config.target_entropy).mean()
+                )
+                loss_collection["log_alpha"] = alpha_loss
+                alpha = (
+                    jnp.exp(log_alpha_fn(train_params["log_alpha"]))
+                    * config.alpha_multiplier
+                )
+            else:
+                alpha_loss = 0.0
+                alpha = config.alpha_multiplier
+
+            """ Policy loss """
+            if bc:
+                rng, bc_rng = jax.random.split(rng)
+                log_probs = policy_fn(
+                    train_params["policy"],
+                    observations,
+                    actions,
+                    bc_rng,
+                    method=cls.policy.log_prob,
+                )
+                policy_loss = (alpha * log_pi - log_probs).mean()
+            else:
+                q_new_actions = jnp.minimum(
+                    qf_fn(train_params["qf1"], observations, new_actions),
+                    qf_fn(train_params["qf2"], observations, new_actions),
+                )
+                policy_loss = (alpha * log_pi - q_new_actions).mean()
+
+            loss_collection["policy"] = policy_loss
+
+            """ Q function loss """
+            q1_pred = qf_fn(train_params["qf1"], observations, actions)
+            q2_pred = qf_fn(train_params["qf2"], observations, actions)
+
+            if config.cql_max_target_backup:
+                rng, cql_rng = jax.random.split(rng)
+                new_next_actions, next_log_pi = policy_fn(
+                    train_params["policy"],
+                    next_observations,
+                    cql_rng,
+                    repeat=config.cql_n_actions,
+                )
+                target_q_values = jnp.minimum(
+                    qf_fn(target_qf_params["qf1"], next_observations, new_next_actions),
+                    qf_fn(target_qf_params["qf2"], next_observations, new_next_actions),
+                )
+                max_target_indices = jnp.expand_dims(
+                    jnp.argmax(target_q_values, axis=-1), axis=-1
+                )
+                target_q_values = jnp.take_along_axis(
+                    target_q_values, max_target_indices, axis=-1
+                ).squeeze(-1)
+                next_log_pi = jnp.take_along_axis(
+                    next_log_pi, max_target_indices, axis=-1
+                ).squeeze(-1)
+            else:
+                rng, cql_rng = jax.random.split(rng)
+                new_next_actions, next_log_pi = policy_fn(
+                    train_params["policy"], next_observations, cql_rng
+                )
+                target_q_values = jnp.minimum(
+                    qf_fn(target_qf_params["qf1"], next_observations, new_next_actions),
+                    qf_fn(target_qf_params["qf2"], next_observations, new_next_actions),
+                )
+
+            if config.backup_entropy:
+                target_q_values = target_q_values - alpha * next_log_pi
+
+            td_target = jax.lax.stop_gradient(
+                rewards + (1.0 - dones) * config.discount * target_q_values
+            )
+            qf1_loss = mse_loss(q1_pred, td_target)
+            qf2_loss = mse_loss(q2_pred, td_target)
+
+            ### CQL
+            if config.use_cql:
+                batch_size = actions.shape[0]
+                rng, random_rng = jax.random.split(rng)
+                cql_random_actions = jax.random.uniform(
+                    random_rng,
+                    shape=(batch_size, config.cql_n_actions, config.action_dim),
+                    minval=-1.0,
+                    maxval=1.0,
+                )
+                rng, current_rng = jax.random.split(rng)
+                cql_current_actions, cql_current_log_pis = policy_fn(
+                    train_params["policy"],
+                    observations,
+                    current_rng,
+                    repeat=config.cql_n_actions,
+                )
+                rng, next_rng = jax.random.split(rng)
+                cql_next_actions, cql_next_log_pis = policy_fn(
+                    train_params["policy"],
+                    next_observations,
+                    next_rng,
+                    repeat=config.cql_n_actions,
+                )
+
+                cql_q1_rand = qf_fn(
+                    train_params["qf1"], observations, cql_random_actions
+                )
+                cql_q2_rand = qf_fn(
+                    train_params["qf2"], observations, cql_random_actions
+                )
+                cql_q1_current_actions = qf_fn(
+                    train_params["qf1"], observations, cql_current_actions
+                )
+                cql_q2_current_actions = qf_fn(
+                    train_params["qf2"], observations, cql_current_actions
+                )
+                cql_q1_next_actions = qf_fn(
+                    train_params["qf1"], observations, cql_next_actions
+                )
+                cql_q2_next_actions = qf_fn(
+                    train_params["qf2"], observations, cql_next_actions
+                )
+
+                cql_cat_q1 = jnp.concatenate(
+                    [
+                        cql_q1_rand,
+                        jnp.expand_dims(q1_pred, 1),
+                        cql_q1_next_actions,
+                        cql_q1_current_actions,
+                    ],
+                    axis=1,
+                )
+                cql_cat_q2 = jnp.concatenate(
+                    [
+                        cql_q2_rand,
+                        jnp.expand_dims(q2_pred, 1),
+                        cql_q2_next_actions,
+                        cql_q2_current_actions,
+                    ],
+                    axis=1,
+                )
+                cql_std_q1 = jnp.std(cql_cat_q1, axis=1)
+                cql_std_q2 = jnp.std(cql_cat_q2, axis=1)
+
+                if config.cql_importance_sample:
+                    random_density = np.log(0.5**config.action_dim)
+                    cql_cat_q1 = jnp.concatenate(
+                        [
+                            cql_q1_rand - random_density,
+                            cql_q1_next_actions - cql_next_log_pis,
+                            cql_q1_current_actions - cql_current_log_pis,
+                        ],
+                        axis=1,
+                    )
+                    cql_cat_q2 = jnp.concatenate(
+                        [
+                            cql_q2_rand - random_density,
+                            cql_q2_next_actions - cql_next_log_pis,
+                            cql_q2_current_actions - cql_current_log_pis,
+                        ],
+                        axis=1,
+                    )
+
+                cql_qf1_ood = (
+                    jax.scipy.special.logsumexp(cql_cat_q1 / config.cql_temp, axis=1)
+                    * config.cql_temp
+                )
+                cql_qf2_ood = (
+                    jax.scipy.special.logsumexp(cql_cat_q2 / config.cql_temp, axis=1)
+                    * config.cql_temp
+                )
+
+                """Subtract the log likelihood of data"""
+                cql_qf1_diff = jnp.clip(
+                    cql_qf1_ood - q1_pred,
+                    config.cql_clip_diff_min,
+                    config.cql_clip_diff_max,
+                ).mean()
+                cql_qf2_diff = jnp.clip(
+                    cql_qf2_ood - q2_pred,
+                    config.cql_clip_diff_min,
+                    config.cql_clip_diff_max,
+                ).mean()
+
+                if config.cql_lagrange:
+                    alpha_prime = jnp.clip(
+                        jnp.exp(alpha_prime_fn(train_params["alpha_prime"])),
+                        a_min=0.0,
+                        a_max=1000000.0,
+                    )
+                    cql_min_qf1_loss = alpha_prime * config.cql_alpha * (cql_qf1_diff - config.cql_target_action_gap)
+                    cql_min_qf2_loss = alpha_prime * config.cql_alpha * (cql_qf2_diff - config.cql_target_action_gap)
+
+                    alpha_prime_loss = - (cql_min_qf1_loss + cql_min_qf2_loss) * 0.5
+                else:
+                    cql_min_qf1_loss = cql_qf1_diff * config.cql_alpha
+                    cql_min_qf2_loss = cql_qf2_diff * config.cql_alpha
+                    alpha_prime_loss = 0.0
+                    alpha_prime = 0.0
+
+                loss_collection["alpha_prime"] = alpha_prime_loss
+
+                qf1_loss = qf1_loss + cql_min_qf1_loss
+                qf2_loss = qf2_loss + cql_min_qf2_loss
+
+            loss_collection["qf1"] = qf1_loss
+            loss_collection["qf2"] = qf2_loss
+            return (
+                tuple(loss_collection[key] for key in train_state.model_keys()),
+                locals(),
+            )
+
+        train_params = train_state.train_params()
+        (_, aux_values), grads = value_and_multi_grad(
+            loss_fn, len(train_params), has_aux=True
+        )(train_params)
+
+        new_train_states = {
+            key: train_state.to_dict()[key].apply_gradients(grads=grads[i][key])
+            for i, key in enumerate(train_state.model_keys())
+        }
+        new_target_qf_params = {}
+        new_target_qf_params["qf1"] = update_target_network(
+            new_train_states["qf1"].params,
+            target_qf_params["qf1"],
+            config.soft_target_update_rate,
+        )
+        new_target_qf_params["qf2"] = update_target_network(
+            new_train_states["qf2"].params,
+            target_qf_params["qf2"],
+            config.soft_target_update_rate,
+        )
+        train_state = train_state.update_from_dict(
+            new_train_states, new_target_qf_params
+        )
+
+        metrics = collect_metrics(
+            aux_values,
+            [
+                "log_pi",
+                "policy_loss",
+                "qf1_loss",
+                "qf2_loss",
+                "alpha_loss",
+                "alpha",
+                "q1_pred",
+                "q2_pred",
+                "target_q_values",
+            ],
+        )
+
+        if config.use_cql:
+            metrics.update(
+                collect_metrics(
+                    aux_values,
+                    [
+                        "cql_std_q1",
+                        "cql_std_q2",
+                        "cql_q1_rand",
+                        "cql_q2_rand" "cql_qf1_diff",
+                        "cql_qf2_diff",
+                        "cql_min_qf1_loss",
+                        "cql_min_qf2_loss",
+                        "cql_q1_current_actions",
+                        "cql_q2_current_actions" "cql_q1_next_actions",
+                        "cql_q2_next_actions",
+                        "alpha_prime",
+                        "alpha_prime_loss",
+                    ],
+                    "cql",
+                )
+            )
+
+        return train_state, metrics
+
+    @classmethod
+    def get_action(cls, train_state, obs):
+        is_single_observation = obs.ndim == 1
+        batched_obs = obs[None, :] if is_single_observation else obs
+        action, _ = train_state.policy.apply_fn(
+            train_state.policy.params,
+            batched_obs,
+            jax.random.PRNGKey(0),
+            deterministic=True,
+        )
+        return action.squeeze(0) if is_single_observation else action
+
+
+def create_cql_train_state(
+    rng: jax.Array,
+    observations: jnp.ndarray,
+    actions: jnp.ndarray,
+    config: CQLConfig,
+    action_dim: int,
+) -> CQLTrainState:
+    policy_model = TanhGaussianPolicy(
+        observation_dim=observations.shape[-1],
+        action_dim=actions.shape[-1],
+        hidden_dims=config.hidden_dims,
+        orthogonal_init=config.orthogonal_init,
+        log_std_multiplier=config.policy_log_std_multiplier,
+        log_std_offset=config.policy_log_std_offset,
+    )
+    qf_model = FullyConnectedQFunction(
+        observation_dim=observations.shape[-1],
+        action_dim=actions.shape[-1],
+        hidden_dims=config.hidden_dims,
+        orthogonal_init=config.orthogonal_init,
+    )
+    optimizer_class = {
+        "adam": optax.adam,
+        "sgd": optax.sgd,
+    }[config.optimizer_type]
+
+    rng, policy_rng, q1_rng, q2_rng = jax.random.split(rng, 4)
+
+    policy_params = policy_model.init(policy_rng, observations, policy_rng)
+    policy = TrainState.create(
+        params=policy_params,
+        tx=optimizer_class(config.policy_lr),
+        apply_fn=policy_model.apply,
+    )
+
+    qf1_params = qf_model.init(
+        q1_rng,
+        observations,
+        actions,
+    )
+    qf1 = TrainState.create(
+        params=qf1_params,
+        tx=optimizer_class(config.qf_lr),
+        apply_fn=qf_model.apply,
+    )
+    qf2_params = qf_model.init(
+        q2_rng,
+        observations,
+        actions,
+    )
+    qf2 = TrainState.create(
+        params=qf2_params,
+        tx=optimizer_class(config.qf_lr),
+        apply_fn=qf_model.apply,
+    )
+    target_qf1_params = deepcopy(qf1_params)
+    target_qf2_params = deepcopy(qf2_params)
+
+    log_alpha_model = Scalar(0.0)
+    rng, log_alpha_rng = jax.random.split(rng)
+    log_alpha = TrainState.create(
+        params=log_alpha_model.init(log_alpha_rng),
+        tx=optimizer_class(config.policy_lr),
+        apply_fn=log_alpha_model.apply,
+    )
+
+    alpha_prime_model = Scalar(1.0)
+    rng, alpha_prime_rng = jax.random.split(rng)
+    alpha_prime = TrainState.create(
+        params=alpha_prime_model.init(alpha_prime_rng),
+        tx=optimizer_class(config.qf_lr),
+        apply_fn=alpha_prime_model.apply,
+    )
+    return CQLTrainState(
+        policy=policy,
+        qf1=qf1,
+        qf2=qf2,
+        log_alpha=log_alpha,
+        alpha_prime=alpha_prime,
+        target_qf1_params=target_qf1_params,
+        target_qf2_params=target_qf2_params,
+        global_steps=0,
+    )
+
+
+def evaluate(
+    policy_fn: Callable,
+    env: GymWrapper,
+    num_episodes: int,
+    obs_mean: float = 0,
+    obs_std: float = 1,
+    seed: int = 0,
+):
+    env.reset_rng(seed)
+    num_envs = getattr(env, "num_envs", 1)
+    episode_returns = []
+    while len(episode_returns) < num_episodes:
+        episode_return = np.zeros(num_envs, dtype=np.float32)
+        finished = np.zeros(num_envs, dtype=bool)
+        obs, _ = env.reset()
+        while not np.all(finished):
+            obs = (obs - obs_mean) / (obs_std + 1e-5)
+            action = policy_fn(obs=obs)
+            obs, reward, done, truncated, _ = env.step(np.array(action))
+            active_mask = ~finished
+            episode_return += np.asarray(reward, dtype=np.float32) * active_mask
+            finished |= np.asarray(done, dtype=bool) | np.asarray(truncated, dtype=bool)
+        completed = min(num_envs, num_episodes - len(episode_returns))
+        episode_returns.extend(episode_return[:completed].tolist())
+    mean_return = np.mean(episode_returns)
+    # Normalize using the env's D4RL-style reference scores (loaded from the
+    # dataset metadata). Falls back to the raw return when refs are absent.
+    normalized = env.get_normalized_score(mean_return)
+    normalized_score = normalized * 100 if normalized is not None else mean_return
+    return normalized_score, mean_return
+
+
+def train():
+   wrapped_train = pyrallis_wrap()(_train)
+   wrapped_train()
+
+def _train(config: CQLConfig):
+    wandb.init(
+        project=config.project,
+        group=config.group,
+        name=config.name,
+        config=asdict(config),
+        id=str(uuid.uuid4()),
+    )
+
+    if config.checkpoints_path is not None:
+        print(f"Checkpoints path: {config.checkpoints_path}")
+        os.makedirs(config.checkpoints_path, exist_ok=True)
+        with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
+            pyrallis_dump(config, f)
+    
+    minari_dataset = minari.load_dataset(config.dataset_id)
+    qdataset = qlearning_dataset(minari_dataset)
+    env = get_env(
+        config.device, 
+        command_type=config.command_type, 
+        dataset=minari_dataset, 
+        num_actors=1, 
+        env_name=config.env
+    )
+    eval_env = get_env(
+        config.device, 
+        command_type=config.command_type, 
+        dataset=minari_dataset, 
+        num_actors=config.n_eval_actors, 
+        env_name=config.env
+    )
+    shifted_env = maybe_get_shifted_env(
+        config.device, command_type=config.command_type,
+        dataset=minari_dataset, eval_shift=config.eval_shift,
+        num_actors=config.n_eval_actors, env_name=config.env
+    )
+
+    action_shape = env.action_space.shape
+    if action_shape is None:
+        action_shape = (1,)
+    action_dim = action_shape[0]
+    config.action_dim = action_dim
+    
+    # Set target entropy if not specified
+    if config.target_entropy >= 0.0:
+        config.target_entropy = -np.prod(action_shape).item()
+    
+    # rescale reward if needed
+    if config.normalize_reward:
+        qdataset.rewards = qdataset.rewards * config.reward_scale + config.reward_bias
+
+    offline_steps = config.offline_iterations // config.n_jitted_updates
+    online_steps = config.online_iterations // config.n_jitted_updates
+    total_steps = offline_steps + online_steps
+    num_envs = getattr(env, "num_envs", 1)
+
+    max_needed_buffer = len(qdataset.observations) + online_steps * num_envs
+    actual_buffer_size = min(config.buffer_size, max_needed_buffer)
+
+    buffer = ReplayBuffer(
+        state_dim=qdataset.observations.shape[1],
+        action_dim=action_dim,
+        buffer_size=actual_buffer_size,
+        seed=config.seed,
+    )
+    obs_mean, obs_std = buffer.load_dataset(qdataset, config)
+
+    # create train_state
+    rng = jax.random.PRNGKey(config.seed)
+    rng, subkey = jax.random.split(rng)
+    example_batch = buffer.sample(1)
+    train_state = create_cql_train_state(
+        subkey,
+        example_batch.observations[0],
+        example_batch.actions[0],
+        config,
+        action_dim,
+    )
+    algo = CQL()
+    update_fn = jax.jit(algo.update_n_times, static_argnums=(3, 4))
+    act_fn = jax.jit(algo.get_action)
+
+    eval_interval = config.eval_freq // config.n_jitted_updates
+
+    obs, _ = env.reset()
+    obs = np.asarray(obs)
+    if obs.ndim == 1:
+        obs = obs[None, ...]
+
+    episode_steps = np.zeros(num_envs, dtype=np.int32)
+    episode_returns = np.zeros(num_envs, dtype=np.float32)
+
+    rng = jax.random.PRNGKey(config.seed)
+
+    print(f"Offline steps: {offline_steps}, Online steps: {online_steps}")
+
+    for i in tqdm.tqdm(range(1, total_steps + 1), smoothing=0.1, dynamic_ncols=True):
+        if i == offline_steps + 1:
+            print("Switching to online training...")
+            obs, _ = env.reset()
+            obs = np.asarray(obs)
+            if obs.ndim == 1:
+                obs = obs[None, ...]
+
+        if i >= offline_steps + 1:
+            episode_steps += 1
+            norm_obs = (obs - obs_mean) / obs_std
+
+            action = act_fn(train_state, norm_obs)
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+
+            next_obs = np.asarray(next_obs)
+            if next_obs.ndim == 1:
+                next_obs = next_obs[None, ...]
+
+            reward = np.asarray(reward, dtype=np.float32).reshape(num_envs)
+            terminated = np.asarray(terminated, dtype=bool).reshape(num_envs)
+            truncated = np.asarray(truncated, dtype=bool).reshape(num_envs)
+
+            done = terminated | truncated
+            episode_returns += reward
+
+            norm_next_obs = (next_obs - obs_mean) / obs_std
+
+            buffer.add_transitions(
+                norm_obs, action, reward, norm_next_obs, done
+            )
+
+            for env_idx in range(num_envs):
+                if done[env_idx]:
+                    wandb.log({
+                        "training/episode_return": float(episode_returns[env_idx]), 
+                        "training/episode_length": int(episode_steps[env_idx])
+                    }, step=i)
+                    
+                    episode_steps[env_idx] = 0
+                    episode_returns[env_idx] = 0
+
+            if np.any(done):
+                obs, _ = env.reset()
+                obs = np.asarray(obs)
+                if obs.ndim == 1:
+                    obs = obs[None, ...]
+            else:
+                obs = next_obs
+
+        rng, update_rng = jax.random.split(rng)
+        batches = buffer.sample(config.n_jitted_updates * config.batch_size)
+        train_state, metrics = update_fn(train_state, batches, update_rng, config, bc=False)
+        
+        train_metrics = {f"training/{k}": v for k, v in metrics.items()}
+        wandb.log(train_metrics, step=i)
+
+        if i % eval_interval == 0:
+            policy_fn = lambda obs: act_fn(train_state, obs)
+            normalized_score, raw_score = evaluate(
+                policy_fn, 
+                eval_env, 
+                config.n_episodes, 
+                obs_mean=obs_mean, 
+                obs_std=obs_std, 
+                seed=config.eval_seed
+            )
+            eval_metrics = {
+                "eval/score": normalized_score,
+                "eval/raw_score": raw_score,
+            }
+            wandb.log(eval_metrics, step=i)
+            print(f"Step {i}: {normalized_score}")
+
+            if config.checkpoints_path is not None and (i // eval_interval) % config.checkpoints_every == 0:
+                checkpoint = {
+                    "policy_params": flax_serialization.to_state_dict(train_state.policy.params),
+                    "qf1_params": flax_serialization.to_state_dict(train_state.qf1.params),
+                    "qf2_params": flax_serialization.to_state_dict(train_state.qf2.params),
+                    "target_qf1_params": flax_serialization.to_state_dict(train_state.target_qf1_params),
+                    "target_qf2_params": flax_serialization.to_state_dict(train_state.target_qf2_params),
+                    "obs_mean": np.array(obs_mean),
+                    "obs_std": np.array(obs_std),
+                    "step": i,
+                }
+                checkpoint_path = os.path.join(config.checkpoints_path, f"checkpoint_{i}.npz")
+                np.savez(checkpoint_path, **checkpoint)
+                print(f"Saved checkpoint to {checkpoint_path}")
+
+    # final evaluation
+    policy_fn = lambda obs: act_fn(train_state, obs)
+    normalized_score, raw_score = evaluate(
+        policy_fn, 
+        eval_env, 
+        config.n_eval_episodes_final, 
+        obs_mean=obs_mean, 
+        obs_std=obs_std, 
+        seed=config.eval_seed
+    )
+    print("Final Evaluation Score:", normalized_score)
+    wandb.log({
+        "eval/final_score": normalized_score,
+        "eval/final_raw_score": raw_score,
+    })
+
+    # Tier-5 shifted evaluation: same policy under a harder / held-out perturbation
+    # regime. Reuses the in-distribution refs, so the gap measures robustness.
+    if shifted_env is not None:
+        shifted_score, shifted_raw = evaluate(
+            policy_fn, 
+            shifted_env, 
+            config.n_eval_episodes_final, 
+            obs_mean=obs_mean, 
+            obs_std=obs_std, 
+            seed=config.eval_seed
+        )
+        print("Final Shifted Evaluation Score:", shifted_score)
+        wandb.log({
+            "eval/shifted_final_score": shifted_score,
+            "eval/shifted_final_raw_score": shifted_raw,
+            "eval/robustness_gap": normalized_score - shifted_score,
+        })
+
+    # Save final checkpoint
+    if config.checkpoints_path is not None:
+        checkpoint = {
+            "policy_params": flax_serialization.to_state_dict(train_state.policy.params),
+            "qf1_params": flax_serialization.to_state_dict(train_state.qf1.params),
+            "qf2_params": flax_serialization.to_state_dict(train_state.qf2.params),
+            "target_qf1_params": flax_serialization.to_state_dict(train_state.target_qf1_params),
+            "target_qf2_params": flax_serialization.to_state_dict(train_state.target_qf2_params),
+            "obs_mean": np.array(obs_mean),
+            "obs_std": np.array(obs_std),
+            "step": total_steps,
+        }
+        checkpoint_path = os.path.join(config.checkpoints_path, "checkpoint_final.npz")
+        np.savez(checkpoint_path, **checkpoint)
+        print(f"Saved final checkpoint to {checkpoint_path}")
+
+    # Sim2real proxy: the scripts/run_srr_eval.sh evaluation on the checkpoint saved
+    # above. Its failure must not take the finished run down with it.
+    if config.checkpoints_path is not None:
+        print("Running proxy evaluation of the final policy...")
+        try:
+            wandb.log(proxy.evaluate(
+                config.checkpoints_path,
+                env_name=config.env,
+                device=config.device,
+                dict_prefix="eval/proxy_results",
+            ))
+        except Exception as e:
+            print(f"[proxy] failed to run proxy evaluation: {e}")
+
+    # Record a rollout video of the final policy
+    try:
+        video_dir = config.checkpoints_path if config.checkpoints_path is not None else "videos"
+        video_path = os.path.join(video_dir, f"{config.name}.mp4")
+        record_policy_video(
+            env_name=config.env,
+            act=lambda o: policy_fn(obs=o),
+            obs_mean=obs_mean,
+            obs_std=obs_std,
+            device=config.device,
+            save_path=video_path,
+            command_type=config.command_type,
+        )
+        wandb.log({"eval/video": wandb.Video(video_path)})
+        print(f"Saved rollout video to {video_path}")
+    except Exception as e:
+        print(f"[video] failed to record rollout video: {e}")
+
+    wandb.finish()
+
+
+if __name__ == "__main__":
+    train()

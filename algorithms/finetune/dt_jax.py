@@ -1,0 +1,1258 @@
+# source https://github.com/nikhilbarhate99/min-decision-transformer
+# https://arxiv.org/abs/2106.01345
+import os
+import uuid
+from dataclasses import asdict, dataclass
+from functools import partial
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
+
+import jax
+import jax.numpy as jnp
+from pyrallis.argparsing import wrap as pyrallis_wrap
+from pyrallis.cfgparsing import dump as pyrallis_dump
+import numpy as np
+import optax
+import wandb
+from flax import linen as nn
+from flax.training.train_state import TrainState
+from flax import serialization as flax_serialization
+from tqdm import tqdm
+
+import minari
+
+from algorithms.utils import proxy
+from algorithms.utils.randomize_gym import GymWrapper, get_env, maybe_get_shifted_env
+
+os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True"
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+
+@dataclass
+class DTConfig:
+    # wandb project name
+    project: str = "CORL"
+    # wandb group name
+    group: str = "DT-D4RL"
+    # wandb run name
+    name: str = "DT"
+    # transformer hidden dim
+    embedding_dim: int = 128
+    # depth of the transformer model
+    num_layers: int = 3
+    # number of heads in the attention
+    num_heads: int = 1
+    # maximum sequence length during training
+    seq_len: int = 20
+    # maximum rollout length, needed for the positional embeddings
+    episode_len: int = 1000
+    # attention dropout
+    attention_dropout: float = 0.1
+    # residual dropout
+    residual_dropout: float = 0.1
+    # embeddings dropout
+    embedding_dropout: float = 0.1
+    # maximum range for the symmetric actions, [-1, 1]
+    max_action: float = 1.0
+    # training dataset and evaluation environment
+    env_name: str = "halfcheetah-medium-v2"
+    dataset_id: str = "halfcheetah-medium-v2"
+    # AdamW optimizer learning rate
+    learning_rate: float = 1e-4
+    # AdamW optimizer betas
+    betas: Tuple[float, float] = (0.9, 0.999)
+    # AdamW weight decay
+    weight_decay: float = 1e-4
+    # maximum gradient norm during training, optional
+    clip_grad: Optional[float] = 0.25
+    # training batch size
+    batch_size: int = 64
+    # Number of offline updates
+    offline_iterations: int = 100_000
+    # Number of online updates
+    online_iterations: int = 100_000
+    # JAX specific
+    n_jitted_updates: int = 8
+    # warmup steps for the learning rate scheduler
+    warmup_steps: int = 10_000
+    # reward scaling, to reduce the magnitude
+    reward_scale: float = 0.001
+    # target return-to-go for the prompting during evaluation
+    target_returns: Tuple[float, ...] = (12000.0, 6000.0)
+    # number of episodes to run during evaluation
+    eval_episodes: int = 10
+    n_eval_actors: int = 10
+    # number of episodes for the final evaluation (larger -> lower variance)
+    n_eval_episodes_final: int = 50
+    # fixed seed for evaluation rollouts (reproducible / comparable)
+    eval_seed: int = 0
+    # evaluation frequency, will evaluate eval_every training steps
+    eval_every: int = 10_000
+    # path for checkpoints saving, optional
+    checkpoints_path: Optional[str] = None
+    # save an intermediate checkpoint every N evaluations (final always saved)
+    checkpoints_every: int = 10
+    # training random seed
+    seed: int = 0
+    # training seed (alternative to seed, used in configs)
+    train_seed: int = 0
+    # evaluation seed
+    eval_seed: int = 42
+    # training device
+    device: str = "cuda"
+    # command type for environment (e.g., "direction", "forward", "forwardfixed")
+    command_type: Optional[str] = None
+    # Optional Tier-5 shifted evaluation: JSON string of flattened env-config
+    # overrides (e.g. stronger push-recovery kicks) applied only to a second eval
+    # env. Normalization reuses the in-distribution dataset refs, so the shifted
+    # score is comparable to the final score (their gap = robustness gap).
+    eval_shift: Optional[str] = None
+    # deterministic torch (not used in JAX, but present in configs for compatibility)
+    deterministic_torch: bool = False
+    # number of workers (not used in JAX, but present in configs for compatibility)
+    num_workers: int = 4
+
+    def __post_init__(self):
+        self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
+        if self.checkpoints_path is not None:
+            self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
+        # `seed` is the source of truth: the runners pass --seed. `train_seed` is a
+        # legacy alias, honored only when `seed` is unset; it used to win, which made
+        # every matrix seed train with the base config's train_seed.
+        if self.seed == 0 and self.train_seed != 0:
+            self.seed = self.train_seed
+        self.train_seed = self.seed
+
+    def __hash__(self):
+        return hash(self.__repr__())
+
+
+def default_init(scale: Optional[float] = float(jnp.sqrt(2))):
+    return nn.initializers.orthogonal(scale)
+
+
+class MaskedCausalAttention(nn.Module):
+    h_dim: int
+    max_T: int
+    n_heads: int
+    drop_p: float
+    kernel_init: Callable = default_init()
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, training=True) -> jnp.ndarray:
+        B, T, C = x.shape
+        N, D = self.n_heads, C // self.n_heads
+        # rearrange q, k, v as (B, N, T, D)
+        q = (
+            nn.Dense(self.h_dim, kernel_init=self.kernel_init)(x)
+            .reshape(B, T, N, D)
+            .transpose(0, 2, 1, 3)
+        )
+        k = (
+            nn.Dense(self.h_dim, kernel_init=self.kernel_init)(x)
+            .reshape(B, T, N, D)
+            .transpose(0, 2, 1, 3)
+        )
+        v = (
+            nn.Dense(self.h_dim, kernel_init=self.kernel_init)(x)
+            .reshape(B, T, N, D)
+            .transpose(0, 2, 1, 3)
+        )
+        # causal mask
+        ones = jnp.ones((self.max_T, self.max_T))
+        mask = jnp.tril(ones).reshape(1, 1, self.max_T, self.max_T)
+        # weights (B, N, T, T) jax
+        weights = jnp.einsum("bntd,bnfd->bntf", q, k) / jnp.sqrt(D)
+        # causal mask applied to weights
+        weights = jnp.where(mask[..., :T, :T] == 0, -jnp.inf, weights[..., :T, :T])
+        # normalize weights, all -inf -> 0 after softmax
+        normalized_weights = jax.nn.softmax(weights, axis=-1)
+        # attention (B, N, T, D)
+        attention = nn.Dropout(self.drop_p, deterministic=not training)(
+            jnp.einsum("bntf,bnfd->bntd", normalized_weights, v)
+        )
+        # gather heads and project (B, N, T, D) -> (B, T, N*D)
+        attention = attention.transpose(0, 2, 1, 3).reshape(B, T, N * D)
+        out = nn.Dropout(self.drop_p, deterministic=not training)(
+            nn.Dense(self.h_dim)(attention)
+        )
+        return out
+
+
+class Block(nn.Module):
+    h_dim: int
+    max_T: int
+    n_heads: int
+    attention_dropout: float
+    residual_dropout: float
+    kernel_init: Callable = default_init()
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, training=True) -> jnp.ndarray:
+        # Attention -> LayerNorm -> MLP -> LayerNorm
+        x = x + MaskedCausalAttention(
+            self.h_dim, self.max_T, self.n_heads, self.attention_dropout
+        )(
+            x, training=training
+        )  # residual
+        x = nn.LayerNorm()(x)
+        # MLP
+        out = nn.Dense(4 * self.h_dim, kernel_init=self.kernel_init)(x)
+        out = nn.gelu(out)
+        out = nn.Dense(self.h_dim, kernel_init=self.kernel_init)(out)
+        out = nn.Dropout(self.residual_dropout, deterministic=not training)(out)
+        # residual
+        x = x + out
+        x = nn.LayerNorm()(x)
+        return x
+
+
+class DecisionTransformer(nn.Module):
+    state_dim: int
+    act_dim: int
+    num_layers: int
+    h_dim: int
+    seq_len: int
+    n_heads: int
+    attention_dropout: float
+    residual_dropout: float
+    embedding_dropout: float
+    max_timestep: int = 4096
+    kernel_init: Callable = default_init()
+
+    def setup(self) -> None:
+        self.blocks = [
+            Block(self.h_dim, 3 * self.seq_len, self.n_heads, self.attention_dropout, self.residual_dropout)
+            for _ in range(self.num_layers)
+        ]
+        # projection heads (project to embedding)
+        self.embed_ln = nn.LayerNorm()
+        self.embed_drop = nn.Dropout(self.embedding_dropout)
+        self.embed_timestep = nn.Embed(self.max_timestep, self.h_dim)
+        self.embed_rtg = nn.Dense(self.h_dim, kernel_init=self.kernel_init)
+        self.embed_state = nn.Dense(self.h_dim, kernel_init=self.kernel_init)
+        # continuous actions
+        self.embed_action = nn.Dense(self.h_dim, kernel_init=self.kernel_init)
+        self.use_action_tanh = True
+        # prediction heads
+        self.predict_rtg = nn.Dense(1, kernel_init=self.kernel_init)
+        self.predict_state = nn.Dense(self.state_dim, kernel_init=self.kernel_init)
+        self.predict_action = nn.Dense(self.act_dim, kernel_init=self.kernel_init)
+
+    def __call__(
+        self,
+        timesteps: jnp.ndarray,
+        states: jnp.ndarray,
+        actions: jnp.ndarray,
+        returns_to_go: jnp.ndarray,
+        training=True,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        B, T, _ = states.shape
+
+        time_embeddings = self.embed_timestep(timesteps)
+        # time embeddings are treated similar to positional embeddings
+        state_embeddings = self.embed_state(states) + time_embeddings
+        action_embeddings = self.embed_action(actions) + time_embeddings
+        returns_embeddings = self.embed_rtg(returns_to_go) + time_embeddings
+        # stack rtg, states and actions and reshape sequence as
+        # (r1, s1, a1, r2, s2, a2 ...)
+        h = (
+            jnp.stack((returns_embeddings, state_embeddings, action_embeddings), axis=1)
+            .transpose(0, 2, 1, 3)
+            .reshape(B, 3 * T, self.h_dim)
+        )
+        h = self.embed_ln(h)
+        h = self.embed_drop(h, deterministic=not training)
+        # transformer and prediction
+        for block in self.blocks:
+            h = block(h, training=training)
+        # get h reshaped such that its size = (B x 3 x T x h_dim) and
+        # h[:, 0, t] is conditioned on r_0, s_0, a_0 ... r_t
+        # h[:, 1, t] is conditioned on r_0, s_0, a_0 ... r_t, s_t
+        # h[:, 2, t] is conditioned on r_0, s_0, a_0 ... r_t, s_t, a_t
+        h = h.reshape(B, T, 3, self.h_dim).transpose(0, 2, 1, 3)
+        # get predictions
+        return_preds = self.predict_rtg(h[:, 2])  # predict next rtg given r, s, a
+        state_preds = self.predict_state(h[:, 2])  # predict next state given r, s, a
+        action_preds = self.predict_action(h[:, 1])
+        if self.use_action_tanh:
+            action_preds = jnp.tanh(action_preds)
+
+        return state_preds, action_preds, return_preds
+
+
+def discount_cumsum(x: np.ndarray, gamma: float) -> np.ndarray:
+    x = np.asarray(x)
+    disc_cumsum = np.zeros_like(x)
+    disc_cumsum[-1] = x[-1]
+    for t in reversed(range(x.shape[0] - 1)):
+        disc_cumsum[t] = x[t] + gamma * disc_cumsum[t + 1]
+    return disc_cumsum
+
+
+def get_traj(dataset_id: str):
+    print("processing: ", dataset_id)
+    dataset = minari.load_dataset(dataset_id)
+    
+    paths = []
+    all_observations = []
+    
+    for episode in dataset.iterate_episodes():
+        terminations = np.array(episode.terminations, dtype=bool)
+        truncations = np.array(episode.truncations, dtype=bool)
+        terminals = np.logical_or(terminations, truncations).astype(np.float32)
+        episode_data = {
+            "observations": np.array(episode.observations[:-1], dtype=np.float32),
+            "next_observations": np.array(episode.observations[1:], dtype=np.float32),
+            "actions": np.array(episode.actions, dtype=np.float32),
+            "rewards": np.array(episode.rewards, dtype=np.float32),
+            "terminals": terminals,
+        }
+        paths.append(episode_data)
+        all_observations.append(episode_data["observations"])
+    
+    all_obs = np.concatenate(all_observations, axis=0)
+    returns = np.array([np.sum(p["rewards"]) for p in paths])
+    num_samples = np.sum([p["rewards"].shape[0] for p in paths])
+    print(f"Number of samples collected: {num_samples}")
+    print(
+        f"Trajectory returns: mean = {np.mean(returns)}, std = {np.std(returns)}, max = {np.max(returns)}, min = {np.min(returns)}"
+    )
+    obs_mean = all_obs.mean(axis=0)
+    obs_std = all_obs.std(axis=0) + 1e-6
+    return paths, obs_mean, obs_std
+
+
+class Trajectory(NamedTuple):
+    timesteps: np.ndarray | jnp.ndarray  # num_ep x max_len
+    states: np.ndarray | jnp.ndarray  # num_ep x max_len x state_dim
+    actions: np.ndarray | jnp.ndarray  # num_ep x max_len x act_dim
+    returns_to_go: np.ndarray | jnp.ndarray  # num_ep x max_len x 1
+    masks: np.ndarray | jnp.ndarray  # num_ep x max_len
+
+
+def padd_by_zero(arr: jnp.ndarray, pad_to: int) -> jnp.ndarray:
+    return jnp.pad(arr, ((0, pad_to - arr.shape[0]), (0, 0)), mode="constant")
+
+
+def make_padded_trajectories(
+    config: DTConfig,
+) -> Tuple[Trajectory, int, jnp.ndarray, jnp.ndarray, jnp.ndarray, int]:
+    trajectories, mean, std = get_traj(config.dataset_id)
+    # Calculate returns to go for all trajectories
+    # Normalize states
+    max_len = config.episode_len
+    traj_lengths = []
+    for traj in trajectories:
+        traj["returns_to_go"] = discount_cumsum(traj["rewards"], 1.0) * config.reward_scale
+        traj["observations"] = (traj["observations"] - mean) / std
+        max_len = max(max_len, traj["observations"].shape[0])
+        traj_lengths.append(traj["observations"].shape[0])
+    # Pad trajectories
+    padded_trajectories = {key: [] for key in Trajectory._fields}
+    for traj in trajectories:
+        timesteps = jnp.arange(0, len(traj["observations"]))
+        padded_trajectories["timesteps"].append(
+            padd_by_zero(timesteps.reshape(-1, 1), max_len).reshape(-1)
+        )
+        padded_trajectories["states"].append(
+            padd_by_zero(traj["observations"], max_len)
+        )
+        padded_trajectories["actions"].append(padd_by_zero(traj["actions"], max_len))
+        padded_trajectories["returns_to_go"].append(
+            padd_by_zero(traj["returns_to_go"].reshape(-1, 1), max_len)
+        )
+        padded_trajectories["masks"].append(
+            padd_by_zero(
+                jnp.ones((len(traj["observations"]), 1)).reshape(-1, 1), max_len
+            ).reshape(-1)
+        )
+    return (
+        Trajectory(
+            timesteps=np.stack(padded_trajectories["timesteps"]),
+            states=np.stack(padded_trajectories["states"]),
+            actions=np.stack(padded_trajectories["actions"]),
+            returns_to_go=np.stack(padded_trajectories["returns_to_go"]),
+            masks=np.stack(padded_trajectories["masks"]),
+        ),
+        len(trajectories),
+        jnp.array(traj_lengths),
+        mean,
+        std,
+        max_len,
+    )
+
+
+class TrajectoryBuffer:
+    def __init__(
+        self,
+        initial_trajectories: Trajectory,
+        initial_lengths: np.ndarray | jnp.ndarray,
+        max_trajectories: int,
+        max_len: int,
+        state_dim: int,
+        act_dim: int,
+        seed: int = 0,
+    ):
+        self.max_trajectories = max_trajectories
+        self.max_len = max_len
+        self.state_dim = state_dim
+        self.act_dim = act_dim
+        self.num_trajectories = len(initial_lengths)
+        self.pointer = self.num_trajectories % max_trajectories
+        self.rng = np.random.default_rng(seed)
+
+        self.timesteps = np.zeros((max_trajectories, max_len), dtype=np.int32)
+        self.states = np.zeros((max_trajectories, max_len, state_dim), dtype=np.float32)
+        self.actions = np.zeros((max_trajectories, max_len, act_dim), dtype=np.float32)
+        self.returns_to_go = np.zeros((max_trajectories, max_len, 1), dtype=np.float32)
+        self.masks = np.zeros((max_trajectories, max_len), dtype=np.float32)
+        self.traj_lengths = np.zeros(max_trajectories, dtype=np.int32)
+
+        n = min(self.num_trajectories, max_trajectories)
+        self.timesteps[:n] = np.asarray(initial_trajectories.timesteps)[:n]
+        self.states[:n] = np.asarray(initial_trajectories.states)[:n]
+        self.actions[:n] = np.asarray(initial_trajectories.actions)[:n]
+        self.returns_to_go[:n] = np.asarray(initial_trajectories.returns_to_go)[:n]
+        self.masks[:n] = np.asarray(initial_trajectories.masks)[:n]
+        self.traj_lengths[:n] = np.asarray(initial_lengths)[:n]
+
+    def add_trajectory(
+        self,
+        timesteps: np.ndarray,
+        states: np.ndarray,
+        actions: np.ndarray,
+        returns_to_go: np.ndarray,
+        length: int,
+    ):
+        idx = self.pointer
+        self.timesteps[idx, :length] = timesteps[:length]
+        self.timesteps[idx, length:] = 0
+
+        self.states[idx, :length] = states[:length]
+        self.states[idx, length:] = 0.0
+
+        self.actions[idx, :length] = actions[:length]
+        self.actions[idx, length:] = 0.0
+
+        self.returns_to_go[idx, :length] = returns_to_go[:length]
+        self.returns_to_go[idx, length:] = 0.0
+
+        self.masks[idx, :length] = 1.0
+        self.masks[idx, length:] = 0.0
+
+        self.traj_lengths[idx] = length
+
+        self.pointer = (self.pointer + 1) % self.max_trajectories
+        self.num_trajectories = min(self.num_trajectories + 1, self.max_trajectories)
+
+    def sample(self, batch_size: int, seq_len: int) -> Trajectory:
+        traj_indices = self.rng.integers(0, self.num_trajectories, size=batch_size)
+        lengths = self.traj_lengths[traj_indices]
+        max_starts = np.maximum(1, lengths - seq_len)
+        starts = self.rng.integers(0, max_starts, size=batch_size)
+
+        batch_timesteps = np.empty((batch_size, seq_len), dtype=np.int32)
+        batch_states = np.empty((batch_size, seq_len, self.state_dim), dtype=np.float32)
+        batch_actions = np.empty((batch_size, seq_len, self.act_dim), dtype=np.float32)
+        batch_rtg = np.empty((batch_size, seq_len, 1), dtype=np.float32)
+        batch_masks = np.empty((batch_size, seq_len), dtype=np.float32)
+
+        for i in range(batch_size):
+            t_idx = traj_indices[i]
+            s_idx = starts[i]
+            batch_timesteps[i] = self.timesteps[t_idx, s_idx : s_idx + seq_len]
+            batch_states[i] = self.states[t_idx, s_idx : s_idx + seq_len]
+            batch_actions[i] = self.actions[t_idx, s_idx : s_idx + seq_len]
+            batch_rtg[i] = self.returns_to_go[t_idx, s_idx : s_idx + seq_len]
+            batch_masks[i] = self.masks[t_idx, s_idx : s_idx + seq_len]
+
+        return Trajectory(
+            timesteps=jnp.asarray(batch_timesteps),
+            states=jnp.asarray(batch_states),
+            actions=jnp.asarray(batch_actions),
+            returns_to_go=jnp.asarray(batch_rtg),
+            masks=jnp.asarray(batch_masks),
+        )
+
+
+def sample_start_idx(
+    rng: jax.Array,
+    traj_idx: jax.Array,
+    padded_traj_length: jnp.ndarray,
+    seq_len: int,
+) -> jnp.ndarray:
+    """
+    Determine the start_idx for given trajectory, the trajectories are padded to max_len.
+    Therefore, naively sample from 0, max_len will produce bunch of all zero data.
+    To avoid that, we refer padded_traj_length, the list of actual trajectory length + seq_len
+    """
+    traj_len = padded_traj_length[traj_idx]
+    start_idx = jax.random.randint(rng, (1,), 0, traj_len - seq_len - 1)
+    return start_idx
+
+
+def extract_traj(
+    traj_idx: jnp.ndarray, start_idx: jnp.ndarray, traj: Trajectory, seq_len: int
+) -> Trajectory:
+    """
+    Extract the trajectory with seq_len for given traj_idx and start_idx
+    """
+    return jax.tree_util.tree_map(
+        lambda x: jax.lax.dynamic_slice_in_dim(x[traj_idx], start_idx, seq_len),
+        traj,
+    )
+
+
+@partial(jax.jit, static_argnums=(2, 3, 4))
+def sample_traj_batch(
+    rng,
+    traj: Trajectory,
+    batch_size: int,
+    seq_len: int,
+    episode_num: int,
+    padded_traj_lengths: jnp.ndarray,
+) -> Trajectory:
+    traj_idx = jax.random.randint(rng, (batch_size,), 0, episode_num)  # B
+    start_idx = jax.vmap(sample_start_idx, in_axes=(0, 0, None, None))(
+        jax.random.split(rng, batch_size), traj_idx, padded_traj_lengths, seq_len
+    ).reshape(
+        -1
+    )  # B
+    return jax.vmap(extract_traj, in_axes=(0, 0, None, None))(
+        traj_idx, start_idx, traj, seq_len
+    )
+
+
+class DTTrainState(NamedTuple):
+    transformer: TrainState
+
+
+class DT(object):
+
+    @classmethod
+    def update(
+        cls, train_state: DTTrainState, batch: Trajectory, rng: jax.Array
+    ) -> Tuple[Any, jnp.ndarray]:
+        timesteps, states, actions, returns_to_go, traj_mask = (
+            batch.timesteps,
+            batch.states,
+            batch.actions,
+            batch.returns_to_go,
+            batch.masks,
+        )
+
+        def loss_fn(params):
+            state_preds, action_preds, return_preds = train_state.transformer.apply_fn(
+                params, timesteps, states, actions, returns_to_go, rngs={"dropout": rng}
+            )  # B x T x state_dim, B x T x act_dim, B x T x 1
+            # mask actions
+            actions_masked = actions * traj_mask[:, :, None]
+            action_preds_masked = action_preds * traj_mask[:, :, None]
+            # Calculate mean squared error loss
+            action_loss = jnp.mean(jnp.square(action_preds_masked - actions_masked))
+            return action_loss
+
+        grad_fn = jax.value_and_grad(loss_fn)
+        loss, grad = grad_fn(train_state.transformer.params)
+        # Apply gradient clipping
+        transformer = train_state.transformer.apply_gradients(grads=grad)
+        return train_state._replace(transformer=transformer), loss
+
+    @classmethod
+    def update_n_times(
+        cls,
+        train_state: DTTrainState,
+        batches: Trajectory,
+        rng: jax.Array,
+        config: DTConfig,
+    ) -> Tuple[DTTrainState, Dict]:
+        batches = jax.tree_util.tree_map(
+            lambda x: x.reshape(
+                (config.n_jitted_updates, config.batch_size) + x.shape[1:]
+            ),
+            batches,
+        )
+
+        def body_fn(carry, batch):
+            state, step_rng = carry
+            step_rng, update_rng = jax.random.split(step_rng)
+            state, loss = cls.update(state, batch, update_rng)
+            return (state, step_rng), loss
+
+        (train_state, _), loss = jax.lax.scan(
+            body_fn, (train_state, rng), batches
+        )
+        return train_state, {"action_loss": loss[-1]}
+
+    @classmethod
+    def get_action(
+        cls,
+        train_state: DTTrainState,
+        timesteps: jnp.ndarray,
+        states: jnp.ndarray,
+        actions: jnp.ndarray,
+        returns_to_go: jnp.ndarray,
+    ) -> jnp.ndarray:
+        state_preds, action_preds, return_preds = train_state.transformer.apply_fn(
+            train_state.transformer.params,
+            timesteps,
+            states,
+            actions,
+            returns_to_go,
+            training=False,
+        )
+        return action_preds
+
+
+def create_dt_train_state(
+    rng: jax.Array, state_dim: int, act_dim: int, config: DTConfig
+) -> DTTrainState:
+    model = DecisionTransformer(
+        state_dim=state_dim,
+        act_dim=act_dim,
+        num_layers=config.num_layers,
+        h_dim=config.embedding_dim,
+        seq_len=config.seq_len,
+        n_heads=config.num_heads,
+        attention_dropout=config.attention_dropout,
+        residual_dropout=config.residual_dropout,
+        embedding_dropout=config.embedding_dropout,
+    )
+    rng, init_rng = jax.random.split(rng)
+    # initialize params
+    params = model.init(
+        init_rng,
+        timesteps=jnp.zeros((1, config.seq_len), jnp.int32),
+        states=jnp.zeros((1, config.seq_len, state_dim), jnp.float32),
+        actions=jnp.zeros((1, config.seq_len, act_dim), jnp.float32),
+        returns_to_go=jnp.zeros((1, config.seq_len, 1), jnp.float32),
+        training=False,
+    )
+    # optimizer with warmup
+    warmup_fn = optax.linear_schedule(
+        init_value=0.0,
+        end_value=config.learning_rate,
+        transition_steps=config.warmup_steps,
+    )
+    decay_fn = optax.constant_schedule(config.learning_rate)
+    schedule_fn = optax.join_schedules(
+        schedules=[warmup_fn, decay_fn],
+        boundaries=[config.warmup_steps],
+    )
+    tx = optax.chain(
+        optax.clip_by_global_norm(config.clip_grad) if config.clip_grad else optax.identity(),
+        optax.adamw(
+            learning_rate=schedule_fn,
+            weight_decay=config.weight_decay,
+            b1=config.betas[0],
+            b2=config.betas[1],
+        ),
+    )
+    train_state = TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+    return DTTrainState(train_state)
+
+
+def get_dt_from_checkpoint(
+    checkpoint_path: str,
+    state_dim: int,
+    action_dim: int,
+) -> Dict[str, Any]:
+    """
+    Load a Decision Transformer from a JAX checkpoint.
+    
+    Args:
+        checkpoint_path: Path to the checkpoint directory
+        state_dim: Dimension of the state/observation space
+        action_dim: Dimension of the action space
+    
+    Returns:
+        Dictionary containing:
+            - 'transformer_fn': JIT-compiled transformer function
+            - 'get_action': Function that takes observations and returns actions
+            - 'transformer_params': The loaded model parameters
+            - 'obs_mean': Observation mean for normalization
+            - 'obs_std': Observation std for normalization
+            - 'config': The loaded config dictionary
+    """
+    from pathlib import Path
+    
+    ckpt_path = Path(checkpoint_path).resolve()
+    
+    # Load config if available
+    config_file = ckpt_path / "config.yaml"
+    config = None
+    if config_file.exists():
+        if yaml is None:
+            raise ImportError("PyYAML is required to load config. Install with: pip install pyyaml")
+        with open(config_file) as f:
+            config = yaml.safe_load(f)
+    else:
+        raise FileNotFoundError(f"Config file not found: {config_file}")
+    
+    # Extract config parameters
+    embedding_dim = config.get("embedding_dim", 128)
+    num_layers = config.get("num_layers", 3)
+    num_heads = config.get("num_heads", 1)
+    seq_len = config.get("seq_len", 20)
+    attention_dropout = config.get("attention_dropout", 0.1)
+    residual_dropout = config.get("residual_dropout", 0.1)
+    embedding_dropout = config.get("embedding_dropout", 0.1)
+    
+    # Find checkpoint files
+    ckpt_files = list(ckpt_path.glob("checkpoint_*.npz"))
+    if not ckpt_files:
+        raise FileNotFoundError(f"No checkpoint files found in {ckpt_path}")
+    
+    # Sort by step number (extract number from filename)
+    def get_step(p):
+        name = p.stem  # e.g., "checkpoint_1000" or "checkpoint_final"
+        step_str = name.split("_")[-1]
+        if step_str == "final":
+            return float("inf")
+        return int(step_str)
+    
+    ckpt_files.sort(key=get_step)
+    
+    # Look for final checkpoint specifically
+    final_ckpt = ckpt_path / "checkpoint_final.npz"
+    if final_ckpt.exists():
+        selected_ckpt = final_ckpt
+    else:
+        selected_ckpt = ckpt_files[-1]
+    
+    print(f"[get_dt_from_checkpoint] Loading checkpoint: {selected_ckpt}")
+    
+    # Load checkpoint
+    checkpoint = np.load(selected_ckpt, allow_pickle=True)
+    transformer_params = checkpoint["transformer_params"].item()  # .item() to extract dict from 0-d array
+    obs_mean = checkpoint["state_mean"]
+    obs_std = checkpoint["state_std"]
+    
+    # Create Decision Transformer model
+    dt_model = DecisionTransformer(
+        state_dim=state_dim,
+        act_dim=action_dim,
+        num_layers=num_layers,
+        h_dim=embedding_dim,
+        seq_len=seq_len,
+        n_heads=num_heads,
+        attention_dropout=attention_dropout,
+        residual_dropout=residual_dropout,
+        embedding_dropout=embedding_dropout,
+    )
+    
+    # Convert params back to FrozenDict
+    transformer_params = flax_serialization.from_state_dict(
+        dt_model.init(
+            jax.random.PRNGKey(0),
+            timesteps=jnp.zeros((1, seq_len), jnp.int32),
+            states=jnp.zeros((1, seq_len, state_dim), jnp.float32),
+            actions=jnp.zeros((1, seq_len, action_dim), jnp.float32),
+            returns_to_go=jnp.zeros((1, seq_len, 1), jnp.float32),
+            training=False,
+        ),
+        transformer_params
+    )
+    
+    # Create JIT-compiled transformer function
+    @jax.jit
+    def transformer_fn(
+        timesteps: jnp.ndarray,
+        states: jnp.ndarray,
+        actions: jnp.ndarray,
+        returns_to_go: jnp.ndarray,
+    ) -> jnp.ndarray:
+        predictions, _ = dt_model.apply(
+            transformer_params,
+            timesteps,
+            states,
+            actions,
+            returns_to_go,
+            training=False,
+        )
+        state_preds, action_preds, return_preds = predictions
+        return action_preds
+    
+    # Create a get_action function for easier inference
+    def get_action(
+        timesteps: jnp.ndarray,
+        states: jnp.ndarray,
+        actions: jnp.ndarray,
+        returns_to_go: jnp.ndarray,
+    ) -> np.ndarray:
+        """Get action from the Decision Transformer."""
+        action_preds = transformer_fn(timesteps, states, actions, returns_to_go)
+        return np.array(action_preds)
+    
+    print(f"[get_dt_from_checkpoint] Loaded DT with embedding_dim={embedding_dim}, "
+          f"num_layers={num_layers}, seq_len={seq_len}")
+    
+    return {
+        "transformer_fn": transformer_fn,
+        "get_action": get_action,
+        "transformer_params": transformer_params,
+        "obs_mean": obs_mean,
+        "obs_std": obs_std,
+        "config": config,
+    }
+
+
+def evaluate(
+    policy_fn: Callable,
+    train_state: DTTrainState,
+    env: GymWrapper,
+    config: DTConfig,
+    target_return: float,
+    state_mean: Any = 0,
+    state_std: Any = 1,
+    seed: int = 0,
+    num_episodes: Optional[int] = None,
+) -> Tuple[float, float]:
+    env.reset_rng(seed)
+    n_eps = num_episodes if num_episodes is not None else config.eval_episodes
+    eval_batch_size = getattr(env, "num_envs", 1)
+    episode_returns = []
+
+    state_shape = env.observation_space.shape if env.observation_space.shape is not None else (1,)
+    act_shape = env.action_space.shape if env.action_space.shape is not None else (1,)
+
+    state_dim = state_shape[0]
+    act_dim = act_shape[0]
+    # Convert state_mean and state_std to JAX arrays and ensure correct shape
+    state_mean = jnp.array(state_mean).reshape(-1) if not isinstance(state_mean, (int, float)) else jnp.array([state_mean] * state_dim)
+    state_std = jnp.array(state_std).reshape(-1) if not isinstance(state_std, (int, float)) else jnp.array([state_std] * state_dim)
+    # same as timesteps used for training the transformer
+    timesteps = jnp.arange(0, config.episode_len, 1, jnp.int32)
+    timesteps = jnp.repeat(timesteps[None, :], eval_batch_size, axis=0)
+    while len(episode_returns) < n_eps:
+        # zeros place holders
+        actions = jnp.zeros(
+            (eval_batch_size, config.episode_len, act_dim), dtype=jnp.float32
+        )
+        states = jnp.zeros(
+            (eval_batch_size, config.episode_len, state_dim), dtype=jnp.float32
+        )
+        rewards_to_go = jnp.zeros(
+            (eval_batch_size, config.episode_len, 1), dtype=jnp.float32
+        )
+        # init episode
+        running_state, _ = env.reset()
+        running_state = np.asarray(running_state).reshape(eval_batch_size, state_dim)
+        running_reward = np.zeros(eval_batch_size, dtype=np.float32)
+        running_rtg = np.full(
+            eval_batch_size, target_return * config.reward_scale, dtype=np.float32
+        )
+        episode_return = np.zeros(eval_batch_size, dtype=np.float32)
+        finished = np.zeros(eval_batch_size, dtype=bool)
+        for t in range(config.episode_len):
+            # add state in placeholder and normalize
+            normalized_state = (jnp.array(running_state) - state_mean) / state_std
+            states = states.at[:, t].set(normalized_state)
+            # calculate running rtg and add in placeholder
+            running_rtg = running_rtg - (running_reward * config.reward_scale)
+            rewards_to_go = rewards_to_go.at[:, t, 0].set(jnp.array(running_rtg))
+            if t < config.seq_len:
+                act_preds = policy_fn(
+                    train_state,
+                    timesteps[:, : t + 1],
+                    states[:, : t + 1],
+                    actions[:, : t + 1],
+                    rewards_to_go[:, : t + 1],
+                )
+                act = act_preds[:, -1]
+            else:
+                act_preds = policy_fn(
+                    train_state,
+                    timesteps[:, t - config.seq_len + 1 : t + 1],
+                    states[:, t - config.seq_len + 1 : t + 1],
+                    actions[:, t - config.seq_len + 1 : t + 1],
+                    rewards_to_go[:, t - config.seq_len + 1 : t + 1],
+                )
+                act = act_preds[:, -1]
+            running_state, running_reward, done, truncated, _ = env.step(np.array(act))
+            running_state = np.asarray(running_state).reshape(eval_batch_size, state_dim)
+            actions = actions.at[:, t].set(act)
+
+            active_mask = ~finished
+            episode_return += np.asarray(running_reward, dtype=np.float32) * active_mask
+            finished |= np.asarray(done, dtype=bool) | np.asarray(truncated, dtype=bool)
+            if np.all(finished):
+                break
+        completed = min(eval_batch_size, n_eps - len(episode_returns))
+        episode_returns.extend(episode_return[:completed].tolist())
+
+    mean_reward = float(np.mean(episode_returns))
+    # Normalize using the env's D4RL-style reference scores (loaded from the
+    # dataset metadata). Falls back to the raw return when refs are absent.
+    normalized = env.get_normalized_score(mean_reward)
+    normalized_score = normalized * 100 if normalized is not None else mean_reward
+    return normalized_score, mean_reward
+
+
+def record_dt_video(
+    policy_fn: Callable,
+    train_state: DTTrainState,
+    config: DTConfig,
+    target_return: float,
+    save_path: str,
+    state_mean: Any = 0,
+    state_std: Any = 1,
+):
+    """Roll out the DT policy for a single episode and save an mp4 of it."""
+    # Headless rendering backend (matches algorithms/utils/save_video.py).
+    os.environ.setdefault("MUJOCO_GL", "egl")
+
+    render_trajectory = []
+
+    def render_callback(_, state):
+        render_trajectory.append(state)
+
+    env = get_env(
+        config.device,
+        render_callback=render_callback,
+        command_type=config.command_type,
+        env_name=config.env_name,
+    )
+
+    state_shape = env.observation_space.shape if env.observation_space.shape is not None else (1,)
+    act_shape = env.action_space.shape if env.action_space.shape is not None else (1,)
+
+    state_dim = state_shape[0]
+    act_dim = act_shape[0]
+    state_mean = (
+        jnp.array(state_mean).reshape(-1)
+        if not isinstance(state_mean, (int, float))
+        else jnp.array([state_mean] * state_dim)
+    )
+    state_std = (
+        jnp.array(state_std).reshape(-1)
+        if not isinstance(state_std, (int, float))
+        else jnp.array([state_std] * state_dim)
+    )
+    timesteps = jnp.arange(0, config.episode_len, 1, jnp.int32)[None, :]
+
+    actions = jnp.zeros((1, config.episode_len, act_dim), dtype=jnp.float32)
+    states = jnp.zeros((1, config.episode_len, state_dim), dtype=jnp.float32)
+    rewards_to_go = jnp.zeros((1, config.episode_len, 1), dtype=jnp.float32)
+
+    running_state, _ = env.reset()
+    running_state = np.array(running_state).flatten()
+    running_reward = 0
+    running_rtg = target_return * config.reward_scale
+    for t in range(config.episode_len):
+        normalized_state = (jnp.array(running_state) - state_mean) / state_std
+        states = states.at[0, t].set(normalized_state)
+        running_rtg = running_rtg - (running_reward * config.reward_scale)
+        rewards_to_go = rewards_to_go.at[0, t].set(running_rtg)
+        if t < config.seq_len:
+            act_preds = policy_fn(
+                train_state,
+                timesteps[:, : t + 1],
+                states[:, : t + 1],
+                actions[:, : t + 1],
+                rewards_to_go[:, : t + 1],
+            )
+        else:
+            act_preds = policy_fn(
+                train_state,
+                timesteps[:, t - config.seq_len + 1 : t + 1],
+                states[:, t - config.seq_len + 1 : t + 1],
+                actions[:, t - config.seq_len + 1 : t + 1],
+                rewards_to_go[:, t - config.seq_len + 1 : t + 1],
+            )
+        act = act_preds[0, -1]
+        running_state, running_reward, done, truncated, _ = env.step(np.array(act))
+        env.render()
+        running_state = np.array(running_state).flatten()
+        actions = actions.at[0, t].set(act)
+        if bool(np.asarray(done).reshape(-1)[0]) or bool(
+            np.asarray(truncated).reshape(-1)[0]
+        ):
+            break
+
+    # Establish a headless GL context before rendering (mirrors save_video.py).
+    try:
+        import mujoco.egl
+
+        gl_context = mujoco.egl.GLContext(1024, 1024)
+        gl_context.make_current()
+    except Exception as e:  # pragma: no cover - depends on GPU/driver
+        print(f"[record_dt_video] could not create EGL context: {e}")
+
+    save_dir = os.path.dirname(os.path.abspath(save_path))
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    env.save_video(render_trajectory, save_path=save_path)
+
+
+def train():
+   wrapped_train = pyrallis_wrap()(_train)
+   wrapped_train()
+
+def _train(config: DTConfig):
+    wandb.init(
+        project=config.project,
+        group=config.group,
+        name=config.name,
+        config=asdict(config),
+        id=str(uuid.uuid4()),
+    )
+
+    if config.checkpoints_path is not None:
+        print(f"Checkpoints path: {config.checkpoints_path}")
+        os.makedirs(config.checkpoints_path, exist_ok=True)
+        with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
+            pyrallis_dump(config, f)
+
+    minari_dataset = minari.load_dataset(config.dataset_id)
+    env = get_env(
+        config.device, 
+        command_type=config.command_type, 
+        dataset=minari_dataset,
+        num_actors=1,
+        env_name=config.env_name
+    )
+    eval_env = get_env(
+        config.device, 
+        command_type=config.command_type, 
+        dataset=minari_dataset,
+        num_actors=config.n_eval_actors,
+        env_name=config.env_name
+    )
+    shifted_env = maybe_get_shifted_env(
+        config.device, command_type=config.command_type,
+        dataset=minari_dataset, eval_shift=config.eval_shift,
+        num_actors=config.n_eval_actors, env_name=config.env_name
+    )
+    rng = jax.random.PRNGKey(config.seed)
+    state_shape = env.observation_space.shape if env.observation_space.shape is not None else (1,)
+    act_shape = env.action_space.shape if env.action_space.shape is not None else (1,)
+    state_dim = state_shape[0]
+    act_dim = act_shape[0]
+    trajectories, episode_num, traj_lengths, state_mean, state_std, max_len = (
+        make_padded_trajectories(config)
+    )
+
+    offline_steps = config.offline_iterations // config.n_jitted_updates
+    online_steps = config.online_iterations // config.n_jitted_updates
+    total_steps = offline_steps + online_steps
+    eval_interval = config.eval_every // config.n_jitted_updates
+
+    max_trajectories = episode_num + online_steps + 1000
+    buffer = TrajectoryBuffer(
+        trajectories,
+        traj_lengths,
+        max_trajectories, 
+        max_len, 
+        state_dim, 
+        act_dim, 
+        seed=config.seed
+    )
+
+    # create trainer
+    rng, subkey = jax.random.split(rng)
+    train_state = create_dt_train_state(subkey, state_dim, act_dim, config)
+
+    algo = DT()
+    update_fn = jax.jit(algo.update_n_times, static_argnums=(3,))
+
+    # Setup online interaction
+    obs, _ = env.reset()
+    obs = np.asarray(obs).reshape(-1)
+    episode_t = 0
+    episode_states = np.zeros((config.episode_len, state_dim), dtype=np.float32)
+    episode_actions = np.zeros((config.episode_len, act_dim), dtype=np.float32)
+    episode_rewards = []
+    episode_rtg = np.zeros((config.episode_len, 1), dtype=np.float32)
+    target_return = config.target_returns[0]
+    running_rtg = target_return * config.reward_scale
+    timesteps_full = jnp.arange(0, config.episode_len, 1, jnp.int32)[None, :]
+
+    print(f"Offline steps: {offline_steps}, Online steps: {online_steps}")
+
+    for i in tqdm(range(1, total_steps + 1), smoothing=0.1, dynamic_ncols=True):
+        if i == offline_steps + 1:
+            print("Switching to online training...")
+            obs, _ = env.reset()
+            obs = np.asarray(obs).reshape(-1)
+            episode_t = 0
+            episode_states.fill(0)
+            episode_actions.fill(0)
+            episode_rewards = []
+            episode_rtg.fill(0)
+            running_rtg = target_return * config.reward_scale
+
+        if i >= offline_steps + 1:
+            norm_obs = (obs - state_mean) / state_std
+            episode_states[episode_t] = norm_obs
+            episode_rtg[episode_t, 0] = running_rtg
+
+            if episode_t < config.seq_len:
+                s_idx = slice(0, episode_t + 1)
+            else:
+                s_idx = slice(episode_t - config.seq_len + 1, episode_t + 1)
+
+            seq_timesteps = timesteps_full[:, s_idx]
+            seq_states = jnp.asarray(episode_states[None, s_idx])
+            seq_actions = jnp.asarray(episode_actions[None, s_idx])
+            seq_rtg = jnp.asarray(episode_rtg[None, s_idx])
+
+            act_preds = algo.get_action(
+                train_state,
+                seq_timesteps,
+                seq_states,
+                seq_actions,
+                seq_rtg,
+            )
+            act = np.asarray(act_preds[0, -1])
+            episode_actions[episode_t] = act
+
+            next_obs, reward, terminated, truncated, _ = env.step(act[None, :])
+            reward_val = float(np.asarray(reward, dtype=np.float32).reshape(-1)[0])
+            term_val = bool(np.asarray(terminated, dtype=bool).reshape(-1)[0])
+            trunc_val = bool(np.asarray(truncated, dtype=bool).reshape(-1)[0])
+            done = term_val or trunc_val
+
+            episode_rewards.append(reward_val)
+            running_rtg -= reward_val * config.reward_scale
+            episode_t += 1
+
+            if done or episode_t >= config.episode_len:
+                ep_len = episode_t
+                ep_return = sum(episode_rewards)
+                wandb.log({
+                    "training/episode_return": ep_return,
+                    "training/episode_length": ep_len,
+                }, step=i)
+
+                actual_rtg = discount_cumsum(np.array(episode_rewards, dtype=np.float32), 1.0) * config.reward_scale
+                buffer.add_trajectory(
+                    np.arange(ep_len, dtype=np.int32),
+                    episode_states[:ep_len],
+                    episode_actions[:ep_len],
+                    actual_rtg.reshape(-1, 1),
+                    ep_len,
+                )
+
+                obs, _ = env.reset()
+                obs = np.asarray(obs).reshape(-1)
+                episode_t = 0
+                episode_states.fill(0)
+                episode_actions.fill(0)
+                episode_rewards = []
+                episode_rtg.fill(0)
+                running_rtg = target_return * config.reward_scale
+            else:
+                obs = np.asarray(next_obs).reshape(-1)
+
+        rng, update_rng = jax.random.split(rng)
+        traj_batch = buffer.sample(
+            config.n_jitted_updates * config.batch_size,
+            config.seq_len,
+        )
+        train_state, metrics = update_fn(train_state, traj_batch, update_rng, config)
+        train_metrics = {f"training/{k}": v for k, v in metrics.items()}
+        wandb.log(train_metrics, step=i)
+
+        if i % eval_interval == 0:
+            for target_return_val in config.target_returns:
+                score, raw_score = evaluate(
+                    algo.get_action, train_state, eval_env, config, target_return_val, state_mean, state_std, seed=config.eval_seed
+                )
+                wandb.log(
+                    {
+                        f"eval/{target_return_val}_score": score,
+                        f"eval/{target_return_val}_raw_score": raw_score,
+                    },
+                    step=i,
+                )
+                print(f"Step {i}, Target Return {target_return_val}: {score}")
+
+            if config.checkpoints_path is not None and (i // eval_interval) % config.checkpoints_every == 0:
+                checkpoint = {
+                    "transformer_params": flax_serialization.to_state_dict(train_state.transformer.params),
+                    "state_mean": np.array(state_mean),
+                    "state_std": np.array(state_std),
+                    "step": i,
+                }
+                checkpoint_path = os.path.join(config.checkpoints_path, f"checkpoint_{i}.npz")
+                np.savez(checkpoint_path, **checkpoint)
+                print(f"Saved checkpoint to {checkpoint_path}")
+
+    # final evaluation
+    for target_return_val in config.target_returns:
+        score, raw_score = evaluate(
+            algo.get_action, train_state, eval_env, config, target_return_val, state_mean, state_std,
+            seed=config.eval_seed, num_episodes=config.n_eval_episodes_final,
+        )
+        wandb.log({
+            f"eval/{target_return_val}_final_score": score,
+            f"eval/{target_return_val}_final_raw_score": raw_score,
+        })
+        print(f"Final Score for Target Return {target_return_val}: {score}")
+
+        if shifted_env is not None:
+            shifted_score, shifted_raw = evaluate(
+                algo.get_action, train_state, shifted_env, config, target_return_val, state_mean, state_std,
+                seed=config.eval_seed, num_episodes=config.n_eval_episodes_final,
+            )
+            wandb.log({
+                f"eval/shifted_{target_return_val}_final_score": shifted_score,
+                f"eval/shifted_{target_return_val}_final_raw_score": shifted_raw,
+                f"eval/{target_return_val}_robustness_gap": score - shifted_score,
+            })
+            print(f"Final Shifted Score for Target Return {target_return_val}: {shifted_score}")
+
+    # Save final checkpoint
+    if config.checkpoints_path is not None:
+        checkpoint = {
+            "transformer_params": flax_serialization.to_state_dict(train_state.transformer.params),
+            "state_mean": np.array(state_mean),
+            "state_std": np.array(state_std),
+            "step": total_steps,
+        }
+        checkpoint_path = os.path.join(config.checkpoints_path, "checkpoint_final.npz")
+        np.savez(checkpoint_path, **checkpoint)
+        print(f"Saved final checkpoint to {checkpoint_path}")
+
+    # Sim2real proxy: the scripts/run_srr_eval.sh evaluation on the checkpoint saved
+    # above. Its failure must not take the finished run down with it.
+    if config.checkpoints_path is not None:
+        print("Running proxy evaluation of the final policy...")
+        try:
+            wandb.log(proxy.evaluate(
+                config.checkpoints_path,
+                env_name=config.env_name,
+                device=config.device,
+                dict_prefix="eval/proxy_results",
+            ))
+        except Exception as e:
+            print(f"[proxy] failed to run proxy evaluation: {e}")
+
+    # Record a rollout video of the final policy (highest target return)
+    try:
+        video_dir = config.checkpoints_path if config.checkpoints_path is not None else "videos"
+        video_path = os.path.join(video_dir, f"{config.name}.mp4")
+        record_dt_video(
+            algo.get_action,
+            train_state,
+            config,
+            config.target_returns[0],
+            video_path,
+            state_mean,
+            state_std,
+        )
+        wandb.log({"eval/video": wandb.Video(video_path)})
+        print(f"Saved rollout video to {video_path}")
+    except Exception as e:
+        print(f"[video] failed to record rollout video: {e}")
+
+    wandb.finish()
+
+
+if __name__ == "__main__":
+    train()

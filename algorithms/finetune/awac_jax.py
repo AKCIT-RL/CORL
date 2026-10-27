@@ -26,7 +26,8 @@ import minari
 
 from algorithms.utils import proxy
 from algorithms.utils.randomize_gym import GymWrapper, get_env, maybe_get_shifted_env, record_policy_video
-from algorithms.utils.dataset import Dataset, qlearning_dataset
+from algorithms.utils.dataset import qlearning_dataset
+from algorithms.utils.replay_buffer import Batch, ReplayBuffer
 
 os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True"
 
@@ -61,7 +62,7 @@ class AWACConfig:
    # training batch size
    batch_size: int = 256 
    # Maximum number of transitions to store in the replay buffer
-   buffer_size: int = 20_000_000 
+   buffer_size: int = 2_000_000 
    # Number of offline updates
    offline_iterations: int = int(1e6)  
    # Number of online updates
@@ -169,166 +170,6 @@ class GaussianPolicy(nn.Module):
          loc=means, scale_diag=jnp.exp(log_stds) * temperature
       )
       return distribution
-
-class Batch(NamedTuple):
-   observations: jnp.ndarray | np.ndarray
-   actions: jnp.ndarray | np.ndarray
-   rewards: jnp.ndarray | np.ndarray
-   next_observations: jnp.ndarray | np.ndarray
-   dones: jnp.ndarray | np.ndarray
-
-class ReplayBuffer:
-   def __init__(
-      self, 
-      state_dim: int, 
-      action_dim: int, 
-      buffer_size: int,
-      seed: int = 0
-   ):
-      self._buffer_size = buffer_size
-      self._pointer = 0
-      self._size = 0
-      self._rng = np.random.default_rng(seed)
-
-      self._data = Batch(
-         observations=np.zeros((buffer_size, state_dim), dtype=np.float32),
-         actions=np.zeros((buffer_size, action_dim), dtype=np.float32),
-         rewards=np.zeros((buffer_size,), dtype=np.float32),
-         next_observations=np.zeros((buffer_size, state_dim), dtype=np.float32),
-         dones=np.zeros((buffer_size,), dtype=np.float32),
-      )
-
-   def size(self) -> int:
-      return self._size
-
-   def max_size(self) -> int:
-      return self._buffer_size
-
-   def _to_numpy(self, value) -> np.ndarray:
-      return np.asarray(value, dtype=np.float32)
-
-   def load_dataset(
-      self, 
-      dataset,
-      config,
-      clip_to_eps: bool = True,
-      eps: float = 1e-5
-   ) -> Tuple[Any, Any]:
-      if self._size != 0:
-         raise ValueError("Trying to load data into non-empty replay buffer")
-
-      obs = self._to_numpy(dataset.observations)
-      act = self._to_numpy(dataset.actions)
-      rew = self._to_numpy(dataset.rewards)
-      next_obs = self._to_numpy(dataset.next_observations)
-      
-      if clip_to_eps:
-         lim = 1 - eps
-         act = np.clip(act, -lim, lim)
-
-      imputed_next_observations = np.roll(obs, -1, axis=0)
-      same_obs = np.all(
-         np.isclose(imputed_next_observations, next_obs, atol=1e-5),
-         axis=-1,
-      )
-      dones = 1.0 - same_obs.astype(np.float32)
-      dones[-1] = 1.0
-      
-      n_transitions = len(obs)
-
-      if n_transitions > self._buffer_size:
-         raise ValueError(
-            "Replay buffer is smaller than the dataset you are trying to load!"
-         )
-
-      perm = self._rng.permutation(n_transitions)
-
-      self._data.observations[:n_transitions] = obs[perm]
-      self._data.actions[:n_transitions] = act[perm]
-      self._data.rewards[:n_transitions] = rew[perm]
-      self._data.next_observations[:n_transitions] = next_obs[perm]
-      self._data.dones[:n_transitions] = dones[perm]
-
-      self._size = n_transitions
-      self._pointer = n_transitions % self._buffer_size
-
-      obs_mean, obs_std = 0, 1
-      if getattr(config, 'normalize_state', False):
-         valid_obs = self._data.observations[:self._size]
-         obs_mean = valid_obs.mean(0)
-         obs_std = valid_obs.std(0) + eps
-
-         self._data.observations[:self._size] = (self._data.observations[:self._size] - obs_mean) / obs_std
-         self._data.next_observations[:self._size] = (self._data.next_observations[:self._size] - obs_mean) / obs_std
-
-      return obs_mean, obs_std
-
-   def add_transition(self, observation, action, reward, next_observation, done):
-      self._data.observations[self._pointer] = self._to_numpy(observation)
-      self._data.actions[self._pointer] = self._to_numpy(action)
-      self._data.rewards[self._pointer] = self._to_numpy(reward)
-      self._data.next_observations[self._pointer] = self._to_numpy(next_observation)
-      self._data.dones[self._pointer] = self._to_numpy(done)
-
-      self._pointer = (self._pointer + 1) % self._buffer_size
-      self._size = min(self._size + 1, self._buffer_size)
-
-   def add_transitions(self, observations, actions, rewards, next_observations, dones):
-      obs = self._to_numpy(observations)
-      acts = self._to_numpy(actions)
-      rews = self._to_numpy(rewards)
-      next_obs = self._to_numpy(next_observations)
-      dns = self._to_numpy(dones)
-
-      n = len(obs)
-      if n == 0:
-         return
-         
-      if n > self._buffer_size:
-         obs = obs[-self._buffer_size:]
-         acts = acts[-self._buffer_size:]
-         rews = rews[-self._buffer_size:]
-         next_obs = next_obs[-self._buffer_size:]
-         dns = dns[-self._buffer_size:]
-         n = self._buffer_size
-
-      end_idx = self._pointer + n
-
-      if end_idx <= self._buffer_size:
-         self._data.observations[self._pointer:end_idx] = obs
-         self._data.actions[self._pointer:end_idx] = acts
-         self._data.rewards[self._pointer:end_idx] = rews
-         self._data.next_observations[self._pointer:end_idx] = next_obs
-         self._data.dones[self._pointer:end_idx] = dns
-      else:
-         overflow = end_idx - self._buffer_size
-         first_part = n - overflow
-
-         self._data.observations[self._pointer:] = obs[:first_part]
-         self._data.actions[self._pointer:] = acts[:first_part]
-         self._data.rewards[self._pointer:] = rews[:first_part]
-         self._data.next_observations[self._pointer:] = next_obs[:first_part]
-         self._data.dones[self._pointer:] = dns[:first_part]
-
-         self._data.observations[:overflow] = obs[first_part:]
-         self._data.actions[:overflow] = acts[first_part:]
-         self._data.rewards[:overflow] = rews[first_part:]
-         self._data.next_observations[:overflow] = next_obs[first_part:]
-         self._data.dones[:overflow] = dns[first_part:]
-
-      self._pointer = end_idx % self._buffer_size
-      self._size = min(self._size + n, self._buffer_size)
-
-   def sample(self, batch_size: int) -> Batch:
-      if self._size == 0:
-         raise ValueError("Replay buffer is empty, cannot sample.")
-
-      indices = self._rng.choice(self._size, size=batch_size, replace=False)
-
-      return jax.tree_util.tree_map(
-         lambda x: jnp.asarray(x[indices], dtype=jnp.float32), 
-         self._data
-      )
 
 def target_update(
    model: TrainState, target_model: TrainState, tau: float
@@ -455,34 +296,25 @@ class AWAC(object):
    def update_n_times(
       cls,
       train_state: AWACTrainState,
-      buffer: Batch,
+      batches: Batch,
       rng: jax.Array,
       config: AWACConfig,
    ) -> Tuple["AWACTrainState", Dict]:
-      buffer_size = buffer.observations.shape[0]
-      for _ in range(config.n_jitted_updates):
-         rng, batch_rng, critic_rng, actor_rng = jax.random.split(rng, 4)
+      batches = jax.tree_util.tree_map(
+         lambda x: x.reshape((config.n_jitted_updates, config.batch_size) + x.shape[1:]),
+         batches,
+      )
 
-         batch_indices = jax.random.choice(
-            batch_rng, buffer_size, shape=(config.batch_size,), replace=False
-         )
-         batch = jax.tree_util.tree_map(lambda x: x[batch_indices], buffer)
+      def body_fn(carry, batch):
+         state, step_rng = carry
+         step_rng, update_rng = jax.random.split(step_rng)
+         state, info = cls.update_step(state, batch, update_rng, config)
+         return (state, step_rng), info
 
-         train_state, critic_loss = cls.update_critic(
-            train_state, batch, critic_rng, config
-         )
-         new_target_critic = target_update(
-            train_state.critic,
-            train_state.target_critic,
-            config.tau,
-         )
-         train_state, actor_loss = cls.update_actor(
-            train_state, batch, actor_rng, config
-         )
-      return train_state._replace(target_critic=new_target_critic), {
-         "critic_loss": critic_loss,
-         "actor_loss": actor_loss,
-      }
+      (train_state, _), update_info = jax.lax.scan(
+         body_fn, (train_state, rng), batches
+      )
+      return train_state, jax.tree_util.tree_map(lambda x: x[-1], update_info)
 
    @classmethod
    def get_action(
@@ -662,10 +494,18 @@ def _train(config: AWACConfig):
       num_actors=config.n_eval_actors, env_name=config.env
    )
 
+   offline_steps = config.offline_iterations // config.n_jitted_updates
+   online_steps = config.online_iterations // config.n_jitted_updates
+   total_steps = offline_steps + online_steps
+   num_envs = getattr(env, "num_envs", 1)
+
+   max_needed_buffer = len(qdataset.observations) + online_steps * num_envs
+   actual_buffer_size = min(config.buffer_size, max_needed_buffer)
+
    buffer = ReplayBuffer(
       state_dim=qdataset.observations.shape[1],
       action_dim=qdataset.actions.shape[1],
-      buffer_size=config.buffer_size,
+      buffer_size=actual_buffer_size,
       seed=config.seed,
    )
    obs_mean, obs_std = buffer.load_dataset(qdataset, config)
@@ -683,13 +523,8 @@ def _train(config: AWACConfig):
    update_fn = jax.jit(algo.update_n_times, static_argnums=(3,))
    act_fn = jax.jit(algo.get_action)
 
-   offline_steps = config.offline_iterations // config.n_jitted_updates
-   online_steps = config.online_iterations // config.n_jitted_updates
-   total_steps = offline_steps + online_steps
-
    eval_interval = config.eval_frequency // config.n_jitted_updates
 
-   num_envs = getattr(env, "num_envs", 1)
    obs, _ = env.reset()
    obs = np.asarray(obs)
    if obs.ndim == 1:
@@ -715,14 +550,8 @@ def _train(config: AWACConfig):
          norm_obs = (obs - obs_mean) / obs_std
 
          rng, subkey = jax.random.split(rng)
-         policy_fn = partial(
-            act_fn,
-            seed=subkey,
-            train_state=train_state,
-         )
-   
-         action = policy_fn(observations=norm_obs)
-         next_obs, reward, terminated, truncated, _ = env.step(np.array(action))
+         action = act_fn(train_state, norm_obs, subkey)
+         next_obs, reward, terminated, truncated, _ = env.step(action)
 
          next_obs = np.asarray(next_obs)
          if next_obs.ndim == 1:
@@ -759,16 +588,14 @@ def _train(config: AWACConfig):
          else:
             obs = next_obs
 
-      for _ in range(config.n_jitted_updates):
-         rng, subkey = jax.random.split(rng)
-         batch = buffer.sample(config.batch_size)
-
-         train_state, update_info = update_fn(
-            train_state,
-            batch,
-            subkey,
-            config,
-         )
+      rng, subkey = jax.random.split(rng)
+      batches = buffer.sample(config.n_jitted_updates * config.batch_size)
+      train_state, update_info = update_fn(
+         train_state,
+         batches,
+         subkey,
+         config,
+      )
 
       train_metrics = {f"training/{k}": v for k, v in update_info.items()}
       wandb.log(train_metrics, step=i)
