@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Script de treinamento completo para algoritmos de fine-tuning (JAX)
+# Script de treinamento completo para algoritmos de fine-tuning (JAX via uv)
 # ==============================================================================
 set -euo pipefail
 
@@ -12,10 +12,6 @@ set -euo pipefail
 ALGORITHMS=(
   "iql"
   "bc"
-  "td3_bc"
-  "awac"
-  "cql"
-  "dt"
 )
 
 # Número de iterações
@@ -30,8 +26,8 @@ COMMAND_TYPES=(
 
 # Datasets utilizados
 DATASETS=(
-  "go2-flat-forward/expert-v0"
-  "go2-flat-forward/medium-v0"
+  "playground/go2-flat-forward/expert-v0"
+  "playground/go2-flat-forward/medium-v0"
 )
 
 # Ambiente de simulação
@@ -43,14 +39,11 @@ DEVICE="cuda"
 SEED=0
 CHECKPOINTS_BASE_DIR="checkpoints"
 
-# Caminho do executável Python (usa a .venv do repositório se existir)
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON="${PYTHON:-$REPO_ROOT/.venv/bin/python}"
-if [[ ! -x "$PYTHON" ]]; then
-  PYTHON="$(command -v python3)"
-fi
+# Comando uv (pode ser sobrescrito via variável de ambiente UV)
+UV="${UV:-uv}"
 
-# Diretório padrão para datasets do Minari
+# Diretório raiz do repositório
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MINARI_DATASETS_PATH="${MINARI_DATASETS_PATH:-$REPO_ROOT/datasets}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
@@ -96,7 +89,7 @@ current_run=0
 start_time=$(date +%s)
 
 echo "=============================================================================="
-echo "Iniciando fila de treinamentos de Fine-Tuning"
+echo "Iniciando fila de treinamentos de Fine-Tuning (usando uv)"
 echo "Algoritmos:       ${ALGORITHMS[*]}"
 echo "Command Types:    ${COMMAND_TYPES[*]}"
 echo "Datasets:         ${DATASETS[*]}"
@@ -104,14 +97,14 @@ echo "Env:              ${ENV_NAME}"
 echo "Offline steps:    ${OFFLINE_ITERATIONS}"
 echo "Online steps:     ${ONLINE_ITERATIONS}"
 echo "Total de runs:    ${total_runs}"
-echo "Python:           ${PYTHON}"
+echo "Comando:          ${UV} run -m <module>"
 echo "=============================================================================="
 
 for algo in "${ALGORITHMS[@]}"; do
   module="$(get_module "$algo")"
   algo_tag="$(get_algo_upper "$algo")"
 
-  # Parâmetro de ambiente difere no DT (--env_name) vs demais (--env)
+  # Parâmetros que diferem no DT vs demais algoritmos
   env_flag="--env"
   if [[ "$algo" == "dt" ]]; then
     env_flag="--env_name"
@@ -133,18 +126,18 @@ for algo in "${ALGORITHMS[@]}"; do
       echo "------------------------------------------------------------------------------"
 
       set +e
-      "$PYTHON" -m "$module" \
-        --project "$PROJECT" \
-        --group "$group_name" \
-        --name "$run_name" \
-        "$env_flag" "$ENV_NAME" \
-        --dataset_id "$ds" \
-        --command_type "$cmd" \
-        --offline_iterations "$OFFLINE_ITERATIONS" \
-        --online_iterations "$ONLINE_ITERATIONS" \
-        --checkpoints_path "$ckpt_path" \
-        --device "$DEVICE" \
-        --seed "$SEED"
+      "$UV" run -m "$module" \
+        "$env_flag=$ENV_NAME" \
+        "--dataset_id=$ds" \
+        "--command_type=$cmd" \
+        "--checkpoints_path=$ckpt_path" \
+        "--project=$PROJECT" \
+        "--group=$group_name" \
+        "--name=$run_name" \
+        "--online_iterations=$ONLINE_ITERATIONS" \
+        "--offline_iterations=$OFFLINE_ITERATIONS" \
+        "--device=$DEVICE" \
+        "--seed=$SEED"
       exit_code=$?
       set -e
 
@@ -162,4 +155,3 @@ echo ""
 echo "=============================================================================="
 echo "Treinamentos finalizados em $((elapsed / 60)) min e $((elapsed % 60)) s."
 echo "=============================================================================="
-
