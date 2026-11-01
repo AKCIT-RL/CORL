@@ -1,5 +1,6 @@
 # source https://github.com/young-geng/JaxCQL
 # https://arxiv.org/abs/2006.04779
+from functools import partial
 import os
 import uuid
 from copy import deepcopy
@@ -869,6 +870,37 @@ def create_cql_train_state(
     )
 
 
+def save_checkpoint(
+    train_state: CQLTrainState, 
+    obs_mean: float, 
+    obs_std: float, 
+    i: int,
+    config: CQLConfig,
+    checkpoint_name: str | None = None
+) -> str | None:
+    if config.checkpoints_path is None:
+        return
+    
+    checkpoint_name = checkpoint_name or f"checkpoint_{i}.npz"
+
+    checkpoint = {
+        "policy_params": flax_serialization.to_state_dict(train_state.policy.params),
+        "qf1_params": flax_serialization.to_state_dict(train_state.qf1.params),
+        "qf2_params": flax_serialization.to_state_dict(train_state.qf2.params),
+        "target_qf1_params": flax_serialization.to_state_dict(train_state.target_qf1_params),
+        "target_qf2_params": flax_serialization.to_state_dict(train_state.target_qf2_params),
+        "obs_mean": np.array(obs_mean),
+        "obs_std": np.array(obs_std),
+        "step": i,
+    }
+    checkpoint_path = os.path.join(
+        config.checkpoints_path, checkpoint_name
+    )
+    np.savez(checkpoint_path, **checkpoint)
+
+    return checkpoint_path
+
+
 def evaluate(
     policy_fn: Callable,
     env: GymWrapper,
@@ -971,6 +1003,26 @@ def _train(config: CQLConfig):
         seed=config.seed,
     )
     obs_mean, obs_std = buffer.load_dataset(qdataset, config)
+    offline_dataset = buffer.all()  # Get the entire dataset as a Batch for offline training
+
+    def _offline_sample(batch_size: int) -> Batch:
+        indices = buffer._rng.integers(0, len(offline_dataset.observations), size=batch_size)
+        return jax.tree_util.tree_map(
+            lambda x: jnp.asarray(x[indices], dtype=jnp.float32), 
+            offline_dataset
+        )
+    offline_sample = partial(
+        _offline_sample, 
+        batch_size=config.batch_size * config.n_jitted_updates
+    )
+
+    def _online_sample(batch_size: int) -> Batch:
+        return buffer.sample(batch_size)
+    online_sample = partial(
+        _online_sample, 
+        batch_size=config.batch_size * config.n_jitted_updates
+    )
+    sample = offline_sample if offline_steps > 0 else online_sample
 
     # create train_state
     rng = jax.random.PRNGKey(config.seed)
@@ -1008,6 +1060,27 @@ def _train(config: CQLConfig):
             obs = np.asarray(obs)
             if obs.ndim == 1:
                 obs = obs[None, ...]
+
+            if config.checkpoints_path is not None:
+                checkpoint_path = save_checkpoint(train_state, obs_mean, obs_std, i, config)
+                print(f"Saved offline checkpoint to {checkpoint_path}")
+
+                if checkpoint_path is not None:
+                    print("Running proxy evaluation of the offline policy...")
+                    try:
+                        wandb.log(
+                            proxy.evaluate(
+                                checkpoint_path,
+                                env_name=config.env,
+                                device=config.device,
+                                dict_prefix="eval/proxy_results",
+                            ),
+                            step=i
+                        )
+                    except Exception as e:
+                        print(f"[proxy] failed to run proxy evaluation: {e}")
+            
+            sample = online_sample
 
         if i >= offline_steps + 1:
             episode_steps += 1
@@ -1052,7 +1125,7 @@ def _train(config: CQLConfig):
                 obs = next_obs
 
         rng, update_rng = jax.random.split(rng)
-        batches = buffer.sample(config.n_jitted_updates * config.batch_size)
+        batches = sample()
         train_state, metrics = update_fn(train_state, batches, update_rng, config, bc=False)
         
         train_metrics = {f"training/{k}": v for k, v in metrics.items()}
@@ -1076,18 +1149,7 @@ def _train(config: CQLConfig):
             print(f"Step {i}: {normalized_score}")
 
             if config.checkpoints_path is not None and (i // eval_interval) % config.checkpoints_every == 0:
-                checkpoint = {
-                    "policy_params": flax_serialization.to_state_dict(train_state.policy.params),
-                    "qf1_params": flax_serialization.to_state_dict(train_state.qf1.params),
-                    "qf2_params": flax_serialization.to_state_dict(train_state.qf2.params),
-                    "target_qf1_params": flax_serialization.to_state_dict(train_state.target_qf1_params),
-                    "target_qf2_params": flax_serialization.to_state_dict(train_state.target_qf2_params),
-                    "obs_mean": np.array(obs_mean),
-                    "obs_std": np.array(obs_std),
-                    "step": i,
-                }
-                checkpoint_path = os.path.join(config.checkpoints_path, f"checkpoint_{i}.npz")
-                np.savez(checkpoint_path, **checkpoint)
+                checkpoint_path = save_checkpoint(train_state, obs_mean, obs_std, i, config)
                 print(f"Saved checkpoint to {checkpoint_path}")
 
     # final evaluation
@@ -1101,10 +1163,13 @@ def _train(config: CQLConfig):
         seed=config.eval_seed
     )
     print("Final Evaluation Score:", normalized_score)
-    wandb.log({
-        "eval/final_score": normalized_score,
-        "eval/final_raw_score": raw_score,
-    })
+    wandb.log(
+        {
+            "eval/final_score": normalized_score,
+            "eval/final_raw_score": raw_score,
+        },
+        step=total_steps,
+    )
 
     # Tier-5 shifted evaluation: same policy under a harder / held-out perturbation
     # regime. Reuses the in-distribution refs, so the gap measures robustness.
@@ -1118,41 +1183,41 @@ def _train(config: CQLConfig):
             seed=config.eval_seed
         )
         print("Final Shifted Evaluation Score:", shifted_score)
-        wandb.log({
-            "eval/shifted_final_score": shifted_score,
-            "eval/shifted_final_raw_score": shifted_raw,
-            "eval/robustness_gap": normalized_score - shifted_score,
-        })
+        wandb.log(
+            {
+                "eval/shifted_final_score": shifted_score,
+                "eval/shifted_final_raw_score": shifted_raw,
+                "eval/robustness_gap": normalized_score - shifted_score,
+            },
+            step=total_steps,
+        )
 
     # Save final checkpoint
     if config.checkpoints_path is not None:
-        checkpoint = {
-            "policy_params": flax_serialization.to_state_dict(train_state.policy.params),
-            "qf1_params": flax_serialization.to_state_dict(train_state.qf1.params),
-            "qf2_params": flax_serialization.to_state_dict(train_state.qf2.params),
-            "target_qf1_params": flax_serialization.to_state_dict(train_state.target_qf1_params),
-            "target_qf2_params": flax_serialization.to_state_dict(train_state.target_qf2_params),
-            "obs_mean": np.array(obs_mean),
-            "obs_std": np.array(obs_std),
-            "step": total_steps,
-        }
-        checkpoint_path = os.path.join(config.checkpoints_path, "checkpoint_final.npz")
-        np.savez(checkpoint_path, **checkpoint)
+        checkpoint_path = save_checkpoint(
+            train_state,
+            obs_mean, 
+            obs_std, 
+            i, 
+            config, 
+            "checkpoint_final.npz"
+        )
         print(f"Saved final checkpoint to {checkpoint_path}")
 
-    # Sim2real proxy: the scripts/run_srr_eval.sh evaluation on the checkpoint saved
-    # above. Its failure must not take the finished run down with it.
-    if config.checkpoints_path is not None:
-        print("Running proxy evaluation of the final policy...")
-        try:
-            wandb.log(proxy.evaluate(
-                config.checkpoints_path,
-                env_name=config.env,
-                device=config.device,
-                dict_prefix="eval/proxy_results",
-            ))
-        except Exception as e:
-            print(f"[proxy] failed to run proxy evaluation: {e}")
+        if checkpoint_path is not None:
+            print("Running proxy evaluation of the final policy...")
+            try:
+                wandb.log(
+                    proxy.evaluate(
+                        checkpoint_path,
+                        env_name=config.env,
+                        device=config.device,
+                        dict_prefix="eval/proxy_results",
+                    ),
+                    step=total_steps,
+                )
+            except Exception as e:
+                print(f"[proxy] failed to run proxy evaluation: {e}")
 
     # Record a rollout video of the final policy
     try:

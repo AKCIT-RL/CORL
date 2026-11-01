@@ -491,7 +491,8 @@ def sample_start_idx(
     To avoid that, we refer padded_traj_length, the list of actual trajectory length + seq_len
     """
     traj_len = padded_traj_length[traj_idx]
-    start_idx = jax.random.randint(rng, (1,), 0, traj_len - seq_len - 1)
+    max_start = jnp.maximum(1, traj_len - seq_len)
+    start_idx = jax.random.randint(rng, (1,), 0, max_start)
     return start_idx
 
 
@@ -654,6 +655,33 @@ def create_dt_train_state(
     )
     train_state = TrainState.create(apply_fn=model.apply, params=params, tx=tx)
     return DTTrainState(train_state)
+
+
+def save_checkpoint(
+    train_state: DTTrainState, 
+    state_mean: float | np.ndarray, 
+    state_std: float | np.ndarray, 
+    i: int,
+    config: DTConfig,
+    checkpoint_name: str | None = None
+) -> str | None:
+    if config.checkpoints_path is None:
+        return
+    
+    checkpoint_name = checkpoint_name or f"checkpoint_{i}.npz"
+
+    checkpoint = {
+        "transformer_params": flax_serialization.to_state_dict(train_state.transformer.params),
+        "state_mean": np.array(state_mean),
+        "state_std": np.array(state_std),
+        "step": i,
+    }
+    checkpoint_path = os.path.join(
+        config.checkpoints_path, checkpoint_name
+    )
+    np.savez(checkpoint_path, **checkpoint)
+
+    return checkpoint_path
 
 
 def get_dt_from_checkpoint(
@@ -1036,6 +1064,7 @@ def _train(config: DTConfig):
     trajectories, episode_num, traj_lengths, state_mean, state_std, max_len = (
         make_padded_trajectories(config)
     )
+    state_mean, state_std = np.asarray(state_mean), np.asarray(state_std)
 
     offline_steps = config.offline_iterations // config.n_jitted_updates
     online_steps = config.online_iterations // config.n_jitted_updates
@@ -1052,6 +1081,34 @@ def _train(config: DTConfig):
         act_dim, 
         seed=config.seed
     )
+
+    offline_trajectories = jax.tree_util.tree_map(jnp.asarray, trajectories)
+    offline_lengths = jnp.asarray(traj_lengths)
+
+    def _offline_sample(batch_size: int, subkey: jax.Array) -> Trajectory:
+        return sample_traj_batch(
+            subkey,
+            offline_trajectories,
+            batch_size,
+            config.seq_len,
+            episode_num,
+            offline_lengths,
+        )
+
+    offline_sample = partial(
+        _offline_sample,
+        batch_size=config.batch_size * config.n_jitted_updates,
+    )
+
+    def _online_sample(batch_size: int, subkey: jax.Array) -> Trajectory:
+        return buffer.sample(batch_size, config.seq_len)
+
+    online_sample = partial(
+        _online_sample,
+        batch_size=config.batch_size * config.n_jitted_updates,
+    )
+
+    sample = offline_sample if offline_steps > 0 else online_sample
 
     # create trainer
     rng, subkey = jax.random.split(rng)
@@ -1085,6 +1142,27 @@ def _train(config: DTConfig):
             episode_rewards = []
             episode_rtg.fill(0)
             running_rtg = target_return * config.reward_scale
+
+            if config.checkpoints_path is not None:
+                checkpoint_path = save_checkpoint(train_state, state_mean, state_std, i, config)
+                print(f"Saved offline checkpoint to {checkpoint_path}")
+
+                if checkpoint_path is not None:
+                    print("Running proxy evaluation of the offline policy...")
+                    try:
+                        wandb.log(
+                            proxy.evaluate(
+                                checkpoint_path,
+                                env_name=config.env_name,
+                                device=config.device,
+                                dict_prefix="eval/proxy_results",
+                            ),
+                            step=i
+                        )
+                    except Exception as e:
+                        print(f"[proxy] failed to run proxy evaluation: {e}")
+
+            sample = online_sample
 
         if i >= offline_steps + 1:
             norm_obs = (obs - state_mean) / state_std
@@ -1149,11 +1227,8 @@ def _train(config: DTConfig):
             else:
                 obs = np.asarray(next_obs).reshape(-1)
 
-        rng, update_rng = jax.random.split(rng)
-        traj_batch = buffer.sample(
-            config.n_jitted_updates * config.batch_size,
-            config.seq_len,
-        )
+        rng, sample_rng, update_rng = jax.random.split(rng, 3)
+        traj_batch = sample(subkey=sample_rng)
         train_state, metrics = update_fn(train_state, traj_batch, update_rng, config)
         train_metrics = {f"training/{k}": v for k, v in metrics.items()}
         wandb.log(train_metrics, step=i)
@@ -1161,7 +1236,14 @@ def _train(config: DTConfig):
         if i % eval_interval == 0:
             for target_return_val in config.target_returns:
                 score, raw_score = evaluate(
-                    algo.get_action, train_state, eval_env, config, target_return_val, state_mean, state_std, seed=config.eval_seed
+                    algo.get_action, 
+                    train_state, 
+                    eval_env, 
+                    config, 
+                    target_return_val, 
+                    state_mean, 
+                    state_std, 
+                    seed=config.eval_seed
                 )
                 wandb.log(
                     {
@@ -1173,14 +1255,7 @@ def _train(config: DTConfig):
                 print(f"Step {i}, Target Return {target_return_val}: {score}")
 
             if config.checkpoints_path is not None and (i // eval_interval) % config.checkpoints_every == 0:
-                checkpoint = {
-                    "transformer_params": flax_serialization.to_state_dict(train_state.transformer.params),
-                    "state_mean": np.array(state_mean),
-                    "state_std": np.array(state_std),
-                    "step": i,
-                }
-                checkpoint_path = os.path.join(config.checkpoints_path, f"checkpoint_{i}.npz")
-                np.savez(checkpoint_path, **checkpoint)
+                checkpoint_path = save_checkpoint(train_state, state_mean, state_std, i, config)
                 print(f"Saved checkpoint to {checkpoint_path}")
 
     # final evaluation
@@ -1189,10 +1264,13 @@ def _train(config: DTConfig):
             algo.get_action, train_state, eval_env, config, target_return_val, state_mean, state_std,
             seed=config.eval_seed, num_episodes=config.n_eval_episodes_final,
         )
-        wandb.log({
-            f"eval/{target_return_val}_final_score": score,
-            f"eval/{target_return_val}_final_raw_score": raw_score,
-        })
+        wandb.log(
+            {
+                f"eval/{target_return_val}_final_score": score,
+                f"eval/{target_return_val}_final_raw_score": raw_score,
+            },
+            step=total_steps,
+        )
         print(f"Final Score for Target Return {target_return_val}: {score}")
 
         if shifted_env is not None:
@@ -1200,38 +1278,42 @@ def _train(config: DTConfig):
                 algo.get_action, train_state, shifted_env, config, target_return_val, state_mean, state_std,
                 seed=config.eval_seed, num_episodes=config.n_eval_episodes_final,
             )
-            wandb.log({
-                f"eval/shifted_{target_return_val}_final_score": shifted_score,
-                f"eval/shifted_{target_return_val}_final_raw_score": shifted_raw,
-                f"eval/{target_return_val}_robustness_gap": score - shifted_score,
-            })
+            wandb.log(
+                {
+                    f"eval/shifted_{target_return_val}_final_score": shifted_score,
+                    f"eval/shifted_{target_return_val}_final_raw_score": shifted_raw,
+                    f"eval/{target_return_val}_robustness_gap": score - shifted_score,
+                },
+                step=total_steps,
+            )
             print(f"Final Shifted Score for Target Return {target_return_val}: {shifted_score}")
 
     # Save final checkpoint
     if config.checkpoints_path is not None:
-        checkpoint = {
-            "transformer_params": flax_serialization.to_state_dict(train_state.transformer.params),
-            "state_mean": np.array(state_mean),
-            "state_std": np.array(state_std),
-            "step": total_steps,
-        }
-        checkpoint_path = os.path.join(config.checkpoints_path, "checkpoint_final.npz")
-        np.savez(checkpoint_path, **checkpoint)
+        checkpoint_path = save_checkpoint(
+            train_state,
+            state_mean, 
+            state_std, 
+            i, 
+            config, 
+            "checkpoint_final.npz"
+        )
         print(f"Saved final checkpoint to {checkpoint_path}")
 
-    # Sim2real proxy: the scripts/run_srr_eval.sh evaluation on the checkpoint saved
-    # above. Its failure must not take the finished run down with it.
-    if config.checkpoints_path is not None:
-        print("Running proxy evaluation of the final policy...")
-        try:
-            wandb.log(proxy.evaluate(
-                config.checkpoints_path,
-                env_name=config.env_name,
-                device=config.device,
-                dict_prefix="eval/proxy_results",
-            ))
-        except Exception as e:
-            print(f"[proxy] failed to run proxy evaluation: {e}")
+        if checkpoint_path is not None:
+            print("Running proxy evaluation of the final policy...")
+            try:
+                wandb.log(
+                    proxy.evaluate(
+                        checkpoint_path,
+                        env_name=config.env_name,
+                        device=config.device,
+                        dict_prefix="eval/proxy_results",
+                    ),
+                    step=total_steps,
+                )
+            except Exception as e:
+                print(f"[proxy] failed to run proxy evaluation: {e}")
 
     # Record a rollout video of the final policy (highest target return)
     try:

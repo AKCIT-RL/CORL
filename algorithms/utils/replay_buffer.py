@@ -147,6 +147,12 @@ class ReplayBuffer:
       self._pointer = end_idx % self._buffer_size
       self._size = min(self._size + n, self._buffer_size)
 
+   def all(self) -> Batch:
+      return jax.tree_util.tree_map(
+         lambda x: jnp.asarray(x[:self._size], dtype=jnp.float32), 
+         self._data
+      )
+
    def sample(self, batch_size: int) -> Batch:
       if self._size == 0:
          raise ValueError("Replay buffer is empty, cannot sample.")
