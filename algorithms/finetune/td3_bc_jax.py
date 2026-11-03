@@ -719,7 +719,7 @@ def _train(config: TD3BCConfig):
                                 checkpoint_path,
                                 env_name=config.env,
                                 device=config.device,
-                                dict_prefix="eval/proxy_results",
+                                dict_prefix="eval/proxy_offline",
                             ),
                             step=i
                         )
@@ -868,7 +868,7 @@ def _train(config: TD3BCConfig):
                         checkpoint_path,
                         env_name=config.env,
                         device=config.device,
-                        dict_prefix="eval/proxy_results",
+                        dict_prefix="eval/proxy_online",
                     ),
                     step=total_steps,
                 )

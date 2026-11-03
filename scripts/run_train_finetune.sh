@@ -15,8 +15,8 @@ ALGORITHMS=(
 )
 
 # Número de iterações
-OFFLINE_ITERATIONS=1000000   # 1M steps offline
-ONLINE_ITERATIONS=500000     # 500k steps online
+OFFLINE_ITERATIONS=100000   # 1M steps offline
+ONLINE_ITERATIONS=50000     # 500k steps online
 
 # Tipos de comando para o ambiente
 COMMAND_TYPES=(
@@ -24,10 +24,13 @@ COMMAND_TYPES=(
   "direction"
 )
 
-# Datasets utilizados
-DATASETS=(
-  "playground/go2-flat-forward/expert-v0"
-  "playground/go2-flat-forward/medium-v0"
+# Qualidades dos datasets utilizados (ex: "expert-v0", "medium-v0")
+# - Se command_type for "direction": usará "go2-joystick-direction/<qualidade>"
+# - Para os demais (ex: "forwardfixed"): usará "go2-flat-forward/<qualidade>"
+# (Localizados diretamente em ~/.minari/datasets/, fora da pasta playground)
+DATASET_QUALITIES=(
+  "expert-v0"
+  "medium-v0"
 )
 
 # Ambiente de simulação
@@ -46,9 +49,11 @@ UV="${UV:-uv}"
 # Diretório raiz do repositório
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Caminho dos datasets do Minari (usa $REPO_ROOT/datasets se populado, senão ~/.minari/datasets)
+# Caminho dos datasets do Minari (usa ~/.minari/datasets se existir, senão $REPO_ROOT/datasets)
 if [[ -z "${MINARI_DATASETS_PATH:-}" ]]; then
-  if [[ -d "$REPO_ROOT/datasets/playground" || -d "$REPO_ROOT/datasets/go2-flat-forward" ]]; then
+  if [[ -d "${HOME}/.minari/datasets/go2-flat-forward" || -d "${HOME}/.minari/datasets/go2-joystick-direction" ]]; then
+    export MINARI_DATASETS_PATH="${HOME}/.minari/datasets"
+  elif [[ -d "$REPO_ROOT/datasets/go2-flat-forward" || -d "$REPO_ROOT/datasets/playground" ]]; then
     export MINARI_DATASETS_PATH="$REPO_ROOT/datasets"
   else
     export MINARI_DATASETS_PATH="${HOME}/.minari/datasets"
@@ -99,10 +104,23 @@ get_eval_flag() {
   esac 
 }
 
+get_dataset_id() {
+  local cmd="$1"
+  local quality="$2"
+  # Extrai apenas o nome base da versão (ex: expert-v0) se fornecido com prefixo
+  local base_quality="${quality##*/}"
+
+  if [[ "$cmd" == "direction" ]]; then
+    echo "go2-joystick-direction/${base_quality}"
+  else
+    echo "go2-flat-forward/${base_quality}"
+  fi
+}
+
 # ==============================================================================
 # EXECUÇÃO DO PIPELINE
 # ==============================================================================
-total_runs=$(( ${#ALGORITHMS[@]} * ${#COMMAND_TYPES[@]} * ${#DATASETS[@]} ))
+total_runs=$(( ${#ALGORITHMS[@]} * ${#COMMAND_TYPES[@]} * ${#DATASET_QUALITIES[@]} ))
 current_run=0
 start_time=$(date +%s)
 
@@ -110,7 +128,7 @@ echo "==========================================================================
 echo "Iniciando fila de treinamentos de Fine-Tuning (usando uv)"
 echo "Algoritmos:       ${ALGORITHMS[*]}"
 echo "Command Types:    ${COMMAND_TYPES[*]}"
-echo "Datasets:         ${DATASETS[*]}"
+echo "Dataset Qualities:${DATASET_QUALITIES[*]}"
 echo "Env:              ${ENV_NAME}"
 echo "Offline steps:    ${OFFLINE_ITERATIONS}"
 echo "Online steps:     ${ONLINE_ITERATIONS}"
@@ -131,7 +149,8 @@ for algo in "${ALGORITHMS[@]}"; do
   eval_flag="$(get_eval_flag "$algo")"
 
   for cmd in "${COMMAND_TYPES[@]}"; do
-    for ds in "${DATASETS[@]}"; do
+    for quality in "${DATASET_QUALITIES[@]}"; do
+      ds="$(get_dataset_id "$cmd" "$quality")"
       current_run=$((current_run + 1))
       ds_clean="$(echo "$ds" | tr '/' '_')"
       ckpt_path="${CHECKPOINTS_BASE_DIR}/${algo_tag}"
