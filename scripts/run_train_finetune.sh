@@ -15,8 +15,8 @@ ALGORITHMS=(
 )
 
 # Número de iterações
-OFFLINE_ITERATIONS=100000   # 1M steps offline
-ONLINE_ITERATIONS=50000     # 500k steps online
+OFFLINE_ITERATIONS=1000000   # 1M steps offline
+ONLINE_ITERATIONS=500000     # 500k steps online
 
 # Tipos de comando para o ambiente
 COMMAND_TYPES=(
@@ -155,7 +155,7 @@ for algo in "${ALGORITHMS[@]}"; do
       ds_clean="$(echo "$ds" | tr '/' '_')"
       ckpt_path="${CHECKPOINTS_BASE_DIR}/${algo_tag}"
       group_name="${algo_tag}-Finetune"
-      run_name="${algo_tag}-${ENV_NAME}-${cmd}-${ds_clean}"
+      run_name="${algo_tag}-${cmd}-${quality}"
 
       echo ""
       echo "------------------------------------------------------------------------------"

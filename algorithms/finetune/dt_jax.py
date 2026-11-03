@@ -1162,6 +1162,24 @@ def _train(config: DTConfig):
                     except Exception as e:
                         print(f"[proxy] failed to run proxy evaluation: {e}")
 
+                # Record a rollout video of the offline policy
+                try:
+                    video_dir = config.checkpoints_path if config.checkpoints_path is not None else "videos"
+                    video_path = os.path.join(video_dir, f"{config.name}-offline.mp4")
+                    record_dt_video(
+                        algo.get_action,
+                        train_state,
+                        config,
+                        config.target_returns[0],
+                        video_path,
+                        state_mean,
+                        state_std,
+                    )
+                    wandb.log({"eval/video/offline": wandb.Video(video_path)})
+                    print(f"Saved rollout video to {video_path}")
+                except Exception as e:
+                    print(f"[video] failed to record rollout video: {e}")
+
             sample = online_sample
 
         if i >= offline_steps + 1:
@@ -1318,7 +1336,7 @@ def _train(config: DTConfig):
     # Record a rollout video of the final policy (highest target return)
     try:
         video_dir = config.checkpoints_path if config.checkpoints_path is not None else "videos"
-        video_path = os.path.join(video_dir, f"{config.name}.mp4")
+        video_path = os.path.join(video_dir, f"{config.name}-online.mp4")
         record_dt_video(
             algo.get_action,
             train_state,
@@ -1328,7 +1346,7 @@ def _train(config: DTConfig):
             state_mean,
             state_std,
         )
-        wandb.log({"eval/video": wandb.Video(video_path)})
+        wandb.log({"eval/video/online": wandb.Video(video_path)})
         print(f"Saved rollout video to {video_path}")
     except Exception as e:
         print(f"[video] failed to record rollout video: {e}")

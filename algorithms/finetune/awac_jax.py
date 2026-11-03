@@ -611,6 +611,24 @@ def _train(config: AWACConfig):
                   )
                except Exception as e:
                   print(f"[proxy] failed to run proxy evaluation: {e}")
+
+            # Record a rollout video of the offline policy
+            try:
+               video_dir = config.checkpoints_path if config.checkpoints_path is not None else "videos"
+               video_path = os.path.join(video_dir, f"{config.name}-offline.mp4")
+               record_policy_video(
+                  env_name=config.env,
+                  act=lambda o: policy_fn(obs=o),
+                  obs_mean=obs_mean,
+                  obs_std=obs_std,
+                  device=config.device,
+                  save_path=video_path,
+                  command_type=config.command_type,
+               )
+               wandb.log({"eval/video/offline": wandb.Video(video_path)})
+               print(f"Saved rollout video to {video_path}")
+            except Exception as e:
+               print(f"[video] failed to record rollout video: {e}")
          
          sample = online_sample
 
@@ -767,7 +785,7 @@ def _train(config: AWACConfig):
    # Record a rollout video of the final policy
    try:
       video_dir = config.checkpoints_path if config.checkpoints_path is not None else "videos"
-      video_path = os.path.join(video_dir, f"{config.name}.mp4")
+      video_path = os.path.join(video_dir, f"{config.name}-online.mp4")
       record_policy_video(
          env_name=config.env,
          act=lambda o: policy_fn(obs=o),
@@ -777,7 +795,7 @@ def _train(config: AWACConfig):
          save_path=video_path,
          command_type=config.command_type,
       )
-      wandb.log({"eval/video": wandb.Video(video_path)})
+      wandb.log({"eval/video/online": wandb.Video(video_path)})
       print(f"Saved rollout video to {video_path}")
    except Exception as e:
       print(f"[video] failed to record rollout video: {e}")
