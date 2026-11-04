@@ -800,6 +800,14 @@ def _train(config: IQLConfig):
 
                 # Record a rollout video of the offline policy
                 try:
+                    policy_fn = partial(
+                        act_fn,
+                        temperature=0.0,
+                        seed=jax.random.PRNGKey(0),
+                        train_state=train_state,
+                    )
+                    fn = policy_fn
+                    policy_fn = lambda obs: fn(observations=obs)
                     video_dir = config.checkpoints_path if config.checkpoints_path is not None else "videos"
                     video_path = os.path.join(video_dir, f"{config.name}-offline.mp4")
                     record_policy_video(
