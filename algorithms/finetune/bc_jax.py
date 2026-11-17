@@ -84,6 +84,10 @@ class BCConfig:
     hidden_dims: Tuple[int, ...] = (256, 256)
     actor_lr: float = 1e-3
     n_jitted_updates: int = 8
+    # whether to stratify online sampling between minari and online data
+    buffer_stratify: bool = False
+    # fraction of each online batch sampled from minari data when stratify=True
+    minari_percent: float = 0.5
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -540,6 +544,7 @@ def _train(config: BCConfig):
         state_dim=qdataset.observations.shape[1],
         action_dim=qdataset.actions.shape[1],
         buffer_size=actual_buffer_size,
+        stratify=config.buffer_stratify,
         seed=config.seed,
     )
     obs_mean, obs_std = buffer.load_dataset(qdataset, config)
@@ -557,7 +562,7 @@ def _train(config: BCConfig):
     )
 
     def _online_sample(batch_size: int) -> Batch:
-        return buffer.sample(batch_size)
+        return buffer.sample(batch_size, minari_percent=config.minari_percent)
     online_sample = partial(
         _online_sample, 
         batch_size=config.batch_size * config.n_jitted_updates

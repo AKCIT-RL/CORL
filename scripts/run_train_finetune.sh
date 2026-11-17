@@ -11,7 +11,6 @@ set -euo pipefail
 # Opções disponíveis: "iql" "bc" "awac" "cql" "td3_bc" "dt"
 ALGORITHMS=(
   "iql"
-  "bc"
 )
 
 # Número de iterações
@@ -177,6 +176,7 @@ for algo in "${ALGORITHMS[@]}"; do
         "--name=$run_name" \
         "--online_iterations=$ONLINE_ITERATIONS" \
         "--offline_iterations=$OFFLINE_ITERATIONS" \
+        "--buffer_stratify=True" \
         "--device=$DEVICE" \
         "--seed=$SEED"
       exit_code=$?
